@@ -40,9 +40,12 @@ class Tail:
             self.pos = 0
         if sz == self.pos:
             return ""
-        with open(self.path, "rb") as f:
-            f.seek(self.pos)
-            data = f.read(min(sz - self.pos, 64 << 20))
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.pos)
+                data = f.read(min(sz - self.pos, 64 << 20))
+        except OSError:
+            return ""
         self.pos += len(data)
         return data.decode("utf-8", "ignore")
 

@@ -3807,7 +3807,9 @@ void spu_indirect_branch(spu_context* ctx)
         extern uint32_t g_sjt_link_a, g_sjt_link_b;
         extern void spu_jobtime_begin(spu_context*, uint32_t);
         const uint32_t lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+        const uint32_t tpc = (uint32_t)ctx->pc & SPU_LS_MASK & ~3u;
         if (__builtin_expect(lr == g_sjt_link_a || lr == g_sjt_link_b, 0)) spu_jobtime_begin(ctx, lr);
+        else if (__builtin_expect(tpc == g_sjt_link_a || tpc == g_sjt_link_b, 0)) spu_jobtime_begin(ctx, tpc);
     }
     int on = s_ibfast;
     if (__builtin_expect(on < 0, 0)) on = spu_ibfast_init();
