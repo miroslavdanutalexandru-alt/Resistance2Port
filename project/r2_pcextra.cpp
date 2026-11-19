@@ -70,6 +70,7 @@ extern volatile unsigned long long g_r2_look_ms;             /* stubs.cpp: on-fo
 extern uint8_t* vm_base;
 void r2pf_toast(const char* title, const char* text, char badge);
 void r2pf_hint(const char* title, const char* text, unsigned ms);
+extern volatile int g_r2_cheat_god, g_r2_cheat_ammo;         /* r2_cheats.cpp */
 int r2pf_overlay_get(void);
 void r2pf_overlay_set(int on);
 void r2rsx_prof_enable(int on);
@@ -990,6 +991,22 @@ extern "C" void r2x_ui_tick(void* hwnd_, int focused, int other_prompt)
     { static int was = 0; const int d = focused && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
       if (d && !was && !s_open && !other_prompt && !s_photo_on) r2x_open_menu();
       was = d; }
+    /* cheats (r2_cheats.cpp): Ctrl+F1 God mode, Ctrl+F2 Infinite ammo */
+    { const int ctrl = focused && (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+      static int was1 = 0, was2 = 0;
+      const int d1 = ctrl && (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
+      const int d2 = ctrl && (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
+      if (d1 && !was1 && !s_open) {
+          g_r2_cheat_god = !g_r2_cheat_god;
+          r2pf_hint("Cheat", g_r2_cheat_god ? "God mode ON" : "God mode OFF", 2500);
+          LOG("cheat: god mode %s", g_r2_cheat_god ? "on" : "off");
+      }
+      if (d2 && !was2 && !s_open) {
+          g_r2_cheat_ammo = !g_r2_cheat_ammo;
+          r2pf_hint("Cheat", g_r2_cheat_ammo ? "Infinite ammo ON" : "Infinite ammo OFF", 2500);
+          LOG("cheat: infinite ammo %s", g_r2_cheat_ammo ? "on" : "off");
+      }
+      was1 = d1; was2 = d2; }
     if (s_open) menu_tick(focused);
     else if (s_release) {                        /* hold the game's input until the closing key is let go */
         if (!(read_input(focused) & (IN_YES | IN_NO | IN_F10))) { s_release = 0; g_port_ui_modal = 0; }
