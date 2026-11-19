@@ -4,9 +4,9 @@
  *                            native (func_00034854, the Lua binding at OPD
  *                            0x00D73940) is run with 4 = all four health bars, so
  *                            every local player's health is topped back up to full,
- *                            and the game's invulnerability flags (set_invulnerability
- *                            mode 3, bits 0xC at player+0x418) are kept set, so
- *                            instant-kill attacks don't land either.
+ *                            and the hero's moby is kept non-damageable (what
+ *                            set_damageable(moby, false) does: bit 0x8 at moby+0x64),
+ *                            so instant-kill attacks don't land either.
  *   Ctrl+F2   Infinite ammo  every frame, for each local player's weapons (the
  *                            weapon lookup func_000F35BC, types 0..46) the four
  *                            ammo counters (primary +0x314/+0x316, alt +0x318/+0x31A,
@@ -52,7 +52,7 @@ static uint64_t gcall(ppu_context* c, void (*f)(ppu_context*), uint64_t a, uint6
 struct Hwm { uint32_t obj, cfg; uint16_t field; int16_t hi; };
 static Hwm s_hwm[1024];
 static int s_nhwm = 0;
-static int s_diag = 0, s_ndiag = 0;
+static int s_diag = 0, s_ndiag = 0, s_gdiag = 0;
 static uint32_t s_diagw[64];
 static int16_t* hwm_slot(uint32_t obj, uint32_t cfg, uint16_t field, int16_t cur)
 {
@@ -87,7 +87,7 @@ static void ammo_player(ppu_context* c, uint32_t player)
         if (type >= 21 && type <= 24) {   /* grenades (func_00034488 / func_000E7F20): player+0x8A0 inventory,
                                              count byte at +0x220 + (type - 21) + 9 */
             const uint32_t f = 0x8A0 + 0x220 + (type - 21) + 9;
-            if (s_diag && s_ndiag < 64 && type == 21)
+            if (s_diag && !s_gdiag && type == 21 && (s_gdiag = 1))
                 fprintf(stderr, "[cheat] player 0x%08X grenades %u %u %u %u\n", player, vm_read8(player + f),
                         vm_read8(player + f + 1), vm_read8(player + f + 2), vm_read8(player + f + 3));
             hold8(player, f);
@@ -115,33 +115,39 @@ static void ammo_player(ppu_context* c, uint32_t player)
     }
 }
 
-/* God mode, part 2: the game's own invulnerability flags (what the Lua
- * set_invulnerability(moby, 3) native func_00061C24 sets: bits 0xC of the flag
- * word at gameobject+0x1F0+0x228; the damage code, e.g. func_003CCF50, tests
- * them). The player from the iterator is that game object ([moby+0x40]). This
- * stops instant-kill attacks (Chameleon grab) that the health refill can't undo.
- * Only the bits we set are cleared again when God mode is turned off. */
-struct Inv { uint32_t player, bits; };
+/* God mode, part 2: the hero's moby is made non-damageable, as the game's own
+ * Lua set_damageable(moby, false) does (func_000606EC: bit 0x8 of the flag word
+ * at moby+0x64). The moby comes from the local-player iterator (func_0071DC64 on
+ * the iterator's entry, the same lookup func_0011C93C does before it returns
+ * [moby+0x40]); it is only touched when [moby+0x40] is that player. This stops
+ * instant-kill attacks (the Chameleon grab) that the health refill can't undo.
+ * Only a bit we cleared is set again when God mode is turned off. */
+struct Inv { uint32_t moby; int cleared; };
 static Inv s_inv[8];
 static int s_ninv = 0;
-static void god_player(uint32_t player, int on)
+static void god_moby(uint32_t moby, uint32_t player, int on)
 {
-    const uint32_t a = player + 0x1F0 + 0x228;
-    int k = 0; while (k < s_ninv && s_inv[k].player != player) k++;
+    if (!moby || vm_read32(moby + 0x40) != player) {
+        static int told = 0;
+        if (on && !told++) fprintf(stderr, "[cheat] god mode: hero moby not found (moby 0x%08X, player 0x%08X, [moby+0x40] 0x%08X)\n",
+                                   moby, player, moby ? vm_read32(moby + 0x40) : 0);
+        return;
+    }
+    const uint32_t a = moby + 0x64;
+    int k = 0; while (k < s_ninv && s_inv[k].moby != moby) k++;
     const uint32_t cur = vm_read32(a);
     if (on) {
-        const uint32_t add = 0xCu & ~cur;
-        if (!add) return;
+        if (!(cur & 0x8u)) return;
         if (k == s_ninv) {
             if (s_ninv >= 8) return;
-            s_inv[s_ninv++] = { player, 0 };
-            fprintf(stderr, "[cheat] god mode: player 0x%08X flags %08X -> %08X\n", player, cur, cur | 0xCu);
+            s_inv[s_ninv++] = { moby, 0 };
+            fprintf(stderr, "[cheat] god mode: hero moby 0x%08X (player 0x%08X) flags %08X -> %08X\n", moby, player, cur, cur & ~0x8u);
         }
-        s_inv[k].bits |= add;
-        vm_write32(a, cur | 0xCu);
-    } else if (k < s_ninv && s_inv[k].bits) {
-        vm_write32(a, cur & ~s_inv[k].bits);
-        fprintf(stderr, "[cheat] god mode off: player 0x%08X flags %08X -> %08X\n", player, cur, cur & ~s_inv[k].bits);
+        s_inv[k].cleared = 1;
+        vm_write32(a, cur & ~0x8u);
+    } else if (k < s_ninv && s_inv[k].cleared) {
+        vm_write32(a, cur | 0x8u);
+        fprintf(stderr, "[cheat] god mode off: hero moby 0x%08X flags %08X -> %08X\n", moby, cur, cur | 0x8u);
     }
 }
 
@@ -157,7 +163,7 @@ extern "C" void r2_cheats_frame(ppu_context* ctx)
     }
     static int ammo_was = 0, god_was = 0;
     const int god = g_r2_cheat_god, ammo = g_r2_cheat_ammo;
-    if (ammo && !ammo_was) { s_nhwm = 0; s_ndiag = 0; s_diag = 1; }   /* fresh start every time it is turned on */
+    if (ammo && !ammo_was) { s_nhwm = 0; s_ndiag = 0; s_gdiag = 0; s_diag = 1; }   /* fresh start every time it is turned on */
     ammo_was = ammo;
     const int god_off = god_was && !god;   /* turned off this frame: give back the invulnerability bits */
     if (!god && !ammo && !god_off) return;
@@ -178,7 +184,10 @@ extern "C" void r2_cheats_frame(ppu_context* ctx)
         const uint32_t player = (uint32_t)gcall(c, func_0011C93C, iter);
         if (player) {
             np++;
-            if (god || god_off) god_player(player, god);
+            if (god || god_off) {
+                const uint32_t ent = vm_read32(iter);
+                if (ent) god_moby((uint32_t)gcall(c, func_0071DC64, ent), player, god);
+            }
             if (ammo) ammo_player(c, player);
         }
         gcall(c, func_0071DD34, iter);                    /* next */
