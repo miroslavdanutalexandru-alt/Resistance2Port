@@ -3,9 +3,10 @@
  *   Ctrl+F1   God mode       every frame the game's own "set_hero_health_min"
  *                            native (func_00034854, the Lua binding at OPD
  *                            0x00D73940) is run with 4 = all four health bars, so
- *                            every local player's health is topped back up to full.
- *                            A single hit larger than full health (or a scripted
- *                            kill / falling out of the world) can still kill.
+ *                            every local player's health is topped back up to full,
+ *                            and the game's invulnerability flags (set_invulnerability
+ *                            mode 3, bits 0xC at player+0x418) are kept set, so
+ *                            instant-kill attacks don't land either.
  *   Ctrl+F2   Infinite ammo  every frame, for each local player's weapons (the
  *                            weapon lookup func_000F35BC, types 0..46) the four
  *                            ammo counters (primary +0x314/+0x316, alt +0x318/+0x31A,
@@ -114,6 +115,36 @@ static void ammo_player(ppu_context* c, uint32_t player)
     }
 }
 
+/* God mode, part 2: the game's own invulnerability flags (what the Lua
+ * set_invulnerability(moby, 3) native func_00061C24 sets: bits 0xC of the flag
+ * word at gameobject+0x1F0+0x228; the damage code, e.g. func_003CCF50, tests
+ * them). The player from the iterator is that game object ([moby+0x40]). This
+ * stops instant-kill attacks (Chameleon grab) that the health refill can't undo.
+ * Only the bits we set are cleared again when God mode is turned off. */
+struct Inv { uint32_t player, bits; };
+static Inv s_inv[8];
+static int s_ninv = 0;
+static void god_player(uint32_t player, int on)
+{
+    const uint32_t a = player + 0x1F0 + 0x228;
+    int k = 0; while (k < s_ninv && s_inv[k].player != player) k++;
+    const uint32_t cur = vm_read32(a);
+    if (on) {
+        const uint32_t add = 0xCu & ~cur;
+        if (!add) return;
+        if (k == s_ninv) {
+            if (s_ninv >= 8) return;
+            s_inv[s_ninv++] = { player, 0 };
+            fprintf(stderr, "[cheat] god mode: player 0x%08X flags %08X -> %08X\n", player, cur, cur | 0xCu);
+        }
+        s_inv[k].bits |= add;
+        vm_write32(a, cur | 0xCu);
+    } else if (k < s_ninv && s_inv[k].bits) {
+        vm_write32(a, cur & ~s_inv[k].bits);
+        fprintf(stderr, "[cheat] god mode off: player 0x%08X flags %08X -> %08X\n", player, cur, cur & ~s_inv[k].bits);
+    }
+}
+
 extern "C" void r2_cheats_frame(ppu_context* ctx)
 {
     static int init = 0;
@@ -124,12 +155,14 @@ extern "C" void r2_cheats_frame(ppu_context* ctx)
         if (g_r2_cheat_god || g_r2_cheat_ammo)
             fprintf(stderr, "[cheat] at start: god %d, ammo %d\n", g_r2_cheat_god, g_r2_cheat_ammo);
     }
-    static int ammo_was = 0;
+    static int ammo_was = 0, god_was = 0;
     const int god = g_r2_cheat_god, ammo = g_r2_cheat_ammo;
     if (ammo && !ammo_was) { s_nhwm = 0; s_ndiag = 0; s_diag = 1; }   /* fresh start every time it is turned on */
     ammo_was = ammo;
-    if (!god && !ammo) return;
+    const int god_off = god_was && !god;   /* turned off this frame: give back the invulnerability bits */
+    if (!god && !ammo && !god_off) return;
     if (g_trampoline_fn) return;         /* never expected at function entry; don't disturb it */
+    god_was = god;
 
     static ppu_context save;             /* main thread only */
     save = *ctx;
@@ -139,17 +172,20 @@ extern "C" void r2_cheats_frame(ppu_context* ctx)
 
     if (god) gcall(c, func_00034854, 4);
 
-    if (ammo) {
-        gcall(c, func_0071DE90, iter);                    /* local player iterator: begin */
-        int np = 0;
-        for (int guard = 0; guard < 8 && (gcall(c, func_0071DCD0, iter) & 0xFF); guard++) {
-            const uint32_t player = (uint32_t)gcall(c, func_0011C93C, iter);
-            if (player) { ammo_player(c, player); np++; }
-            gcall(c, func_0071DD34, iter);                /* next */
+    gcall(c, func_0071DE90, iter);                        /* local player iterator: begin */
+    int np = 0;
+    for (int guard = 0; guard < 8 && (gcall(c, func_0071DCD0, iter) & 0xFF); guard++) {
+        const uint32_t player = (uint32_t)gcall(c, func_0011C93C, iter);
+        if (player) {
+            np++;
+            if (god || god_off) god_player(player, god);
+            if (ammo) ammo_player(c, player);
         }
-        static int np_was = -1;
-        if (np != np_was) { fprintf(stderr, "[cheat] infinite ammo: %d player(s)\n", np); np_was = np; }
+        gcall(c, func_0071DD34, iter);                    /* next */
     }
+    if (god_off) s_ninv = 0;
+    static int np_was = -1;
+    if (np != np_was) { fprintf(stderr, "[cheat] %d local player(s)\n", np); np_was = np; }
 
     *ctx = save;
 }
