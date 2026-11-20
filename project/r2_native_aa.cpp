@@ -47,6 +47,7 @@
 #include "../ps3recomp/libs/video/rsx_vp_eval.h"
 #include "../ps3recomp/libs/video/rsx_vulkan_backend.h"
 #include "../ps3recomp/libs/video/rsx_vk_upscale.h"
+#include "../ps3recomp/libs/video/rsx_d3d12_engine.h"
 
 namespace {
 
@@ -70,6 +71,20 @@ struct Cfg {
     unsigned view = 0;     // RSX_AA_DEBUG_VIEW: 1 |AA - input| x8, 2 split screen
     bool mask = true;      // RSX_DLSS_MASK=0: no moving-object mask
 } g_cfg;
+
+// R2_RSX=d3d12: the same game hooks drive rsx_d3d12_engine's scene_aa (r2_native_aa_register_d3d12) with Halton
+// jitter; up_f stays 1 there (the D3D12 engine does its own corner rendering, g_up below).
+bool g_d3d12 = false;
+float g_d3d12_jsign = 1.f;   // DLSS: RSX_DLSS_JITTER_SIGN / RSX_AA_JITTER_SIGN
+unsigned g_d3d12_phases = 8; // RSX_AA_PHASES
+// Direct3D 12 render scale (RSX_UPSCALE < 1 with DLSS / FSR 3.1 / XeSS; 1 = native resolution): the engine's
+// scene window (rsx_d3d12_engine_aa_window; draws of the scene's size render at g_up x) closes when the
+// upscaler ran, at the flip, or when this frame's pass is skipped.
+float g_up = 1.f;
+void up_window_close() { if (g_d3d12 && g_up < 1.f) rsx_d3d12_engine_aa_window(0, 0); }
+bool up_ready() { return g_d3d12 ? rsx_d3d12_engine_temporal_upscaler_ready() != 0
+                                 : rsx_vulkan_backend_temporal_upscaler_ready() != 0; }
+void force_fsr1() { if (g_d3d12) rsx_d3d12_engine_force_output_fsr1(); else rsx_vulkan_backend_force_output_fsr1(); }
 
 void read_cfg()
 {
@@ -228,13 +243,14 @@ void run()
 {
     auto& st = g_st;
     st.aa_done = true;
-    if (st.disabled) return;
-    if (!rsx_vulkan_backend_temporal_upscaler_ready()) { skip_once("the upscaler is not ready"); return; }
+    if (st.disabled) { up_window_close(); return; }
+    if (!up_ready()) { up_window_close(); skip_once("the upscaler is not ready"); return; }
     if (!st.scene_draws || !st.color || !st.depth || !st.frame_S.valid || st.w < 16 || st.h < 16) {
+        up_window_close();
         skip_once("no scene this frame");
         return;
     }
-    if (st.msaa) { skip_once("the scene is multisampled"); return; }
+    if (st.msaa) { up_window_close(); skip_once("the scene is multisampled"); return; }
 
     m4 T = m4_identity();
     bool reset = st.need_reset || !st.prev_valid;
@@ -292,7 +308,7 @@ void run()
         q.out_h = st.h;
     }
     q.jitter_px[0] = st.jx; q.jitter_px[1] = st.jy;
-    const float js = rsx_vk_upscale_eval_jitter_sign();
+    const float js = g_d3d12 ? g_d3d12_jsign : rsx_vk_upscale_eval_jitter_sign();
     q.eval_jitter[0] = st.jx * js; q.eval_jitter[1] = st.jy * js;
     for (int r = 0; r < 4; ++r)
         for (int c = 0; c < 4; ++c) q.reproject[r * 4 + c] = (float)T.m[r][c];
@@ -303,6 +319,7 @@ void run()
     q.debug_view = g_cfg.view;
     q.use_mask = g_cfg.mask ? 1u : 0u;
     if (!rsx_draw_engine_scene_aa(&q)) {
+        up_window_close();
         skip_once("the upscaler pass failed");
         return;
     }
@@ -318,10 +335,10 @@ void on_draw(void*, const rsx_aa_draw_info* in)
     auto& st = g_st;
     st.cur_scene = false;
     if (st.disabled) return;
-    if (!rsx_vulkan_backend_temporal_upscaler_ready()) {
+    if (!up_ready()) {
         st.disabled = true;
         r2log("no temporal upscaler (DLSS / FSR 3.1) on this device; FSR1 output scaling instead");
-        rsx_vulkan_backend_force_output_fsr1();
+        force_fsr1();
         return;
     }
     const u32 rt = addr_key(in->color, in->color_location, in->color_offset);
@@ -349,6 +366,9 @@ void on_draw(void*, const rsx_aa_draw_info* in)
 
     if (st.scene_valid && !st.aa_done && ds == st.scene_ds && (dtest || dwrite)) {
         st.cur_scene = true;
+        // Direct3D 12 render scale: this and the rest of the scene's draws go into the corner (unverified in game)
+        if (g_d3d12 && g_up < 1.f && !st.msaa)
+            rsx_d3d12_engine_aa_window(1, rt == st.scene_rt && in->color ? in->color : in->depth);
         st.scene_draws++;
         st.depth = in->depth;
         if (rt == st.scene_rt) {
@@ -399,8 +419,9 @@ float draw_scale(void*)
 void on_flip(void*)
 {
     auto& st = g_st;
-    if (st.disabled) return;
+    if (st.disabled) { up_window_close(); return; }
     if (st.scene_draws && !st.aa_done) run();
+    up_window_close();
 
     // Next frame's scene: the depth buffer with the most depth-tested draws, then its busiest colour target.
     u32 best_ds = 0;
@@ -462,7 +483,7 @@ void on_flip(void*)
     // Upscale only a scene the pass ran on last frame (at full size the first time), like the jitter: a frame
     // drawn into the corner that the pass then misses is shown as is.
     st.up_frame = st.up_f < 1.f && st.ran_ok && st.scene_valid && !st.scene_changed &&
-                  rsx_vulkan_backend_temporal_upscaler_ready();
+                  up_ready();
     st.ran_ok = false;
     st.scene_draws = 0;
     st.draw_index = 0;
@@ -474,7 +495,17 @@ void on_flip(void*)
     st.frame++;
     st.jx = st.jy = 0.f;
     unsigned rw = 0, rh = 0, ow = 0, oh = 0;
-    if (jitter_on && st.w && rsx_vk_upscale_created_size(&rw, &rh, &ow, &oh) && ow) {
+    if (jitter_on && st.w && g_d3d12) {
+        // Direct3D 12: Halton(2,3) in render pixels (rsx_vk_upscale's native sequence); jitter_px is in guest
+        // pixels, 1 / g_up of a render pixel at a render scale.
+        unsigned i = (st.frame % g_d3d12_phases) + 1u, j = i;
+        float f = 1.f, r = 0.f;
+        while (i) { f *= 0.5f; r += f * (float)(i % 2u); i /= 2u; }
+        st.jx = (r - 0.5f) / g_up;
+        f = 1.f; r = 0.f;
+        while (j) { f /= 3.f; r += f * (float)(j % 3u); j /= 3u; }
+        st.jy = (r - 0.5f) / g_up;
+    } else if (jitter_on && st.w && rsx_vk_upscale_created_size(&rw, &rh, &ow, &oh) && ow) {
         // The selector's jitter (FSR 3.1's own sequence, else Halton(2,3)) is in render pixels; the engine's
         // jitter_px is in guest pixels of the scene target (the backend scales eval_jitter back by the same
         // render scale), so the upscaler gets exactly the selector's value.
@@ -524,6 +555,47 @@ extern "C" int r2_native_aa_register(void)
     return 1;
 }
 
+// Before rsx_d3d12_engine_init (R2_RSX=d3d12, experimental): RSX_FSR=1 FSR1 output scaling, 2 DLAA (DLSS),
+// 3 FSR 3.1 native AA, 4 XeSS native AA; RSX_UPSCALE < 1 renders the scene at that scale (experimental);
+// a provider that fails to load falls back to FSR1 output scaling. 1 when registered.
+extern "C" int r2_native_aa_register_d3d12(void)
+{
+    g_d3d12 = true;
+    const char* e = std::getenv("RSX_FSR");
+    const int mode = e ? std::atoi(e) : 0;
+    if (mode == 1) {
+        r2log("FSR1 (RSX_FSR=1): spatial output scaling on Direct3D 12");
+        rsx_d3d12_engine_force_output_fsr1();
+        return 0;
+    }
+    if (mode < 2 || mode > 4) return 0;
+    static const char* const names[] = { "", "", "DLAA", "FSR 3.1", "XeSS" };
+    read_cfg();
+    rsx_vk_upscale_config cfg;
+    rsx_vk_upscale_config_from_env(&cfg);   // DLSS preset, RSX_SHARPEN, jitter sign and phases
+    g_d3d12_jsign = mode == 2 && cfg.dlss_jitter_sign < 0.f ? -1.f : 1.f;
+    g_d3d12_phases = cfg.phases ? cfg.phases : 8u;
+    const float sharp = cfg.sharpness < 0.f ? 0.f : cfg.sharpness > 1.f ? 1.f : cfg.sharpness;
+    if (!rsx_d3d12_engine_use_upscaler(mode == 2 ? 1 : mode == 3 ? 2 : 3, sharp, cfg.dlss_preset)) {
+        r2log("%s unavailable on Direct3D 12; FSR1 output scaling instead", names[mode]);
+        rsx_d3d12_engine_force_output_fsr1();
+        return 0;
+    }
+    const char* us = std::getenv("RSX_UPSCALE");
+    g_up = rsx_d3d12_engine_set_render_scale(us ? (float)std::atof(us) : 1.f);
+    if (!(g_up > 0.f && g_up < 1.f)) g_up = 1.f;
+    if (g_up < 1.f && !cfg.phases) {
+        // the providers' recommendation: 8 x (output / render)^2 Halton phases
+        const double n = std::ceil(8.0 / ((double)g_up * (double)g_up) - 1e-6);
+        g_d3d12_phases = (unsigned)(n < 8.0 ? 8.0 : n > 64.0 ? 64.0 : n);
+    }
+    rsx_draw_engine_set_aa_hooks(&g_hooks);
+    r2log("%s native AA requested for Direct3D 12 (experimental, unverified in game; render scale %.3f, "
+          "%u jitter phases)", names[mode], (double)g_up, g_d3d12_phases);
+    return 1;
+}
+
 #else
 extern "C" int r2_native_aa_register(void) { return 0; }
+extern "C" int r2_native_aa_register_d3d12(void) { return 0; }
 #endif

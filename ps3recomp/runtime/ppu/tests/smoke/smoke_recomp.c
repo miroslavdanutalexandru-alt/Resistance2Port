@@ -613,6 +613,13 @@ void func_00010000(ppu_context* ctx)
      * of registration, and this one must get its verdict out while the rest of
      * the process is still standing. */
     atexit(smoke_verify);
+    /* sys_process_exit skips the CRT's exit handlers by default (ExitProcess);
+     * keep the exit() path so smoke_verify runs. */
+#ifdef _WIN32
+    _putenv("PS3_EXIT_CRT=1");
+#else
+    setenv("PS3_EXIT_CRT", "1", 1);
+#endif
 
     ctx->gpr[3] = SMOKE_EXIT_STATUS;
     func_00010700(ctx); DRAIN_TRAMPOLINE(ctx);

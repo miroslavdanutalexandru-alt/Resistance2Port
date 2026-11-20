@@ -26,6 +26,7 @@ extern volatile int g_ps3_host_paused; /* sys_ppu_thread.c: port pause, main thr
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
+#include "spu_sched.h"     /* PORT_SPU_SCHED: CV re-poll interval of blocked reads */
 #include "../syscalls/ps3_waitstat.h"   /* ps3_guest_mem_notify */
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
@@ -281,6 +282,19 @@ static uint64_t s_semfix_wait_t0[256];   /* us, start of the current capped wait
 static uint64_t s_semfix_ok_max[256];    /* us, longest recent satisfied wait (decays) */
 static uint64_t s_semfix_cap_t[256];     /* us, last cap; 0 = none pending */
 static volatile uint8_t s_semfix_circ[256];
+#include "semfix_heal.h"
+static semfix_heal_t s_semfix_heal[256];   /* R3_SEMFIX_HEAL (semfix_heal.h) */
+static unsigned semfix_heal_need(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("R3_SEMFIX_HEAL");
+        if (!e) e = getenv("R2_SEMFIX_HEAL");
+        int n = e ? atoi(e) : 3;
+        v = n < 0 ? 0 : n > 255 ? 255 : n;
+    }
+    return (unsigned)v;
+}
 static uint64_t semfix_now_us(void) { return spu_host_ns() / 1000u; }
 static void semfix_circ_note_spu(uint32_t w, uint32_t val)
 {
@@ -337,6 +351,7 @@ void semfix_note_spu(uint32_t ea, uint32_t size)
         s_semfix_last_spu[off >> 4] = s->spu_val;
         s_semfix_spu_seen[off >> 4] = 1;
         semfix_circ_note_spu(off >> 4, s->spu_val);
+        semfix_heal_store(&s_semfix_heal[off >> 4]);
     }
 }
 
@@ -379,6 +394,7 @@ void semfix_acquired(uint32_t ea)
     const uint32_t off = ea - base;
     if (!base || off >= 0x1000u || (off & 15u)) return;
     if (s_semfix[off >> 4].state) s_semfix[off >> 4].state = 0;
+    semfix_heal_satisfied(&s_semfix_heal[off >> 4]);
     semfix_wait_done(off >> 4);
 }
 
@@ -419,12 +435,7 @@ uint64_t semfix_wait_cap_us(uint32_t ea, uint32_t expect)
         if (mn < 0) mn = 0;
         s_semfix_min_ms = mn;
     }
-    if (mn && s_semfix_circ[w]) {
-        uint64_t c = s_semfix_ok_max[w] + (s_semfix_ok_max[w] >> 2) + 1000u;
-        if (c < (uint64_t)mn * 1000u) c = (uint64_t)mn * 1000u;
-        if (c < cap) cap = c;
-    }
-    return cap;
+    return semfix_heal_pick_cap(cap, s_semfix_circ[w] || s_semfix_heal[w].healed, s_semfix_ok_max[w], mn);
 }
 
 void semfix_cap_taken(uint32_t ea, uint32_t expect, uint32_t cur, uint64_t waited_us)
@@ -433,7 +444,11 @@ void semfix_cap_taken(uint32_t ea, uint32_t expect, uint32_t cur, uint64_t waite
     const uint32_t off = ea - g_semfix_base;
     if (off < 0x1000u) {
         s_semfix_wait_t0[off >> 4] = 0;
-        s_semfix_cap_t[off >> 4] = semfix_now_us();
+        /* only a long cap arms the circular-wait detection (semfix_heal_arms_circ) */
+        s_semfix_cap_t[off >> 4] = semfix_heal_arms_circ(&s_semfix_heal[off >> 4]) ? semfix_now_us() : 0;
+        if (semfix_heal_cap(&s_semfix_heal[off >> 4], semfix_heal_need()))
+            fprintf(stderr, "[semfix] label %u: %u capped waits in a row with no store of %08X in between (the store is not coming: FIFO desync / job not kicked) -> short cap (R3_SEMFIX_MIN_MS) until an acquire of it is satisfied (R3_SEMFIX_HEAL=0 off)\n",
+                    off >> 4, semfix_heal_need(), expect);
     }
     if (n <= 8 || (n & (n - 1)) == 0)
         fprintf(stderr, "[semfix] label %u: no SPU store of %08X after %llu ms (cur %08X), RSX continues (R2_SEMFIX_MS cap, %ld times)\n",
@@ -878,29 +893,17 @@ static DWORD WINAPI spu_phys_watch_thread(LPVOID p)
           if (spin_mode) { for (int i = 0; i < 32; i++) YieldProcessor(); } else Sleep(1); }
         /* logs\\ftrace.now -> record the frame timeline (ps3_ftrace) for the
          * next N seconds (file content, default 6) into logs/ftrace_reqK.txt.
-         * Needs PS3_FTRACE set (any far start, e.g. 99999:6:<path>) so the
-         * buffer exists; this only moves the window to "now". */
+         * Needs PS3_FTRACE set (a far start, e.g. 99999:6:<path>, keeps the
+         * recorder disarmed until this; ps3_ft_trigger allocates and arms;
+         * a trigger while a capture records or is written is logged, ignored). */
         { static unsigned fspin = 0;
           if ((++fspin & 0x7Fu) == 0 && GetFileAttributesA("logs\\ftrace.now") != INVALID_FILE_ATTRIBUTES) {
               double secs = 6.0;
               { FILE* ff = fopen("logs\\ftrace.now", "r"); if (ff) { double v; if (fscanf(ff, "%lf", &v) == 1 && v > 0 && v < 120) secs = v; fclose(ff); } }
               MoveFileExA("logs\\ftrace.now", "logs\\ftrace.done", MOVEFILE_REPLACE_EXISTING);
-              ps3_ft_state* fs = &g_ps3_ft;
-              (void)ps3_ft_on();
-              if (!fs->buf) fprintf(stderr, "[ftrace] not armed -- set PS3_FTRACE=99999:6:<path>\n");
-              else {
-                  static int nreq = 0;
-                  if (__atomic_load_n(&fs->dumped, __ATOMIC_ACQUIRE)) {
-                      __atomic_store_n(&fs->n, 0u, __ATOMIC_RELEASE); fs->dropped = 0;
-                      memset(fs->us, 0, sizeof fs->us);
-                      __atomic_store_n(&fs->dumped, 0, __ATOMIC_RELEASE);
-                  }
-                  snprintf(fs->path, sizeof fs->path, "logs/ftrace_req%d.txt", ++nreq);
-                  const uint64_t now = ps3_ft_now();
-                  fs->start = now; fs->end = now + (uint64_t)(secs * 1e9);
-                  __atomic_store_n(&fs->on, 2, __ATOMIC_RELEASE);
-                  fprintf(stderr, "[ftrace] recording %.1f s now -> %s\n", secs, fs->path);
-              }
+              static int nreq = 0;
+              char fp[64]; snprintf(fp, sizeof fp, "logs/ftrace_req%d.txt", nreq + 1);
+              if (ps3_ft_trigger(secs, fp)) ++nreq;
           } }
         /* logs\\phys.now -> dump the trace now (renamed to phys.done) */
         { static unsigned spin = 0;
@@ -1242,21 +1245,34 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
             s_llpoll_low = (e && *e) ? atoi(e) != 0 : !ps3_host_prio_boost();
         }
         if (s_llpoll_low && ea == t_llpoll_ea && t_llpoll_same >= 16) SwitchToThread();
+        /* GETLLAR polling backoff (SPU_FAST_LLPOLL=<pauses>, default 8;
+         * 0 = off). A run of SPU_FAST_LLPOLL_AFTER (default 64) fast
+         * re-reads means nobody has written the line: the SPU is
+         * spin-polling it (R2's raw-SPU job kernel returns to its caller
+         * on an empty queue and re-issues the GETLLAR: ~5.5M/s, most of
+         * rawSPU0's ~90% of a core). A tight 128-byte copy+compare poll
+         * slows whatever runs on the SMT sibling ~1.6x (replay, 5600X: job
+         * image 203 2013 -> 3230 us); 8 pauses per poll (~0.11 us)
+         * bring that to 1.18x (2369 us) -- a SPURS lane on a raw SPU's
+         * sibling then keeps most of its throughput. The pauses run BEFORE
+         * the read (as the yield above), never between the GETLLAR and the
+         * PUTLLC that may follow it, so the reservation window is unchanged.
+         * The poll answers at most ~0.1 us later. */
+        static int s_bo = -1; static unsigned s_bo_after = 64;
+        if (__builtin_expect(s_bo < 0, 0)) {
+            const char* e = getenv("SPU_FAST_LLPOLL"); const char* a = getenv("SPU_FAST_LLPOLL_AFTER");
+            int v = (e && *e) ? atoi(e) : 8; v = v < 0 ? 0 : v > 256 ? 256 : v;
+            if (a && *a && atoi(a) > 0) s_bo_after = (unsigned)atoi(a);
+            fprintf(stderr, "[spu-llpoll] SPU_FAST_LLPOLL=%d pause(s) per GETLLAR re-read after %u unchanged (0 = off)\n", v, s_bo_after);
+            s_bo = v;
+        }
+        if (s_bo && t_llfast_run >= s_bo_after) for (int k = 0; k < s_bo; k++) _mm_pause();
         /* Re-read of a line this SPU already holds: lock-free seqlock copy
          * (spu_coherency.c). Same snapshot and reservation as the locked path. */
         if (spu_coh_llar_fast(ctx, ea, ls)) {
             ctx->dbg_getllar++;
             SPU_PROF_ADD(ctx, getllar_fast, 1);
-            /* GETLLAR polling backoff (SPU_FAST_LLPOLL=1, default OFF): a run
-             * of fast re-reads means nobody has written the line, so the SPU
-             * is spin-waiting; one pause per poll after a long run frees the
-             * SMT sibling. Off by default: it measurably slowed the poll
-             * (0.078 -> 0.124 us/op with 4 pauses after 32), and R2's job
-             * kernel waits in rdch RdEventStat (spu_ch_wait already pauses),
-             * not in a bare GETLLAR loop. */
-            { static int s_bo = -1;
-              if (__builtin_expect(s_bo < 0, 0)) { const char* e = getenv("SPU_FAST_LLPOLL"); s_bo = e ? atoi(e) != 0 : 0; }
-              if (s_bo && ++t_llfast_run >= 256u) _mm_pause(); }
+            if (t_llfast_run < 0x7FFFFFFFu) t_llfast_run++;
             goto getllar_done;
         }
         t_llfast_run = 0;
@@ -1558,6 +1574,8 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     if (channel_is_mfc(channel)) {
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
          * not the plain GET/PUT the DMA engine would do. */
+        if (channel == MFC_Cmd && __builtin_expect(g_cpurep_spu_live != 0, 0) &&
+            cpurep_spu_atomic(ctx, v, spu_mfc_atomic)) return; /* cpu-replay */
         if (channel == MFC_Cmd && spu_mfc_atomic(ctx, v))
             return;
         if (channel == MFC_Cmd) { SPU_PROF_ADD(ctx, dma, 1); SPU_PROF_ADD(ctx, dma_bytes, ctx->mfc_size); }
@@ -1693,8 +1711,9 @@ static int yz_ch_block(void)
  *
  * Losing a reservation means the reserved line changed, and GETLLAR already
  * snapshots it, so compare against that snapshot rather than hooking every store.
- * ponytail: polled, not store-hooked -- one 128-byte memcmp per 10 ms poll on an
- * already-blocked SPU, and nothing at all on the PPU store path. The ceiling is
+ * ponytail: polled, not store-hooked -- one 128-byte memcmp per CV poll on an
+ * already-blocked SPU (every PORT_SPU_SCHED_MS, default 1 ms; 10 ms with
+ * PORT_SPU_SCHED=0), and nothing at all on the PPU store path. The ceiling is
  * one poll of wake latency, and an A-B-A write that restores the same bytes
  * between polls is missed; hook the writers if either ever matters.
  */
@@ -1739,7 +1758,9 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel) { return spu_ch_read
 
 /* Signal the per-SPU wait CV so a blocked spu_rdch re-checks its predicate.
  * MUST be called by every producer AFTER it makes a read predicate true. */
-static volatile long long g_sw_wakes;   /* [spuwait] stat, racy count */
+/* [spuwait] stat, racy count. Perf final pass: each counter on its own cache line, off the
+ * read-mostly spin-wait settings below that every wait reads. */
+static __declspec(align(64)) volatile long long g_sw_wakes;
 void spu_ch_wake(spu_context* ctx)
 {
     if (!ctx) return;
@@ -1784,8 +1805,9 @@ static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0)
 
 /* Resistance port (hot): PORT_SPU_SPINWAIT=old|backoff|wait picks how a
  * blocking channel read spins before it sleeps on ch_wait_cv.
- *   old     -- the v190 loop below (4 pauses per poll for SPU_WAIT_SPIN_US).
- *   backoff -- (default) same spin budget, but the pause run between polls
+ *   old     -- (default when PORT_NOSPIN=0) the v190 loop below (4 pauses per
+ *              poll for SPU_WAIT_SPIN_US).
+ *   backoff -- opt-in A/B: same spin budget, but the pause run between polls
  *              doubles every 16 polls (4 -> 128) and, after 20 us, every poll
  *              offers the core (SwitchToThread). The first ~2 us poll exactly
  *              as often as old, so a fast answer sees no extra latency; a long
@@ -1799,13 +1821,24 @@ static void spu_ft_wait_span(spu_context* ctx, uint32_t channel, uint64_t t0)
  * [spuwait] every ~10 s: waits, done-in-spin, slept, polls, yields, wakes. */
 static int s_spinwait_mode = -1;          /* 0 old, 1 backoff, 2 wait */
 static int s_spinwait_us = 20;
-static volatile long long g_sw_waits, g_sw_spin_ok, g_sw_slept, g_sw_polls, g_sw_yields, g_sw_wakes;
+static int s_spinwait_nospin = 0;         /* wait mode picked by PORT_NOSPIN (default on) */
+static __declspec(align(64)) volatile long long g_sw_waits;
+static __declspec(align(64)) volatile long long g_sw_spin_ok;
+static __declspec(align(64)) volatile long long g_sw_slept;
+static __declspec(align(64)) volatile long long g_sw_polls;
+static __declspec(align(64)) volatile long long g_sw_yields;
 static double s_sw_tsc_per_us;
 static void spu_spinwait_init(void)
 {
     const char* e = getenv("PORT_SPU_SPINWAIT");
     int m = 0;
     if (e && *e) m = !_stricmp(e, "old") || !strcmp(e, "0") ? 0 : !_stricmp(e, "wait") ? 2 : 1;
+    /* Low-core no-spin profile (ps3_host_nospin, sys_ppu_thread.c): with
+     * PORT_SPU_SPINWAIT unset, PORT_NOSPIN on (default; auto = < 12 logical CPUs) selects wait mode with a
+     * pause-only spin (no SwitchToThread per poll) and then the CV park, so a
+     * waiting raw SPU stops taking the core the synth lane / main thread need.
+     * PORT_NOSPIN=0 (or auto with >= 12 CPUs): unchanged. */
+    else { extern int ps3_host_nospin(void); if (ps3_host_nospin()) { m = 2; s_spinwait_nospin = 1; } }
     const char* u = getenv("PORT_SPU_SPINWAIT_US");
     if (u && *u) s_spinwait_us = atoi(u) < 0 ? 0 : atoi(u);
     LARGE_INTEGER f, q0, q1; QueryPerformanceFrequency(&f);
@@ -1814,8 +1847,9 @@ static void spu_spinwait_init(void)
     const unsigned long long t1 = __builtin_ia32_rdtsc();
     s_sw_tsc_per_us = (double)(t1 - t0) * (double)f.QuadPart / ((double)(q1.QuadPart - q0.QuadPart) * 1e6);
     if (s_sw_tsc_per_us < 100.0) s_sw_tsc_per_us = 100.0;
-    fprintf(stderr, "[spuwait] PORT_SPU_SPINWAIT=%s (spin %d us in wait mode, tsc %.0f/us)\n",
-            m == 0 ? "old" : m == 2 ? "wait" : "backoff", s_spinwait_us, s_sw_tsc_per_us);
+    fprintf(stderr, "[spuwait] PORT_SPU_SPINWAIT=%s%s (spin %d us in wait mode, tsc %.0f/us)\n",
+            m == 0 ? "old" : m == 2 ? "wait" : "backoff", s_spinwait_nospin ? " (nospin, pause-only spin)" : "",
+            s_spinwait_us, s_sw_tsc_per_us);
     s_spinwait_mode = m;
 }
 /* Backoff spin; returns 1 if the channel became ready. */
@@ -1839,6 +1873,64 @@ static int spu_spinwait_backoff(spu_context* ctx, uint32_t channel, int spin_us,
     if (yields) _InterlockedExchangeAdd64((volatile long long*)&g_sw_yields, yields);
     return ok;
 }
+/* PORT_SPU_SCHED (spu_sched.h): re-poll lost-reservation waits every
+ * PORT_SPU_SCHED_MS instead of every 10 ms. s_sched_missed counts sleeps that
+ * timed out with the line already changed -- wakes no producer delivered. */
+static int s_sched_on = -1, s_sched_ms = 1, s_sched_idle_ms = SPU_SCHED_IDLE_DEF_MS;
+static SPU_THREAD_LOCAL int t_sched_quiet;   /* PORT_SPU_SCHED_IDLE_MS streak (spu_sched.h) */
+static volatile long g_sched_ms_peak;          /* longest lost-reservation timeout this 10 s window */
+static __declspec(align(64)) volatile long long g_sched_lr_sleeps, g_sched_missed;
+/* PORT_SPU_SCHED_STATS (default on; 0 = off): how long the lost-reservation
+ * sleeps last, how many end on the timeout rather than a writer's wake, the
+ * share per SPU image (the job queue workers, 403/406 in R3), and which line a
+ * missed wake (a write that bypassed spu_coh_notify_write) was on -- appended
+ * to the [spu-sched] 10 s line. Two QPC reads per sleep; nothing per spin. */
+static int s_sched_stats = 0;
+static __declspec(align(64)) volatile long long g_sched_lr_qpc, g_sched_lr_tmo;
+enum { SPU_SCHED_IMGS = 8 };
+static volatile long g_sched_img_id[SPU_SCHED_IMGS];   /* image_id + 2 (1 = any negative id), 0 = free */
+static volatile long long g_sched_img_n[SPU_SCHED_IMGS], g_sched_img_qpc[SPU_SCHED_IMGS];
+static volatile long g_sched_miss_line, g_sched_miss_img, g_sched_miss_same;
+static void spu_sched_note(const spu_context* ctx, long long q0, int timed_out, int missed)
+{
+    LARGE_INTEGER q1; QueryPerformanceCounter(&q1);
+    const long long d = q1.QuadPart - q0;
+    _InterlockedExchangeAdd64((volatile long long*)&g_sched_lr_qpc, d);
+    if (timed_out) _InterlockedIncrement64((volatile long long*)&g_sched_lr_tmo);
+    const long id = ctx->image_id < 0 ? 1 : (long)ctx->image_id + 2; /* never 0: pure-interpretation jobs are -1 */
+    for (int i = 0; i < SPU_SCHED_IMGS; i++) {
+        long cur = g_sched_img_id[i];
+        if (!cur) cur = _InterlockedCompareExchange(&g_sched_img_id[i], id, 0);
+        if (!cur || cur == id) {
+            _InterlockedIncrement64((volatile long long*)&g_sched_img_n[i]);
+            _InterlockedExchangeAdd64((volatile long long*)&g_sched_img_qpc[i], d);
+            break;
+        }
+    }
+    if (missed) {
+        const long line = (long)(ctx->resv_ea & ~127u);
+        if (_InterlockedExchange(&g_sched_miss_line, line) == line) _InterlockedIncrement(&g_sched_miss_same);
+        g_sched_miss_img = (long)ctx->image_id;
+    }
+}
+static void spu_sched_init(void)
+{
+    s_sched_ms = spu_sched_parse_ms(getenv("PORT_SPU_SCHED_MS"));
+    const int on = spu_sched_parse_bool(getenv("PORT_SPU_SCHED"), 1);
+    s_sched_stats = spu_sched_parse_bool(getenv("PORT_SPU_SCHED_STATS"), 1);
+    s_sched_idle_ms = spu_sched_parse_idle_ms(getenv("PORT_SPU_SCHED_IDLE_MS"));
+    fprintf(stderr, "[spu-sched] PORT_SPU_SCHED=%d (lost-reservation waits re-poll every %d ms, others %d ms), stats %d (PORT_SPU_SCHED_STATS), "
+                    "idle backoff to %d ms (PORT_SPU_SCHED_IDLE_MS opt-in, 0 = off)\n",
+            on, on ? s_sched_ms : SPU_SCHED_SLOW_MS, SPU_SCHED_SLOW_MS, s_sched_stats,
+            s_sched_idle_ms > s_sched_ms ? s_sched_idle_ms : 0);
+    s_sched_on = on;
+}
+/* Effective state for the [native] line (project/main.cpp). */
+int spu_sched_effective(void)
+{
+    if (s_sched_on < 0) spu_sched_init();
+    return s_sched_on;
+}
 static void spu_spinwait_report(void)
 {
     static volatile long long s_next;
@@ -1853,7 +1945,69 @@ static void spu_spinwait_report(void)
             s_spinwait_mode == 0 ? "old" : s_spinwait_mode == 2 ? "wait" : "backoff",
             w - l_w, ok - l_ok, sl - l_sl, p - l_p, y - l_y, wk - l_wk);
     l_w = w; l_ok = ok; l_sl = sl; l_p = p; l_y = y; l_wk = wk;
+    static long long l_ls, l_ms, l_rw;
+    const long long ls = g_sched_lr_sleeps, ms = g_sched_missed;
+    if (ls != l_ls) {
+        const long peak = _InterlockedExchange(&g_sched_ms_peak, 0);
+        fprintf(stderr, "[spu-sched] 10s: lost-reservation sleeps=%lld missed wakes=%lld (caught by the %ld ms re-poll) range-notify wakes=%lld",
+                ls - l_ls, ms - l_ms, peak > 0 ? peak : (long)(s_sched_on > 0 ? s_sched_ms : SPU_SCHED_SLOW_MS),
+                g_spu_coh_range_wakes - l_rw);
+        if (s_sched_stats) {
+            static LARGE_INTEGER qf;
+            if (!qf.QuadPart) QueryPerformanceFrequency(&qf);
+            const long long sq = _InterlockedExchange64((volatile long long*)&g_sched_lr_qpc, 0);
+            const long long tmo = _InterlockedExchange64((volatile long long*)&g_sched_lr_tmo, 0);
+            const double k = 1000.0 / (double)qf.QuadPart;
+            fprintf(stderr, "; asleep %.1f ms (avg %.0f us), %lld ended on the timeout", sq * k,
+                    ls > l_ls ? sq * k * 1000.0 / (double)(ls - l_ls) : 0.0, tmo);
+            int by_img = 0;
+            for (int i = 0; i < SPU_SCHED_IMGS; i++) {
+                const long id = g_sched_img_id[i];
+                if (!id) break;
+                const long long n = _InterlockedExchange64((volatile long long*)&g_sched_img_n[i], 0);
+                const long long q = _InterlockedExchange64((volatile long long*)&g_sched_img_qpc[i], 0);
+                if (n) fprintf(stderr, "%s img %ld %lld/%.1f ms", by_img++ ? "," : "; by image:", id - 2, n, q * k);
+            }
+            if (ms != l_ms)
+                fprintf(stderr, "; last missed line 0x%08lX (img %ld, %ld repeats of the same line)",
+                        (unsigned long)g_sched_miss_line, g_sched_miss_img, _InterlockedExchange(&g_sched_miss_same, 0));
+        }
+        fprintf(stderr, "\n");
+    }
+    l_ls = ls; l_ms = ms; l_rw = g_spu_coh_range_wakes;
 }
+
+/* PORT_SPU_SPIN_ADAPT=<pct> (default 25; 0 = spin on every wait as before):
+ * adaptive pre-sleep spin, adapted from the inFAMOUS 2 PC port
+ * (PS3_SPU_SPIN_ADAPT, spu_channels.c, MIT -- THIRD_PARTY_NOTICES.md). Each SPU
+ * host thread keeps a running estimate (of 1024) of how often its spins end
+ * with the channel ready, and skips the spin while that is below <pct> percent:
+ * an SPU that mostly sits idle (menus, a paused game, a sleeping sound engine)
+ * stops burning its spin window on every wait -- on a 4-core CPU that window
+ * is a core the main thread needs. Every 8th skipped wait spins anyway to
+ * re-measure, so a thread whose waits turn short again gets its spin back. */
+static int s_spin_adapt = -1;                 /* threshold of 1024; 0 = off */
+static SPU_THREAD_LOCAL int t_spin_p = 1024;  /* starts optimistic */
+static SPU_THREAD_LOCAL unsigned t_spin_skip;
+static int spu_spin_adapt_init(void)
+{
+    const char* e = getenv("PORT_SPU_SPIN_ADAPT");
+    int pct = (e && *e) ? atoi(e) : 25;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    s_spin_adapt = pct * 1024 / 100;
+    fprintf(stderr, "[spuwait] adaptive spin %s (PORT_SPU_SPIN_ADAPT=%d%%)\n",
+            pct ? "on: skip the spin while fewer waits end in it" : "off", pct);
+    return s_spin_adapt;
+}
+/* 1 = skip this wait's spin. */
+static inline int spu_spin_gate(void)
+{
+    const int thr = s_spin_adapt < 0 ? spu_spin_adapt_init() : s_spin_adapt;
+    if (!thr || t_spin_p >= thr) return 0;
+    return (++t_spin_skip & 7u) != 0;
+}
+static inline void spu_spin_note(int hit) { t_spin_p += ((hit ? 1024 : 0) - t_spin_p) / 8; }
 
 /* Block the calling SPU host thread until `channel` is readable. */
 static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
@@ -1895,10 +2049,11 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
         }
         if (s_spinwait_mode < 0) spu_spinwait_init();
         int spun_ok = -1;
-        if (s_spinwait_mode != 0 && (s_spin_all || ctx->spu_id < 8u)) {
+        const int spin_here = (s_spin_all || ctx->spu_id < 8u) && !spu_spin_gate();   /* PORT_SPU_SPIN_ADAPT */
+        if (s_spinwait_mode != 0 && spin_here) {
             const int us = s_spinwait_mode == 2 ? s_spinwait_us : s_spin_us;
-            spun_ok = us > 0 ? spu_spinwait_backoff(ctx, channel, us, s_low) : 0;
-        } else if (s_spin_us > 0 && (s_spin_all || ctx->spu_id < 8u)) {
+            spun_ok = us > 0 ? spu_spinwait_backoff(ctx, channel, us, s_spinwait_nospin ? 0 : s_low) : 0;
+        } else if (s_spin_us > 0 && spin_here) {
             /* SPU_FAST_WAIT (default on): poll the predicate every 4 pauses
              * instead of 24 (wake latency), and read the clock every 16th
              * poll instead of every one -- QueryPerformanceCounter in this
@@ -1923,6 +2078,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
         }
         _InterlockedIncrement64((volatile long long*)&g_sw_waits);
         if (spun_ok < 0) spun_ok = spu_ch_ready_ex(ctx, channel, 0);
+        if (spin_here) spu_spin_note(spun_ok);
         if (spun_ok) _InterlockedIncrement64((volatile long long*)&g_sw_spin_ok);
         spu_spinwait_report();
     }
@@ -1933,8 +2089,26 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
             AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             if (!spu_ch_ready(ctx, channel)) {
                 _InterlockedIncrement64((volatile long long*)&g_sw_slept);
-                SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
-                                          (SRWLOCK*)&ctx->ch_wait_lock, 10, 0);
+                if (s_sched_on < 0) spu_sched_init();
+                const int lr = channel == SPU_RdEventStat && (ctx->event_mask & SPU_SCHED_LR_EVENT) && ctx->resv_valid;
+                DWORD ms = spu_sched_wait_ms(s_sched_on, s_sched_ms, channel == SPU_RdEventStat,
+                                             ctx->event_mask, ctx->resv_valid);
+                if (lr && s_sched_on > 0) ms = spu_sched_idle_ms(ms, t_sched_quiet, s_sched_idle_ms);
+                if (lr && (long)ms > g_sched_ms_peak) g_sched_ms_peak = (long)ms;
+                if (lr) _InterlockedIncrement64((volatile long long*)&g_sched_lr_sleeps);
+                LARGE_INTEGER sq0; sq0.QuadPart = 0;
+                if (lr && s_sched_stats) QueryPerformanceCounter(&sq0);
+                const BOOL woke = SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
+                                                            (SRWLOCK*)&ctx->ch_wait_lock, ms, 0);
+                int missed = 0;
+                if (!woke && lr && ctx->resv_valid) {
+                    /* timed out with the reservation still armed: a changed
+                     * line now is a write that never called spu_ch_wake */
+                    spu_resv_lost_poll(ctx);
+                    if (!ctx->resv_valid) { _InterlockedIncrement64((volatile long long*)&g_sched_missed); missed = 1; }
+                }
+                if (lr) t_sched_quiet = spu_sched_idle_next(t_sched_quiet, !woke, missed);
+                if (sq0.QuadPart) spu_sched_note(ctx, sq0.QuadPart, !woke, missed);
             }
             ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             /* Resistance port: the PPU stopped this raw SPU (spu_raw.c). */
@@ -2397,6 +2571,175 @@ void spu_register_function(uint32_t addr, spu_fn fn)
         s_hash_next[s_hash_tail[h] - 1] = i + 1;
     s_hash_tail[h] = i + 1;
 }
+
+/* r7c: SPU_PROF_SAMPLE=1 (off by default) samples the SPURS lane threads every
+ * SPU_PROF_SAMPLE_MS (2) and prints, every SPU_PROF_SAMPLE_SECS (5):
+ *   - per lane state: parked (OS, no lifted frame), running without a lifted
+ *     frame (kernel/interpreter), OS wait, runtime (DMA/channel/
+ *     spin helpers under a lifted frame), lifted job code;
+ *   - per image: share split the same way;
+ *   - top lifted functions (img:LS addr) and top host leaves (module+RVA,
+ *     for llvm-symbolizer) -- the native-replacement targets. */
+#ifdef _WIN32
+enum { SPU_PS_MAX_THR = 32, SPU_PS_NIMG = 1024, SPU_PS_NF = 1 << 14, SPU_PS_NL = 1 << 12 };
+static HANDLE s_ps_thr[SPU_PS_MAX_THR];
+static volatile LONG s_ps_nthr;
+typedef struct { DWORD64 fn; uint32_t idx; } spu_ps_ent;
+static int spu_ps_cmp(const void* a, const void* b)
+{
+    const DWORD64 x = ((const spu_ps_ent*)a)->fn, y = ((const spu_ps_ent*)b)->fn;
+    return x < y ? -1 : x > y;
+}
+static DWORD WINAPI spu_prof_sample_thread(LPVOID unused)
+{
+    (void)unused;
+    const int ms = spu_env_flag("SPU_PROF_SAMPLE_MS", 2) > 0 ? spu_env_flag("SPU_PROF_SAMPLE_MS", 2) : 2;
+    const int secs = spu_env_flag("SPU_PROF_SAMPLE_SECS", 5) > 0 ? spu_env_flag("SPU_PROF_SAMPLE_SECS", 5) : 5;
+    const int top = spu_env_flag("SPU_PROF_SAMPLE_TOP", 25) > 0 ? spu_env_flag("SPU_PROF_SAMPLE_TOP", 25) : 25;
+    static spu_ps_ent* tab; static uint32_t ntab;
+    /* per image: [0] OS, [1] runtime, [2] lifted */
+    static uint32_t img_c[SPU_PS_NIMG][3];
+    static uint64_t fkey[SPU_PS_NF]; static uint32_t fcnt[SPU_PS_NF];
+    static DWORD64 lkey[SPU_PS_NL]; static uint32_t lcnt[SPU_PS_NL];
+    tab = (spu_ps_ent*)malloc(sizeof(spu_ps_ent) * SPU_FN_REGISTRY_MAX);
+    if (!tab) return 0;
+    HMODULE os_mod[4] = { GetModuleHandleA("ntdll.dll"), GetModuleHandleA("KernelBase.dll"),
+                          GetModuleHandleA("kernel32.dll"), GetModuleHandleA("win32u.dll") };
+    fprintf(stderr, "[spu-sample] SPU_PROF_SAMPLE: SPURS lanes every %d ms, report every %d s\n", ms, secs);
+    for (int win = 1;; win++) {
+        /* the registry only appends: rebuild the sorted host-fn index per window */
+        const uint32_t n = s_registry_count;
+        if (n != ntab) {
+            for (uint32_t i = 0; i < n; i++) { tab[i].fn = (DWORD64)(uintptr_t)s_registry[i].fn; tab[i].idx = i; }
+            qsort(tab, n, sizeof *tab, spu_ps_cmp);
+            ntab = n;
+        }
+        memset(img_c, 0, sizeof img_c); memset(fkey, 0, sizeof fkey); memset(fcnt, 0, sizeof fcnt);
+        memset(lkey, 0, sizeof lkey); memset(lcnt, 0, sizeof lcnt);
+        uint32_t total = 0, idle = 0, idle_run = 0, os = 0, rt = 0, lifted = 0;
+        const ULONGLONG end = GetTickCount64() + (ULONGLONG)secs * 1000;
+        while (GetTickCount64() < end) {
+            Sleep(ms);
+            const LONG nt = s_ps_nthr;
+            for (LONG t = 0; t < nt; t++) {
+                HANDLE h = s_ps_thr[t];
+                if (!h || SuspendThread(h) == (DWORD)-1) continue;
+                CONTEXT c; c.ContextFlags = CONTEXT_FULL;
+                DWORD64 leaf = 0; int got = 0, depth_lift = -1; uint32_t ridx = 0;
+                if (GetThreadContext(h, &c)) {
+                    got = 1;
+                    for (int d = 0; d < 40 && c.Rip; d++) {
+                        DWORD64 base = 0;
+                        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c.Rip, &base, NULL);
+                        const DWORD64 start = f ? base + f->BeginAddress : c.Rip;
+                        if (d == 0) leaf = start;
+                        if (f && ntab) {
+                            uint32_t lo = 0, hi = ntab;
+                            while (lo < hi) { uint32_t m = (lo + hi) / 2; if (tab[m].fn < start) lo = m + 1; else hi = m; }
+                            if (lo < ntab && tab[lo].fn == start) { depth_lift = d; ridx = tab[lo].idx; break; }
+                        }
+                        if (!f) { if (d) break; c.Rip = *(DWORD64*)c.Rsp; c.Rsp += 8; continue; }
+                        PVOID hd; DWORD64 ef;
+                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, f, &c, &hd, &ef, NULL);
+                    }
+                }
+                ResumeThread(h);
+                if (!got) continue;
+                total++;
+                HMODULE m = NULL;
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)leaf, &m);
+                int in_os = 0;
+                for (int k = 0; k < 4; k++) if (m && m == os_mod[k]) in_os = 1;
+                if (depth_lift < 0) {
+                    /* no lifted frame: parked lane (OS) or kernel/interpreter work */
+                    if (in_os) idle++;
+                    else {
+                        idle_run++;
+                        uint32_t i = (uint32_t)((leaf >> 4) * 2654435761u) & (SPU_PS_NL - 1);
+                        for (uint32_t p = 0; p < SPU_PS_NL && lkey[i] && lkey[i] != leaf; p++) i = (i + 1) & (SPU_PS_NL - 1);
+                        if (!lkey[i] || lkey[i] == leaf) { lkey[i] = leaf; lcnt[i]++; }
+                    }
+                    continue;
+                }
+                const int cls = depth_lift == 0 ? 2 : in_os ? 0 : 1;
+                if (cls == 0) os++; else if (cls == 1) rt++; else lifted++;
+                const int img = s_registry[ridx].image_id;
+                img_c[(unsigned)img < SPU_PS_NIMG ? img : 0][cls]++;
+                if (cls == 2) {
+                    const uint64_t k = ((uint64_t)(uint32_t)img << 32) | s_registry[ridx].addr | 1ull << 63;
+                    uint32_t i = (uint32_t)((k * 0x9E3779B97F4A7C15ull) >> 50) & (SPU_PS_NF - 1);
+                    for (uint32_t p = 0; p < SPU_PS_NF && fkey[i] && fkey[i] != k; p++) i = (i + 1) & (SPU_PS_NF - 1);
+                    if (!fkey[i] || fkey[i] == k) { fkey[i] = k; fcnt[i]++; }
+                } else {
+                    uint32_t i = (uint32_t)((leaf >> 4) * 2654435761u) & (SPU_PS_NL - 1);
+                    for (uint32_t p = 0; p < SPU_PS_NL && lkey[i] && lkey[i] != leaf; p++) i = (i + 1) & (SPU_PS_NL - 1);
+                    if (!lkey[i] || lkey[i] == leaf) { lkey[i] = leaf; lcnt[i]++; }
+                }
+            }
+        }
+        if (!total) continue;
+        /* % of all lane samples; x lanes = busy lanes */
+        const double pc = 100.0 / total, lanes = (double)s_ps_nthr;
+        fprintf(stderr, "[spu-sample] window %d: %ld lanes, %u samples | parked %.1f%% | no lifted frame, running %.1f%% | in job: lifted %.1f%% runtime %.1f%% OS-wait %.1f%% (= %.2f lanes computing, %.2f waiting)\n",
+                win, (long)s_ps_nthr, total, idle * pc, idle_run * pc, lifted * pc, rt * pc, os * pc,
+                lanes * (lifted + rt) / total, lanes * os / total);
+        for (int r = 0; r < 12; r++) {
+            int bi = -1; uint32_t best = 0;
+            for (int i = 0; i < SPU_PS_NIMG; i++) {
+                const uint32_t s = img_c[i][0] + img_c[i][1] + img_c[i][2];
+                if (s > best) { best = s; bi = i; }
+            }
+            if (bi < 0) break;
+            fprintf(stderr, "[spu-sample]   img %d: %.1f%% (%.2f lanes) = lifted %.1f%% runtime %.1f%% OS-wait %.1f%%\n",
+                    bi, best * pc, lanes * best / total, img_c[bi][2] * pc, img_c[bi][1] * pc, img_c[bi][0] * pc);
+            img_c[bi][0] = img_c[bi][1] = img_c[bi][2] = 0;
+        }
+        for (int r = 0; r < top; r++) {
+            uint32_t best = 0, bi = 0;
+            for (uint32_t i = 0; i < SPU_PS_NF; i++) if (fcnt[i] > best) { best = fcnt[i]; bi = i; }
+            if (!best) break;
+            fprintf(stderr, "[spu-sample]   lifted img %u LS 0x%05X %.1f%%\n",
+                    (unsigned)((fkey[bi] >> 32) & 0x7FFFFFFFu), (unsigned)(uint32_t)fkey[bi], best * pc);
+            fcnt[bi] = 0;
+        }
+        for (int r = 0; r < 15; r++) {
+            uint32_t best = 0, bi = 0;
+            for (uint32_t i = 0; i < SPU_PS_NL; i++) if (lcnt[i] > best) { best = lcnt[i]; bi = i; }
+            if (!best) break;
+            HMODULE m = NULL; char mn[MAX_PATH] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)lkey[bi], &m) && m)
+                GetModuleFileNameA(m, mn, sizeof mn);
+            const char* bn = strrchr(mn, '\\');
+            fprintf(stderr, "[spu-sample]   host leaf %s+0x%llX %.1f%%\n", bn ? bn + 1 : mn,
+                    (unsigned long long)(lkey[bi] - (DWORD64)(uintptr_t)m), best * pc);
+            lcnt[bi] = 0;
+        }
+        fflush(stderr);
+    }
+}
+/* Called by each SPURS lane thread at start (cellSpurs.c spurs_pm_worker). */
+void spu_prof_sample_add_self(void)
+{
+    static int on = -1;
+    if (on < 0) on = spu_env_flag("SPU_PROF_SAMPLE", 0);
+    if (!on) return;
+    HANDLE h = NULL;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
+                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0))
+        return;
+    const LONG i = InterlockedIncrement(&s_ps_nthr) - 1;
+    if (i >= SPU_PS_MAX_THR) { InterlockedDecrement(&s_ps_nthr); CloseHandle(h); return; }
+    s_ps_thr[i] = h;
+    if (i == 0) {
+        HANDLE t = CreateThread(NULL, 0, spu_prof_sample_thread, NULL, 0, NULL);
+        if (t) { SetThreadPriority(t, THREAD_PRIORITY_HIGHEST); CloseHandle(t); }
+    }
+}
+#else
+void spu_prof_sample_add_self(void) {}
+#endif
 
 /* Report a CROSS-IMAGE match: the registry served a function some other image
  * registered at this address, because one side's image_id was the 0 wildcard.

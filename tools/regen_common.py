@@ -47,6 +47,7 @@ def spu_post(f, hooks):
     run([sys.executable, os.path.join(HERE, 'spu_regcache.py'), f, f])
     run([sys.executable, os.path.join(HERE, 'spu_directhop.py'), f])
     run([sys.executable, os.path.join(HERE, 'spu_hooks.py'), 'apply', 'post', f, hooks])
+    run([sys.executable, os.path.join(HERE, 'spu_w0.py'), f])
 
 def fix_includes(d):
     for f in glob.glob(os.path.join(d, 'spu_recomp.*')):

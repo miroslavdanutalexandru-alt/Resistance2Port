@@ -51,6 +51,7 @@ extern int g_spu_force_ch_block;              /* spu_channels.c */
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 /* For attributing an MMIO store to the guest code that made it. */
 #include "../ppu/ppu_context.h"
+#include "../platform/port_hires_sleep.h"   /* port_sleep_1ms (perf pass 9) */
 extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
 extern void ps3_hle_register_ctx(uint32_t nid, const char* name,
                                  void (*fn)(ppu_context*));
@@ -471,10 +472,15 @@ static void raw_spu_start(raw_spu* s)
     /* Resistance port: raw SPU 0 is the game's sound engine. It parks on a
      * channel between commands, so a high priority costs nothing; at normal
      * priority it was scheduled late under load and the mix underran
-     * (crackle). SPU_RAW_PRIO=0 off. */
-    else { extern int ps3_host_prio_boost(void);
+     * (crackle). SPU_RAW_PRIO=0 off. Without the general boost (low CPU
+     * profile) raw SPU 0 alone gets ABOVE_NORMAL with the audio-only boost,
+     * and only while its channel waits park (PORT_NOSPIN), so it cannot
+     * starve the main thread by spinning. */
+    else { extern int ps3_host_prio_boost(void), ps3_host_audio_boost(void), ps3_host_nospin(void);
            const char* e = getenv("SPU_RAW_PRIO");
-           if (e ? atoi(e) : ps3_host_prio_boost()) SetThreadPriority(s->thread, THREAD_PRIORITY_HIGHEST); }
+           if (e ? atoi(e) : ps3_host_prio_boost()) SetThreadPriority(s->thread, THREAD_PRIORITY_HIGHEST);
+           else if (!e && n == 0 && ps3_host_audio_boost() && ps3_host_nospin())
+               SetThreadPriority(s->thread, THREAD_PRIORITY_ABOVE_NORMAL); }
 #endif
 }
 

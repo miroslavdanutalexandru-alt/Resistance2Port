@@ -14,10 +14,9 @@
  *        above). PC Options: frame rate, upscaler (next start), mouse
  *        sensitivity, field of view, controller prompts (at once); each change
  *        is saved where the launcher keeps it (settings.ini + settings.bat,
- *        controls.txt). The game's own pause / main menus are Scaleform movies
- *        the port does not edit; a small hint ("F10: PC menu") is shown while
- *        the pause menu is up and once at start (R2_MENU_PC_HINT=0 hides it;
- *        off by default in exclusive fullscreen unless the swapchain OSD is on).
+ *        controls.txt). The game's own pause / main menus are Scaleform movies;
+ *        their PC SETTINGS entries are r2_menurows.cpp's (native pages of the
+ *        game's own options panels; this menu is never opened from them).
  *   F12 / PrtScn  screenshot of the game window -> screenshots\R2_<date>_<time>.png
  *   Focus loss    R2_BACKGROUND = pause (default: the game's frame loop is held
  *                 in stubs.cpp r2_frame_period and the sound muted) | mute | run.
@@ -41,6 +40,7 @@
 #include <vector>
 #include <string>
 #include "port_osd.h"
+#include "port_ini_migrate.h"
 #pragma comment(lib, "xinput.lib")
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
@@ -51,16 +51,18 @@ extern "C" {
 volatile int g_r2pc_paused = 0;                      /* read by stubs.cpp r2_frame_period, debugtools.inc */
 extern volatile int g_port_ui_modal;                 /* libs/input/cellPad.c: game input blocked */
 extern volatile int g_port_audio_mute;               /* libs/audio/cellAudio.c */
+extern volatile long g_port_audio_focus_gen;         /* libs/audio/cellAudio.c: focus regained */
 extern volatile long g_savedata_busy;                /* libs/system/cellSaveData.c */
 extern volatile int g_kbm_capture;                   /* cellPad.c: F8 mouse release */
 void sys_fs_flush_all(void);                         /* runtime/syscalls/sys_fs.c */
 extern void (*volatile g_port_ui_tick)(void* hwnd);  /* libs/video/rsx_null_backend.c */
 extern void (*volatile g_port_close_hook)(void* hwnd);
-extern volatile unsigned long long g_r2_look_ms;     /* stubs.cpp: the on-foot look code last ran (ms) */
 void cellpad_set_glyph_pref(const char* v);          /* cellPad.c: live R2_PAD_GLYPHS */
 double cellpad_mouse_sens(void);
 void cellpad_set_mouse_sens(double s);
 extern uint8_t* vm_base;
+extern volatile int g_port_input_mode;               /* cellPad.c: 0 PS3, 1 keyboard & mouse, 2 Xbox, 3 Nintendo */
+void r2_button_name(const char* pad, int mode, char* out, int n);   /* stubs.cpp */
 }
 
 enum { BG_PAUSE, BG_MUTE, BG_RUN };
@@ -71,7 +73,7 @@ static volatile int s_shot_req = 0;
 
 /* ---- the prompt / toast / PC menu window ------------------------------- */
 enum { OV_NONE, OV_ASK, OV_SAVING, OV_RELEASE, OV_MENU };
-enum { KIND_DIALOG, KIND_TOAST, KIND_HINT, KIND_MENU };
+enum { KIND_DIALOG, KIND_TOAST, KIND_MENU };
 static int s_ov_state = OV_NONE;
 static HWND s_ov = NULL;
 static wchar_t s_ov_l1[96], s_ov_l2[160];
@@ -89,7 +91,7 @@ static int s_menu_row_top = 0, s_menu_row_h = 1, s_menu_val_x = 0;   /* last pai
 static POINT s_menu_mouse0; static int s_menu_mouse_armed = 0;        /* cursor at open; moved since */
 static void menu_mouse_reset(void) { GetCursorPos(&s_menu_mouse0); s_menu_mouse_armed = 0; }
 struct PcChoice { std::wstring label; std::string value; };
-enum { OPT_FPS, OPT_FSR, OPT_SENS, OPT_FOV, OPT_PROMPTS, OPT_COUNT };
+enum { OPT_FPS, OPT_FSR, OPT_SENS, OPT_FOV, OPT_ASPECT, OPT_PROMPTS, OPT_COUNT };
 struct PcOpt { const wchar_t* title; const wchar_t* help; const char* ini; int restart; std::vector<PcChoice> ch; int sel, run; };
 static PcOpt s_opt[OPT_COUNT];
 static double s_sens = 1.0;
@@ -131,6 +133,15 @@ static bool file_set(const char* path, const std::string& prefix, const std::str
 static std::string ini_get(const char* key)
 {
     std::vector<std::string> in; read_lines("settings.ini", in);
+    static bool s_migrated = false;                  /* renamed keys (port_ini_migrate.h): read under the new name, */
+    if (port_ini_migrate_lines(in) > 0 && !s_migrated) {   /* written back once; the old line stays as a fallback */
+        s_migrated = true;
+        if (FILE* f = fopen("settings.ini.pcmenu.tmp", "w")) {
+            for (auto& l : in) fprintf(f, "%s\n", l.c_str());
+            if (fclose(f) != 0 || !MoveFileExA("settings.ini.pcmenu.tmp", "settings.ini", MOVEFILE_REPLACE_EXISTING))
+                DeleteFileA("settings.ini.pcmenu.tmp");
+        }
+    }
     const std::string p = std::string(key) + "=";
     for (auto& l : in) if (!strncmp(l.c_str(), p.c_str(), p.size())) return l.substr(p.size());
     return std::string("\x01");                      /* not there */
@@ -165,20 +176,26 @@ static void opts_init(void)
     if (!_stricmp(fps.c_str(), "uncapped") || !_stricmp(fps.c_str(), "max") || !_stricmp(fps.c_str(), "unlimited") || !_stricmp(fps.c_str(), "off")) fps = "0";
     if (!_stricmp(fps.c_str(), "display")) fps = "refresh";
     opt_add(OPT_FPS, L"Frame rate", L"30 is the PS3 original. Above 60 is experimental: game speed stays right, but the 60 Hz physics step judders.", "fps", 1,
-            { {L"30 fps (PS3 original)", "30"}, {L"60 fps", "60"}, {L"120 fps (experimental)", "120"}, {L"144 fps (experimental)", "144"},
-              {L"Match display", "refresh"}, {L"Uncapped (experimental)", "0"} }, fps);
+            { {L"30 fps (PS3 original)", "30"}, {L"40 fps", "40"}, {L"45 fps", "45"}, {L"60 fps", "60"}, {L"72 fps", "72"},
+              {L"90 fps (experimental)", "90"}, {L"120 fps (experimental)", "120"}, {L"144 fps (experimental)", "144"}, {L"165 fps (experimental)", "165"},
+              {L"240 fps (experimental)", "240"}, {L"Match display", "refresh"}, {L"Just under refresh (VRR)", "vrr"}, {L"Uncapped (experimental)", "0"} }, fps);
     std::string fsr = env_or("RSX_FSR", "0");
     if (fsr == "3") fsr = "1";                       /* FSR 3.1 on the native Vulkan renderer */
-    opt_add(OPT_FSR, L"Upscaler / anti-aliasing", L"DLSS needs a GeForce RTX (falls back to FSR). Quality preset: launcher.", "fsr", 1,
-            { {L"Off (PS3 original)", "0"}, {L"AMD FSR 3.1", "1"}, {L"NVIDIA DLSS", "2"} }, fsr);
+    opt_add(OPT_FSR, L"Upscaler / anti-aliasing", L"DLSS needs a GeForce RTX, XeSS runs on any GPU (both fall back to FSR). Quality preset: launcher.", "fsr", 1,
+            { {L"Off (PS3 original)", "0"}, {L"AMD FSR 3.1", "1"}, {L"NVIDIA DLSS", "2"}, {L"Intel XeSS (experimental)", "4"} }, fsr);
     s_sens = cellpad_mouse_sens();
     opt_add(OPT_SENS, L"Mouse sensitivity", L"Also multiplied by the game's own Look Sensitivity option.", NULL, 0, {}, "");
     std::string fov = env_or("R2_PATCH_FOV_VALUE", "");
     if (fov.empty() && atoi(env_or("R2_PATCH_FOV", "0").c_str()) == 1) fov = "0.7";
-    opt_add(OPT_FOV, L"Field of view", L"Wider views can misalign some shadows (RPCS3 \"Extended FOV\" patch).", "fov", 0,
-            { {L"Original", ""}, {L"Wider", "0.85"}, {L"Widest", "0.7"} }, fov);
+    /* the same steps as launcher.cpp "fov" (view width ~ 1/K on the FOV-safe path, r2_patches.cpp) */
+    opt_add(OPT_FOV, L"Field of view", L"How much wider the view is. Above +43% is experimental (stronger edge stretching).", "fov", 0,
+            { {L"Original", ""}, {L"+5%", "0.95"}, {L"+11%", "0.9"}, {L"+18% (Wider)", "0.85"}, {L"+25%", "0.8"},
+              {L"+33%", "0.75"}, {L"+43% (Widest)", "0.7"}, {L"+54% (experimental)", "0.65"}, {L"+67% (experimental)", "0.6"} }, fov);
+    /* launcher.cpp "aspect" (R2_ASPECT, read at start-up); the same row as R3's */
+    opt_add(OPT_ASPECT, L"Ultrawide / aspect ratio", L"Fit window widens the view to the window's shape (Hor+: more on the sides). The HUD is stretched.", "aspect", 1,
+            { {L"16:9 (PS3 original)", ""}, {L"Fit window", "auto"}, {L"21:9", "21:9"}, {L"32:9", "32:9"} }, env_or("R2_ASPECT", ""));
     opt_add(OPT_PROMPTS, L"Button prompts", L"Which buttons the game shows with a controller (keyboard always shows keys).", "padglyphs", 0,
-            { {L"Auto", ""}, {L"Keyboard keys", "keys"}, {L"Xbox", "xbox"}, {L"PlayStation", "ps"} }, env_or("R2_PAD_GLYPHS", ""));
+            { {L"Auto", ""}, {L"Keyboard keys", "keys"}, {L"Xbox", "xbox"}, {L"PlayStation", "ps"}, {L"Nintendo", "nintendo"} }, env_or("R2_PAD_GLYPHS", ""));
 }
 /* the Extended FOV constant (r2_patches.cpp): 1.0 original */
 static void fov_live(const std::string& v)
@@ -207,11 +224,16 @@ static void opt_apply(int i)
     case OPT_FPS: bat_set("R2_FPS", v); break;
     case OPT_FSR: {
         std::string r = ini_get("renderer"); if (r == "\x01" || r.empty()) r = env_or("R2_RSX", "rpcs3");
-        bat_set("RSX_FSR", (!_stricmp(r.c_str(), "vulkan") && v == "1") ? "3" : v);
+        /* native renders only with R2_RENDERER_FORCE_NATIVE=1 (main.cpp r2_renderer_migrate); further renderers
+           (e.g. a Direct3D 12 one) take the values as they are unless mapped here */
+        const bool native = (!_stricmp(r.c_str(), "vulkan") || !_stricmp(r.c_str(), "native")) && env_or("R2_RENDERER_FORCE_NATIVE", "0") == "1";
+        const bool d3d12 = !_stricmp(r.c_str(), "d3d12");   /* FSR 3.1 = 3 there, XeSS stays 4 */
+        bat_set("RSX_FSR", ((native && (v == "1" || v == "4")) || (d3d12 && v == "1")) ? "3" : v);   /* XeSS: Compatible renderer only, FSR 3.1 on native (as launcher.cpp) */
         std::string up = ini_get("upscale"); if (up == "\x01" || up.empty()) up = "1";
         bat_set("RSX_UPSCALE", v == "0" ? "1" : up);
         break; }
     case OPT_FOV: bat_set("R2_PATCH_FOV_VALUE", v); fov_live(v); break;
+    case OPT_ASPECT: bat_set("R2_ASPECT", v); break;
     case OPT_PROMPTS: bat_set("R2_PAD_GLYPHS", v); cellpad_set_glyph_pref(v.c_str()); break;
     }
     fprintf(stderr, "[pcmenu] %ls = %ls%s%c", o.title, o.ch[o.sel].label.c_str(), o.restart ? " (next start)" : "", 10);
@@ -227,10 +249,60 @@ static void opt_step(int i, int d)
     } else {
         PcOpt& o = s_opt[i];
         const int n = (int)o.ch.size();
+        if (i == OPT_FOV) {                          /* a slider: stops at the ends */
+            const int s = o.sel + d;
+            if (s < 0 || s >= n) return;
+            o.sel = s;
+        } else
         o.sel = (o.sel + d + n) % n;
     }
     opt_apply(i);
 }
+/* value-based access for the PC pages of the game's own options screen (r2_menurows.cpp) */
+extern "C" int pcm_opt_find(const char* key)
+{
+    opts_init();
+    if (!key) return -1;
+    if (!strcmp(key, "mouse_sens")) return OPT_SENS;
+    for (int i = 0; i < OPT_COUNT; i++) if (i != OPT_SENS && s_opt[i].ini && !strcmp(s_opt[i].ini, key)) return i;
+    return -1;
+}
+extern "C" int pcm_opt_value(int i, char* out, int n)
+{
+    if (i < 0 || i >= OPT_COUNT || n <= 0) return 0;
+    opts_init();
+    if (i == OPT_SENS) snprintf(out, n, "%.2f", s_sens);
+    else snprintf(out, n, "%s", s_opt[i].ch[s_opt[i].sel].value.c_str());
+    return 1;
+}
+extern "C" void pcm_opt_set_value(int i, const char* v)
+{
+    if (i < 0 || i >= OPT_COUNT || !v) return;
+    opts_init();
+    if (i == OPT_SENS) {
+        double s = atof(v);
+        if (!(s >= 0.1)) s = 0.1;
+        if (s > 4.0) s = 4.0;
+        if (fabs(s - s_sens) < 1e-9) return;
+        s_sens = s;
+    } else {
+        PcOpt& o = s_opt[i];
+        int k = -1;
+        for (size_t j = 0; j < o.ch.size(); j++) if (!_stricmp(o.ch[j].value.c_str(), v)) { k = (int)j; break; }
+        if (k < 0 || k == o.sel) return;
+        o.sel = k;
+    }
+    opt_apply(i);
+}
+extern "C" int pcm_ini_get(const char* key, char* out, int n)   /* 0: not in settings.ini */
+{
+    const std::string v = ini_get(key);
+    if (v == "\x01") { if (n > 0) out[0] = 0; return 0; }
+    snprintf(out, n, "%s", v.c_str());
+    return 1;
+}
+extern "C" void pcm_ini_set(const char* key, const char* v) { ini_set(key, v); }
+extern "C" void pcm_bat_set(const char* env, const char* v) { bat_set(env, v); }
 extern "C" void r2x_open_menu(void);   /* r2_pcextra.cpp: More PC Options */
 extern "C" int r2x_menu_open(void);
 extern "C" void r2x_ui_tick(void* hwnd, int focused, int other_prompt);
@@ -390,7 +462,7 @@ static void ov_show_kind(const wchar_t* l1, const wchar_t* l2, int kind)
     if (l1) wcsncpy_s(s_ov_l1, l1, _TRUNCATE);
     if (l2) wcsncpy_s(s_ov_l2, l2, _TRUNCATE);
     s_ov_kind = kind;
-    s_ov_toast = kind == KIND_TOAST || kind == KIND_HINT;
+    s_ov_toast = kind == KIND_TOAST;
     RECT rc; GetClientRect(s_game, &rc);
     const int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
     int w, h, x, y;
@@ -401,10 +473,6 @@ static void ov_show_kind(const wchar_t* l1, const wchar_t* l2, int kind)
         if (w > cw) w = cw;
         if (h > ch) h = ch;
         x = (cw - w) / 2; y = (ch - h) / 2;
-    } else if (kind == KIND_HINT) {
-        w = cw * 30 / 100; if (w < 380) w = 380;
-        h = ch * 7 / 100; if (h < 54) h = 54;
-        x = (cw - w) / 2; y = ch - h - ch * 4 / 100;
     } else {
         const int toast = kind == KIND_TOAST;
         w = toast ? cw * 30 / 100 : cw * 46 / 100; h = toast ? ch * 9 / 100 : ch * 22 / 100;
@@ -412,6 +480,7 @@ static void ov_show_kind(const wchar_t* l1, const wchar_t* l2, int kind)
         if (h < (toast ? 60 : 130)) h = toast ? 60 : 130;
         x = (cw - w) / 2; y = toast ? ch * 6 / 100 : (ch - h) / 2;
     }
+    posd_ui_scale_rect(&x, &y, &w, &h, cw, ch, kind == KIND_TOAST);   /* PORT_UI_SCALE */
     s_ovr_shown = 1; s_ovr_x = x; s_ovr_y = y; s_ovr_w = w; s_ovr_h = h; s_ovr_cw = cw; s_ovr_ch = ch;
     s_ovr_osd = posd_on();
     if (s_ovr_osd) {
@@ -461,7 +530,7 @@ static void ov_follow(void)
     if (posd_on() != s_ovr_osd || rc.right - rc.left != s_ovr_cw || rc.bottom - rc.top != s_ovr_ch) ov_show_kind(NULL, NULL, s_ov_kind);
 }
 static void menu_show(void) { ov_show_kind(NULL, NULL, KIND_MENU); }
-static int s_menu_prev = 0, s_prev_in = 0, s_hint_on = 0;
+static int s_menu_prev = 0, s_prev_in = 0;
 static void menu_close(void) { s_ov_state = OV_RELEASE; ov_hide(); }
 /* OK / click (dir 1) or change an option (dir +-1) on the selected row */
 static void menu_activate(int dir)
@@ -488,9 +557,34 @@ static void menu_activate(int dir)
 
 /* ---- screenshots -------------------------------------------------------- */
 struct Shot { int w, h; std::vector<uint8_t> bgr; wchar_t path[MAX_PATH]; };
+/* Direct3D 12 renderer: the presented frame itself (no port UI, the SDR image under HDR). Asked
+ * from shot_thread: the UI tick runs on the presenting thread, so waiting there never sees a frame. */
+extern "C" int  rsx_d3d12_engine_capture_available(void);
+extern "C" int  rsx_d3d12_engine_capture(void** bgra, int* w, int* h, unsigned timeout_ms);
+extern "C" void rsx_d3d12_engine_capture_free(void* p);
+static bool shot_from_renderer(Shot* s)
+{
+    void* px = NULL; int w = 0, h = 0;
+    if (!rsx_d3d12_engine_capture(&px, &w, &h, 2000) || !px) return false;
+    s->w = w; s->h = h;
+    const size_t stride = ((size_t)w * 3 + 3) & ~(size_t)3;
+    s->bgr.assign(stride * h, 0);
+    const uint8_t* src = (const uint8_t*)px;
+    for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+        const uint8_t* q = src + ((size_t)y * w + x) * 4; uint8_t* o = &s->bgr[y * stride + x * 3];
+        o[0] = q[0]; o[1] = q[1]; o[2] = q[2];
+    }
+    rsx_d3d12_engine_capture_free(px);
+    return true;
+}
 static DWORD WINAPI shot_thread(LPVOID p)
 {
     Shot* s = (Shot*)p;
+    if (s->bgr.empty() && !shot_from_renderer(s)) {
+        fprintf(stderr, "[pcport] screenshot FAILED: no frame from the renderer: %ls%c", s->path, 10);
+        delete s;
+        return 0;
+    }
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     const bool co = SUCCEEDED(hr);
     IWICImagingFactory* f = NULL; IWICStream* st = NULL; IWICBitmapEncoder* enc = NULL; IWICBitmapFrameEncode* fr = NULL;
@@ -522,35 +616,38 @@ static void take_screenshot(void)
     const int w = rc.right - rc.left, h = rc.bottom - rc.top;
     if (w <= 0 || h <= 0 || IsIconic(s_game)) return;
     POINT tl = { 0, 0 }; ClientToScreen(s_game, &tl);
-    const int osd = posd_on();
-    if (osd) posd_suppress_for_capture();   /* a frame without the OSD layers on screen */
-    HDC sdc = GetDC(NULL); HDC mdc = CreateCompatibleDC(sdc);
-    BITMAPINFO bi = {};
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = NULL;
-    HBITMAP bm = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
     Shot* s = NULL;
-    if (bm && bits) {
-        HGDIOBJ ob = SelectObject(mdc, bm);
-        /* the screen as the desktop composes it (no CAPTUREBLT: our own
-         * layered prompt/toast windows are left out; the OSD is off above) */
-        if (BitBlt(mdc, 0, 0, w, h, sdc, tl.x, tl.y, SRCCOPY)) {
-            GdiFlush();
-            s = new Shot; s->w = w; s->h = h;
-            const size_t stride = ((size_t)w * 3 + 3) & ~(size_t)3;
-            s->bgr.assign(stride * h, 0);
-            const uint8_t* src = (const uint8_t*)bits;
-            for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
-                const uint8_t* q = src + ((size_t)y * w + x) * 4; uint8_t* o = &s->bgr[y * stride + x * 3];
-                o[0] = q[0]; o[1] = q[1]; o[2] = q[2];
+    if (rsx_d3d12_engine_capture_available()) { s = new Shot; s->w = w; s->h = h; }   /* pixels: shot_thread */
+    const int osd = s ? 0 : posd_on();
+    if (osd) posd_suppress_for_capture();   /* a frame without the OSD layers on screen */
+    if (!s) {
+        HDC sdc = GetDC(NULL); HDC mdc = CreateCompatibleDC(sdc);
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
+        bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = NULL;
+        HBITMAP bm = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+        if (bm && bits) {
+            HGDIOBJ ob = SelectObject(mdc, bm);
+            /* the screen as the desktop composes it (no CAPTUREBLT: our own
+             * layered prompt/toast windows are left out; the OSD is off above) */
+            if (BitBlt(mdc, 0, 0, w, h, sdc, tl.x, tl.y, SRCCOPY)) {
+                GdiFlush();
+                s = new Shot; s->w = w; s->h = h;
+                const size_t stride = ((size_t)w * 3 + 3) & ~(size_t)3;
+                s->bgr.assign(stride * h, 0);
+                const uint8_t* src = (const uint8_t*)bits;
+                for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+                    const uint8_t* q = src + ((size_t)y * w + x) * 4; uint8_t* o = &s->bgr[y * stride + x * 3];
+                    o[0] = q[0]; o[1] = q[1]; o[2] = q[2];
+                }
             }
+            SelectObject(mdc, ob);
         }
-        SelectObject(mdc, ob);
+        if (osd) r2rsx_osd_suppress(0);
+        if (bm) DeleteObject(bm);
+        DeleteDC(mdc); ReleaseDC(NULL, sdc);
     }
-    if (osd) r2rsx_osd_suppress(0);
-    if (bm) DeleteObject(bm);
-    DeleteDC(mdc); ReleaseDC(NULL, sdc);
     if (!s) { fprintf(stderr, "[pcport] screenshot: could not read the screen%c", 10); return; }
     wchar_t dir[MAX_PATH]; GetCurrentDirectoryW(MAX_PATH, dir);
     wcscat_s(dir, L"\\screenshots");
@@ -665,6 +762,7 @@ static LRESULT CALLBACK game_subproc(HWND h, UINT m, WPARAM w, LPARAM l)
         break;
     case WM_ACTIVATEAPP:
         if (!w) ClipCursor(NULL);
+        else InterlockedIncrement(&g_port_audio_focus_gen);
         break;
     case WM_KILLFOCUS:
         ClipCursor(NULL);
@@ -706,10 +804,7 @@ static void ui_tick(void* hwnd_)
     if (s_menu_on < 0) {
         const char* e = getenv("R2_MENU_PC");
         s_menu_on = (e && *e) ? atoi(e) != 0 : 1;
-        const char* h = getenv("R2_MENU_PC_HINT"); const char* dm = getenv("RSX_DISPLAY");
-        s_hint_on = !s_menu_on ? 0 : (h && *h) ? atoi(h) != 0 : (!(dm && !_stricmp(dm, "exclusive")) || r2rsx_osd_wanted());
-        fprintf(stderr, "[pcport] PC menu (F10 / hold View+Menu): %s, hint %s%c", s_menu_on ? "on" : "off (quit prompt only)",
-                s_hint_on ? "on" : "off", 10);
+        fprintf(stderr, "[pcport] PC menu (F10 / hold View+Menu): %s%c", s_menu_on ? "on" : "off (quit prompt only)", 10);
     }
     const int in = prompt_input(focused);
     switch (s_ov_state) {
@@ -778,26 +873,6 @@ static void ui_tick(void* hwnd_)
 
     ov_follow();
     const int prompt = s_ov_state != OV_NONE;
-
-    /* the hint: while the game's pause menu is up (a pause press during
-     * on-foot play, then the look code stops), and once ~12 s after start */
-    if (s_hint_on > 0) {
-        static ULONGLONG t_first = 0, pause_t = 0;
-        if (!t_first) t_first = now;
-        const ULONGLONG look = g_r2_look_ms;
-        const int playing = look && now - look < 200;
-        { static int was = 0;
-          const int d = (focused && ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) || (GetAsyncKeyState(VK_RETURN) & 0x8000))) ||
-                        (xi_buttons() & XINPUT_GAMEPAD_START);
-          if (d && !was && playing) pause_t = now;
-          was = d; }
-        if (pause_t && ((playing && now - pause_t > 600) || now - pause_t > 120000)) pause_t = 0;
-        const int want = !prompt && !s_toast_until && focused &&
-                         ((pause_t && !playing && now - pause_t > 250) || (!look && now - t_first > 12000 && now - t_first < 22000));
-        if (want && s_ov_kind != KIND_HINT)
-            ov_show_kind(L"PC menu:  F10   or hold View + Menu", L"PC Options  \u00B7  Quit to Desktop", KIND_HINT);
-        else if (!want && s_ov_kind == KIND_HINT && !prompt) ov_hide();
-    }
 
     r2x_ui_tick(hwnd, focused, prompt);   /* r2_pcextra.cpp: extras menu, photo mode, pad-loss pause, cutscene skip */
     const int bg_pause = !focused && s_bg == BG_PAUSE;

@@ -11,6 +11,10 @@
 static int g_fail = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); g_fail = 1; } } while (0)
 
+// PORT_NOTIFY_ALL_WRITES: the runtime's SPU coherence notify (spu_coherency.c), recorded
+static uint32_t g_nr_ea, g_nr_len, g_nr_n;
+extern "C" void spu_coh_notify_range(uint32_t ea, uint32_t size) { g_nr_ea = ea; g_nr_len = size; g_nr_n++; }
+
 static void set_env(const char* name, const char* value)
 {
 	_putenv_s(name, value ? value : "");
@@ -129,6 +133,7 @@ static void test_stale_store()
 	CHECK(!s.try_serve(dof.start + 4, 4096, reinterpret_cast<uint8_t*>(guest.data()))); // other range
 	CHECK(s.try_serve(dof.start, 4096, reinterpret_cast<uint8_t*>(guest.data())));
 	CHECK(guest == frame1);                                     // exactly the previous real readback
+	CHECK(g_nr_n == 1 && g_nr_ea == dof.start && g_nr_len == 4096); // the serve is a guest write: SPU reservations notified
 	CHECK(!s.try_serve(dof.start, 4096, reinterpret_cast<uint8_t*>(guest.data())));  // never twice in a row
 
 	s.refresh(dof.start, 4096, reinterpret_cast<const uint8_t*>(frame2.data()), 2);
@@ -183,6 +188,83 @@ static void test_label_split_and_report()
 	CHECK(st.flushes.load() == 0 && st.kicks.load() == 0);               // counters restart
 }
 
+// R2PORT RSX_ADS_STALE_AUTO: a surface is chronic after 4 late flushes in a row; one in-time flush clears it
+static void test_late_tracker()
+{
+	adsrb::late_tracker lt;
+	for (int i = 0; i < 3; ++i) lt.on_flush(0x1000, true);
+	CHECK(!lt.chronic(0x1000) && lt.streak(0x1000) == 3);
+	lt.on_flush(0x1000, true);
+	CHECK(lt.chronic(0x1000));
+	CHECK(!lt.chronic(0x2000));
+	lt.on_flush(0x1000, false);
+	CHECK(!lt.chronic(0x1000) && lt.streak(0x1000) == 0);
+	lt.on_flush(0x3000, false);                       // in time, never late: not tracked
+	CHECK(lt.streak(0x3000) == 0);
+	for (uint32_t s = 1; s <= 5; ++s) for (uint32_t k = 0; k < s; ++k) lt.on_flush(s << 16, true);
+	CHECK(lt.streak(5u << 16) == 5 && lt.streak(4u << 16) == 4); // the lowest streak was evicted
+	CHECK(lt.streak(1u << 16) == 0);
+}
+
+// R2PORT RSX_ADS_KICK_ADAPT (from R3): a range whose early copies are always replaced by the fault recopy stops kicking after
+// adapt_idle unconsumed cycles, probes on every adapt_probe-th flush, and resumes once a probe copy is consumed. Off = unchanged.
+static void test_kick_adapt()
+{
+	set_env("RSX_ADS_KICK_ADAPT", nullptr);
+	CHECK(adsrb::read_config().kick_adapt);
+	set_env("RSX_ADS_KICK_ADAPT", "0");
+	CHECK(!adsrb::read_config().kick_adapt);
+	set_env("RSX_ADS_ASYNC_RB", "0");
+	set_env("RSX_ADS_KICK_ADAPT", nullptr);
+	CHECK(!adsrb::read_config().kick_adapt);
+	set_env("RSX_ADS_ASYNC_RB", nullptr);
+
+	const uint64_t ms = 1'000'000;
+	for (int adapt = 0; adapt < 2; ++adapt)
+	{
+		adsrb::hot_tracker t;
+		t.set_adapt(adapt != 0);
+		adsrb::range out[adsrb::hot_tracker::max_entries];
+		uint64_t now = 3000 * ms;
+		t.on_flush(dof, now);
+		int kicks = 0, suppressed_cycles = 0;
+		for (int f = 0; f < 200; ++f)
+		{
+			now += 16 * ms;
+			uint32_t sup = 0;
+			if (t.collect(now, 0, 0xFFFFFFFFu, out, adsrb::hot_tracker::select::kick, &sup) == 1)
+			{
+				t.on_kick(dof);
+				kicks++;
+			}
+			if (sup) suppressed_cycles++;
+			t.on_flush(dof, now, false);
+		}
+		if (!adapt)
+		{
+			CHECK(kicks == 199 && suppressed_cycles == 0);
+		}
+		else
+		{
+			CHECK(kicks >= 3 && kicks <= 3 + 200 / int(adsrb::hot_tracker::adapt_probe) + 1);
+			CHECK(suppressed_cycles == 199 - kicks);
+			uint32_t sup = 0;
+			while (t.collect(now, 0, 0xFFFFFFFFu, out, adsrb::hot_tracker::select::kick, &sup) == 0)
+			{
+				now += 16 * ms;
+				t.on_flush(dof, now, false);
+			}
+			t.on_kick(dof);
+			now += 16 * ms;
+			t.on_flush(dof, now, true);
+			CHECK(t.collect(now, 0, 0xFFFFFFFFu, out) == 1);
+			now += 16 * ms;
+			t.on_flush(dof, now, false); // no kick this cycle: idle does not grow
+			CHECK(t.collect(now, 0, 0xFFFFFFFFu, out) == 1);
+		}
+	}
+}
+
 int main()
 {
 	test_config();
@@ -190,6 +272,8 @@ int main()
 	test_pending_never_evicted();
 	test_stale_store();
 	test_label_split_and_report();
+	test_late_tracker();
+	test_kick_adapt();
 	std::printf(g_fail ? "test_adsrb: FAIL\n" : "test_adsrb: all passed\n");
 	return g_fail;
 }

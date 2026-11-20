@@ -15,6 +15,7 @@ void r2rsx_set_flip_mode(uint32_t mode) { (void)mode; }
 uint32_t r2rsx_get_flip_status(void) { return 0; }
 void r2rsx_set_flip_status(uint32_t s) { (void)s; }
 uint64_t r2rsx_last_flip_time(void) { return 0; }
+uint64_t r2rsx_flips_executed(void) { return UINT64_MAX; }   /* no renderer: r2_hot's frames-only fence */
 uint64_t r2rsx_vblank_count(void) { return 0; }
 uint32_t r2rsx_current_display_buffer(void) { return 0; }
 void r2rsx_set_flip_handler(uint32_t opd) { (void)opd; }
@@ -31,15 +32,20 @@ void r2rsx_set_zcull(uint32_t i, uint32_t o, uint32_t w, uint32_t h, uint32_t cs
   (void)sf; (void)sr; (void)sm; (void)bound; }
 void r2rsx_wait_get(uint32_t put, unsigned max_ms) { (void)put; (void)max_ms; }
 void r2rsx_wait_get_outside(uint32_t lo, uint32_t hi, unsigned max_ms) { (void)lo; (void)hi; (void)max_ms; }
-int  r2rsx_osd_wanted(void) { return 0; }
-int  r2rsx_osd_ready(void) { return 0; }
+/* The Direct3D 12 renderer draws the port UI itself (rsx_d3d12_engine_osd.inc). */
+#include "../rsx_d3d12_engine.h"
+const rsx_d3d12_osd_api* r2rsx_osd_d3d12_none(void) { return NULL; }
+#pragma comment(linker, "/alternatename:rsx_d3d12_engine_osd_api=r2rsx_osd_d3d12_none")
+#define R2RSX_OSD_D3D12 const rsx_d3d12_osd_api* d = rsx_d3d12_engine_osd_api()
+int  r2rsx_osd_wanted(void) { R2RSX_OSD_D3D12; return d ? d->wanted() : 0; }
+int  r2rsx_osd_ready(void) { R2RSX_OSD_D3D12; return d ? d->ready() : 0; }
 void r2rsx_osd_layer(int s, const void* p, int w, int h, int x, int y, int rw, int rh, float a)
-{ (void)s; (void)p; (void)w; (void)h; (void)x; (void)y; (void)rw; (void)rh; (void)a; }
-void r2rsx_osd_hide(int s) { (void)s; }
-int  r2rsx_osd_visible(int s) { (void)s; return 0; }
-void r2rsx_osd_suppress(int on) { (void)on; }
-unsigned r2rsx_osd_presents(void) { return 0; }
-void r2rsx_osd_refresh(void) {}
+{ R2RSX_OSD_D3D12; if (d) d->layer(s, p, w, h, x, y, rw, rh, a); }
+void r2rsx_osd_hide(int s) { R2RSX_OSD_D3D12; if (d) d->hide(s); }
+int  r2rsx_osd_visible(int s) { R2RSX_OSD_D3D12; return d ? d->visible(s) : 0; }
+void r2rsx_osd_suppress(int on) { R2RSX_OSD_D3D12; if (d) d->suppress(on); }
+unsigned r2rsx_osd_presents(void) { R2RSX_OSD_D3D12; return d ? d->presents() : 0u; }
+void r2rsx_osd_refresh(void) { R2RSX_OSD_D3D12; if (d) d->refresh(); }
 void r2rsx_prof_enable(int on) { (void)on; }
 int  r2rsx_prof_sample(double* f, double* d, double* u) { (void)f; (void)d; (void)u; return 0; }
 /* PC extras (VKR2PcExtras.cpp in the RPCS3 library) */

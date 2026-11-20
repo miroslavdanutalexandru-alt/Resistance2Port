@@ -71,12 +71,114 @@ int ps3_perf_on(const char* name, int def)
  * -----------------------------------------------------------------------*/
 volatile long g_guest_mem_seq = 0;
 static volatile long s_mem_waiters = 0;   /* threads in a notify-aware short usleep */
+#ifdef _WIN32
+/* PS3_USLEEP_BLOCK: short usleeps block on a per-thread event (woken by the
+ * notify below) plus a high-resolution timer instead of spinning, so a poll
+ * loop no longer holds a core the SPU worker it waits for needs. */
+#define USLEEP_BLOCK_SLOTS 64
+static HANDLE s_blk_ev[USLEEP_BLOCK_SLOTS];
+static volatile long s_blk_armed[USLEEP_BLOCK_SLOTS];
+static volatile long s_blk_used = 0;
+static volatile long s_blk_waiters = 0;
+#endif
+/* Resistance port: SPU_DMA_FAST (default 1; SPU_DMA_FAST=0 = the old path)
+ * coalesces these notifications. A waiter only ever needs ONE bump of
+ * g_guest_mem_seq after it took its snapshot, but every SPU PUT and atomic
+ * did an InterlockedIncrement while anyone waited. With R3's ADS depth of
+ * field the main thread sits 11-17 ms a frame in short usleeps at 0x0082C340
+ * (the WWS job-list wait) while job 419 issues ~31k PUTs a frame over 2-4
+ * lanes, so every PUT read a line the waiting PPU rewrote on each usleep and
+ * then fought the other lanes for it with a locked add. Now the waiter arms
+ * s_mem_armed after its snapshot; the first notify after that disarms it and
+ * bumps the sequence, later ones see it clear and only read. Each waiter is
+ * still woken by the first write after its snapshot: a notify either finds
+ * the flag armed (and bumps) or an earlier notify cleared it after the
+ * snapshot was taken (and bumps after that). Kept on its own cache line. */
+#if defined(_MSC_VER)
+typedef __declspec(align(64)) struct { volatile long v; char pad[60]; } ps3_mem_armed_line;
+#else
+typedef struct { volatile long v; char pad[60]; } __attribute__((aligned(64))) ps3_mem_armed_line;
+#endif
+static ps3_mem_armed_line s_mem_armed_line;
+#define s_mem_armed (s_mem_armed_line.v)
+static volatile int s_mem_coalesce = -1;
+static int ps3_mem_notify_coalesce(void)
+{
+    int c = s_mem_coalesce;
+    if (__builtin_expect(c < 0, 0)) {
+        const char* e = getenv("SPU_DMA_FAST");
+        c = !(e && *e == '0');
+        s_mem_coalesce = c;
+    }
+    return c;
+}
+/* PS3_USLEEP_WATCH: writer-woken short usleeps for known guest poll loops.
+ * The game installs g_ps3_usleep_watch (R2: the SPU job wait at
+ * 0x006B8D3C, project\stubs.cpp R2_JOBWAIT_WAKE; R3: 0x0082C340). For a usleep it recognises, it reports the
+ * guest range the loop polls ([lo,hi)) and whether the loop's condition is
+ * already met. The waiter then blocks on its own event until an SPU store
+ * (PUT or atomic) lands in that range, with a high-resolution timer as the
+ * fallback (R2: the guest's own usleep time unless PS3_USLEEP_WATCH_MAX_US
+ * is set, so a store the watch cannot see costs no more than before). Stores elsewhere do not
+ * wake it, unlike the global notify, which the ~31k DOF PUTs a frame keep
+ * firing. PS3_USLEEP_WATCH=0 = the old spin. */
+int (*volatile g_ps3_usleep_watch)(void* ctx, uint32_t* lo, uint32_t* hi) = 0;
+#ifdef _WIN32
+#define USLEEP_WATCH_SLOTS 8
+typedef struct { volatile uint32_t lo, hi; volatile long armed; HANDLE ev; } ps3_watch_slot;
+static ps3_watch_slot s_watch[USLEEP_WATCH_SLOTS];
+static volatile long s_watch_used = 0, s_watch_n = 0;
+/* Union of every range ever watched, on its own read-mostly line: a store
+ * outside it costs two loads. */
+#if defined(_MSC_VER)
+typedef __declspec(align(64)) struct { volatile uint32_t lo, hi; char pad[56]; } ps3_watch_span;
+#else
+typedef struct { volatile uint32_t lo, hi; char pad[56]; } __attribute__((aligned(64))) ps3_watch_span;
+#endif
+static ps3_watch_span s_watch_span = { 0xFFFFFFFFu, 0u, {0} };
+static void ps3_watch_notify_slow(uint32_t ea, uint32_t span)
+{
+    /* Our data store must be visible before we read the armed flags (the
+     * waiter arms, then re-reads the data): a store-load fence. */
+    MemoryBarrier();
+    if (!s_watch_n) return;
+    const uint64_t e0 = ea, e1 = (uint64_t)ea + span;
+    long n = s_watch_used; if (n > USLEEP_WATCH_SLOTS) n = USLEEP_WATCH_SLOTS;
+    for (long i = 0; i < n; i++) {
+        ps3_watch_slot* s = &s_watch[i];
+        if (s->armed && e0 < s->hi && e1 > s->lo && InterlockedExchange(&s->armed, 0)) SetEvent(s->ev);
+    }
+}
+static inline void ps3_watch_notify(uint32_t ea, uint32_t span)
+{
+    if ((uint64_t)ea + span <= s_watch_span.lo || ea >= s_watch_span.hi) return;
+    ps3_watch_notify_slow(ea, span);
+}
+#endif
 void ps3_guest_mem_notify(uint32_t ea)
 {
     (void)ea;
+#ifdef _WIN32
+    ps3_watch_notify(ea & ~127u, 128u);
+    if (ps3_mem_notify_coalesce()) {
+        if (!s_mem_armed || !InterlockedExchange(&s_mem_armed, 0)) return;
+        InterlockedIncrement(&g_guest_mem_seq);
+        if (s_blk_waiters) {
+            long n = s_blk_used; if (n > USLEEP_BLOCK_SLOTS) n = USLEEP_BLOCK_SLOTS;
+            for (long i = 0; i < n; i++)
+                if (s_blk_armed[i] && InterlockedExchange(&s_blk_armed[i], 0)) SetEvent(s_blk_ev[i]);
+        }
+        return;
+    }
+#endif
     if (s_mem_waiters) {
 #ifdef _WIN32
         InterlockedIncrement(&g_guest_mem_seq);
+        if (s_blk_waiters) {
+            long n = s_blk_used; if (n > USLEEP_BLOCK_SLOTS) n = USLEEP_BLOCK_SLOTS;
+            for (long i = 0; i < n; i++)
+                if (s_blk_armed[i] && InterlockedExchange(&s_blk_armed[i], 0)) SetEvent(s_blk_ev[i]);
+        }
 #else
         __atomic_add_fetch(&g_guest_mem_seq, 1, __ATOMIC_SEQ_CST);
 #endif
@@ -90,12 +192,109 @@ void (*volatile g_guest_mem_notify)(uint32_t ea) = ps3_guest_mem_notify;
 static volatile int s_notify_put = -1;
 void ps3_guest_mem_notify_put(uint32_t ea)
 {
+#ifdef _WIN32
+    ps3_watch_notify(ea, 0x4000u);   /* a PUT is at most 16 KB */
+    if (s_mem_coalesce > 0) { if (!s_mem_armed) return; }
+    else
+#endif
     if (!s_mem_waiters) return;
     if (__builtin_expect(s_notify_put < 0, 0))
         s_notify_put = ps3_perf_on("PS3_USLEEP_NOTIFY", 1) && ps3_perf_on("PS3_USLEEP_NOTIFY_PUT", 1);
     if (s_notify_put) ps3_guest_mem_notify(ea);
 }
 
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+static volatile long s_watch_on = -1, s_watch_max_us = 0;   /* 0 = the guest's usec */
+static volatile long long s_wst_wait, s_wst_woken, s_wst_tmo, s_wst_ready, s_wst_next;
+static void ps3_watch_widen(uint32_t lo, uint32_t hi)
+{
+    for (;;) {
+        const uint32_t c = s_watch_span.lo;
+        if (lo >= c || (uint32_t)InterlockedCompareExchange((volatile long*)&s_watch_span.lo, (long)lo, (long)c) == c) break;
+    }
+    for (;;) {
+        const uint32_t c = s_watch_span.hi;
+        if (hi <= c || (uint32_t)InterlockedCompareExchange((volatile long*)&s_watch_span.hi, (long)hi, (long)c) == c) break;
+    }
+}
+/* PS3_USLEEP_WATCH (above): serve a short usleep of a watched poll loop.
+ * Returns 0 when this is not one (the caller sleeps as before). */
+static int ps3_usleep_watch_wait(void* ctx, uint64_t usec, int* early)
+{
+    if (__builtin_expect(s_watch_on < 0, 0)) {
+        const char* m = getenv("PS3_USLEEP_WATCH_MAX_US");
+        long v = m && *m ? atol(m) : 0;
+        s_watch_max_us = v <= 0 ? 0 : v < 50 ? 50 : v;
+        s_watch_on = ps3_perf_on("PS3_USLEEP_WATCH", 1);
+        fprintf(stderr, "[usleep] PS3_USLEEP_WATCH=%ld (max %ld us, 0 = the guest's usleep time; hook %s)\n", s_watch_on, s_watch_max_us,
+                g_ps3_usleep_watch ? "set" : "none");
+    }
+    int (*hook)(void*, uint32_t*, uint32_t*) = g_ps3_usleep_watch;
+    if (!s_watch_on || !hook) return 0;
+    uint32_t lo = 0, hi = 0;
+    const int w = hook(ctx, &lo, &hi);
+    if (!w || (w == 1 && lo >= hi)) return 0;
+    static PS3_TLS long t_ws = -1;
+    static PS3_TLS HANDLE t_wtimer;
+    if (t_ws == -1) {
+        t_ws = -2;
+        const long i = InterlockedIncrement(&s_watch_used) - 1;
+        if (i < USLEEP_WATCH_SLOTS) {
+            HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+            t_wtimer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_MANUAL_RESET |
+                                              CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if (!t_wtimer) t_wtimer = CreateWaitableTimerW(NULL, TRUE, NULL);
+            if (ev && t_wtimer) { s_watch[i].ev = ev; MemoryBarrier(); t_ws = i; }
+        }
+    }
+    if (t_ws < 0) return 0;
+    InterlockedIncrement64(&s_wst_wait);
+    if (w == 2) {   /* the condition is met already: the loop re-checks at once */
+        InterlockedIncrement64(&s_wst_ready);
+        *early = 1;
+    } else {
+        ps3_watch_widen(lo, hi);
+        ps3_watch_slot* s = &s_watch[t_ws];
+        s->lo = lo; s->hi = hi;
+        InterlockedIncrement(&s_watch_n);
+        InterlockedExchange(&s->armed, 1);
+        /* armed (full barrier), then re-check: a store that landed before the
+         * arm is seen here, one after it sets the event */
+        uint32_t l2, h2;
+        if (hook(ctx, &l2, &h2) == 2) {
+            InterlockedIncrement64(&s_wst_ready);
+            *early = 1;
+        } else {
+            const uint64_t us = !s_watch_max_us ? usec : usec > (uint64_t)s_watch_max_us ? usec : (uint64_t)s_watch_max_us;
+            LARGE_INTEGER due; due.QuadPart = -(LONGLONG)us * 10;
+            SetWaitableTimer(t_wtimer, &due, 0, NULL, NULL, FALSE);
+            HANDLE hs[2] = { s->ev, t_wtimer };
+            if (WaitForMultipleObjects(2, hs, FALSE, (DWORD)(us / 1000 + 20)) == WAIT_OBJECT_0) {
+                InterlockedIncrement64(&s_wst_woken);
+                *early = 1;
+            } else InterlockedIncrement64(&s_wst_tmo);
+        }
+        /* a notifier that already disarmed the slot may still set the event:
+         * drop that so the next wait is not cut short */
+        if (!InterlockedExchange(&s->armed, 0)) WaitForSingleObject(s->ev, 0);
+        InterlockedDecrement(&s_watch_n);
+    }
+    LARGE_INTEGER now, f; QueryPerformanceCounter(&now);
+    if (now.QuadPart >= s_wst_next) {
+        QueryPerformanceFrequency(&f);
+        const long long nx = now.QuadPart + 10 * f.QuadPart, prev = s_wst_next;
+        if (InterlockedCompareExchange64(&s_wst_next, nx, prev) == prev && prev) {
+            fprintf(stderr, "[usleep-watch] 10 s: %lld waits, %lld woken by the writer, %lld timed out, %lld already done\n",
+                    (long long)InterlockedExchange64(&s_wst_wait, 0), (long long)InterlockedExchange64(&s_wst_woken, 0),
+                    (long long)InterlockedExchange64(&s_wst_tmo, 0), (long long)InterlockedExchange64(&s_wst_ready, 0));
+        }
+    }
+    return 1;
+}
+#endif
 /* ---------------------------------------------------------------------------
  * Per-thread wait accounting (see sys_timer.h)
  * -----------------------------------------------------------------------*/
@@ -399,6 +598,10 @@ int64_t sys_timer_usleep(ppu_context* ctx)
          * soon as a guest write it may be waiting for is reported, so the
          * guest re-checks immediately; an early return from usleep is
          * harmless to a poll loop, which simply checks and sleeps again. */
+        int wearly = 0;
+        if (ps3_usleep_watch_wait(ctx, usec, &wearly)) {
+            if (ws && wearly) ws->early_n++;
+        } else {
         ensure_qpc_init();
         LARGE_INTEGER qpc_start, qpc_now;
         QueryPerformanceCounter(&qpc_start);
@@ -407,7 +610,78 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         if (s_notify) {
             InterlockedIncrement(&s_mem_waiters);
             const long seq0 = g_guest_mem_seq;
+            if (ps3_mem_notify_coalesce()) InterlockedExchange(&s_mem_armed, 1);   /* after the snapshot */
             int early = 0;
+            static volatile int s_block = -1, s_block_min = 0;
+            if (s_block < 0) {
+                const char* m = getenv("PS3_USLEEP_BLOCK_MIN");
+                s_block_min = m && *m ? atoi(m) : 10;
+                s_block = ps3_perf_on("PS3_USLEEP_BLOCK", 0);
+                fprintf(stderr, "[usleep] PS3_USLEEP_BLOCK=%d (min %d us)\n", s_block, s_block_min);
+            }
+            /* PS3_USLEEP_PARK (low-core no-spin profile; default = PORT_NOSPIN,
+             * on by default; PORT_NOSPIN=auto = below 12 CPUs only): a poll loop that has
+             * been spinning here for PS3_USLEEP_PARK_AFTER_US (default 200)
+             * from the same guest site stops spinning and parks on the block
+             * event below (woken by the next guest-memory notify -- SPU
+             * PUT/atomic, RSX label/semaphore writes -- with the guest's own
+             * usleep time on a high-resolution timer as the fallback). Short
+             * polls (< the threshold) still spin exactly as before, so a
+             * quick answer sees no added latency; only long waits give the
+             * core back to the SPU lane / audio synth they are waiting on. */
+            static volatile int s_park = -1, s_park_after = 200;
+            if (s_park < 0) {
+                extern int ps3_host_nospin(void);
+                const char* m = getenv("PS3_USLEEP_PARK_AFTER_US");
+                s_park_after = m && *m ? atoi(m) : 200;
+                if (s_park_after < 0) s_park_after = 0;
+                s_park = ps3_perf_on("PS3_USLEEP_PARK", ps3_host_nospin());
+                fprintf(stderr, "[usleep] PS3_USLEEP_PARK=%d (after %d us of polling one site)\n", s_park, s_park_after);
+            }
+            int park = 0;
+            if (s_park) {
+                static PS3_TLS uint32_t t_pk_lr;
+                static PS3_TLS long long t_pk_t0, t_pk_last;
+                const long long now = qpc_start.QuadPart;
+                /* same site, and the previous usleep began < 2 ms (plus this
+                 * one's length) ago: still the same wait */
+                if ((uint32_t)ctx->lr != t_pk_lr || now - t_pk_last > s_qpc_freq.QuadPart / 500 + (long long)(qpc_deadline - qpc_start.QuadPart))
+                    { t_pk_lr = (uint32_t)ctx->lr; t_pk_t0 = now; }
+                t_pk_last = now;
+                park = (now - t_pk_t0) * 1000000 >= (long long)s_park_after * s_qpc_freq.QuadPart;
+            }
+            static PS3_TLS long t_slot = -1;
+            static PS3_TLS HANDLE t_btimer;
+            if ((s_block || park) && t_slot == -1 && (park || usec >= (uint64_t)s_block_min)) {
+                t_slot = -2;
+                /* claim a slot only while one is left: s_blk_used never passes
+                 * USLEEP_BLOCK_SLOTS (the notify loops index s_blk_armed/_ev by it) */
+                long i;
+                for (;;) {
+                    i = s_blk_used;
+                    if (i >= USLEEP_BLOCK_SLOTS || InterlockedCompareExchange(&s_blk_used, i + 1, i) == i) break;
+                }
+                if (i < USLEEP_BLOCK_SLOTS) {
+                    HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+                    t_btimer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_MANUAL_RESET |
+                                                      CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+                    if (ev && t_btimer) { s_blk_ev[i] = ev; MemoryBarrier(); t_slot = i; }
+                }
+            }
+            if (t_slot >= 0 && (park || (s_block && usec >= (uint64_t)s_block_min))) {
+                InterlockedExchange(&s_blk_armed[t_slot], 1);
+                InterlockedIncrement(&s_blk_waiters);
+                if (g_guest_mem_seq == seq0) {
+                    LARGE_INTEGER due; due.QuadPart = -((LONGLONG)usec * 10);
+                    SetWaitableTimer(t_btimer, &due, 0, NULL, NULL, FALSE);
+                    HANDLE hs[2] = { s_blk_ev[t_slot], t_btimer };
+                    if (WaitForMultipleObjects(2, hs, FALSE, 20) == WAIT_OBJECT_0) early = 1;
+                } else early = 1;
+                InterlockedDecrement(&s_blk_waiters);
+                /* a notifier that already disarmed the slot may still set the
+                 * event: drop that so the next sleep is not cut short */
+                if (!InterlockedExchange(&s_blk_armed[t_slot], 0)) WaitForSingleObject(s_blk_ev[t_slot], 0);
+            } else
             do {
                 if (g_guest_mem_seq != seq0) { early = 1; break; }
                 SwitchToThread();
@@ -420,6 +694,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
                 SwitchToThread();
                 QueryPerformanceCounter(&qpc_now);
             } while (qpc_now.QuadPart < qpc_deadline);
+        }
         }
         if (ws) { LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
                   ws->short_n++; ws->short_qpc += (unsigned long long)(t1.QuadPart - ws_t0.QuadPart);

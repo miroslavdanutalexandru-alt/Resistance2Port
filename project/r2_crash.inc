@@ -12,13 +12,19 @@
  *   R2_CRASH_DUMPS=full (or CRASH_DUMP_FULL=1)      full-memory dumps (several GB)
  *   PORT_HANG_DUMP=1   strict watchdog: 20 s (PORT_HANG_S) without a game frame,
  *                      or without an RSX flip while frames run (not when paused)
+ *   logs\hang.now      create it while the game runs: one hang report now (a
+ *                      stalled objective / script; lists every guest thread's
+ *                      priority, syscall + wait object, call site)
  *   PORT_HANG_DUMP=0   no watchdog; unset: game frames only, R2_HANG_S (90) s
  * vm_base is declared above; VM_SIZE is defined further down, hence the literal. */
 #ifdef _WIN32
 #include "port_crash.h"
+#define PORT_FRAMETIME_IMPL   /* frame-time recorder: logs\frametimes_*.txt, marker key */
+#include "port_frametime.h"
 
 extern "C" volatile LONG r2_game_frames = 0;   /* stubs.cpp frame limiter */
 extern "C" volatile int g_r2pc_paused;         /* r2_pcport.cpp: focus pause / quit prompt */
+extern "C" volatile long g_port_pause_gen;     /* bumped on every pause / resume (stubs.cpp default 0) */
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);   /* ppu_loader.cpp: host pc -> lifted function */
 extern "C" int r2rsx_enabled(void);
 extern "C" uint64_t r2rsx_last_flip_time(void);
@@ -27,6 +33,15 @@ extern "C" void rsx_null_refresh_restore_on_crash(void);   /* rsx_null_backend.c
 static uint64_t r2c_frames(void) { return (uint64_t)(ULONG)r2_game_frames; }
 static uint64_t r2c_rsx(void) { return r2rsx_enabled() ? r2rsx_last_flip_time() : 0; }
 static int r2c_paused(void) { return g_r2pc_paused != 0; }
+/* guest PPU state of the faulting thread (ppu_loader.cpp); PORT_CRASH_EXTRA=0 turns it off */
+extern "C" int ppu_crash_guest_state(uint64_t*, uint32_t*, uint32_t*, uint32_t*, uint32_t*, uint32_t*);
+static void r2c_guest(PortGuestState* g)
+{
+    g->valid = ppu_crash_guest_state(&g->thread_id, &g->lr, &g->sp, &g->syscall_inflight,
+                                     &g->syscall_last, &g->callsite);
+}
+
+extern "C" void ppu_hang_guest_threads(void (*emit)(const char*));   /* sys_ppu_thread.c */
 
 static void r2_crash_init(void)
 {
@@ -42,7 +57,15 @@ static void r2_crash_init(void)
     c.vm_size = 0x100010000ull;   /* VM_SIZE */
     c.guest_resolve = ppu_prof_resolve_host;
     c.before_report = rsx_null_refresh_restore_on_crash;
+    c.guest_state = r2c_guest;
+    c.guest_threads = ppu_hang_guest_threads;
+    c.after_report = port_ft_on_report;
     port_crash::init(c);
+    PortFtConfig f = {};
+    f.title = c.title;
+    f.paused = r2c_paused;
+    f.pause_gen = [](void) -> long { return g_port_pause_gen; };
+    port_ft_init(f);
 }
 #else
 extern "C" volatile LONG r2_game_frames = 0;

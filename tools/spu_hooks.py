@@ -36,7 +36,9 @@ def split(lines):
     return pre, funcs
 
 def extract(curp, rawp, postp, outp):
-    pc, C = split(rd(curp)); pr, R = split(rd(rawp)); pp, P = split(rd(postp))
+    # cur went through spu_w0.py; compare in the plain form the hunks apply to
+    unw0 = lambda l: re.sub(r'\bSPU_([WH])0\(S_(\d+)\)', lambda m: 'S_%s._u%s[0]' % (m.group(2), '32' if m.group(1) == 'W' else '16'), l)
+    pc, C = split([unw0(l) for l in rd(curp)]); pr, R = split(rd(rawp)); pp, P = split(rd(postp))
     res = {'pre': {}, 'post': {}, 'preamble': hunks(pp, pc)}
     for n, b in C.items():
         if n not in P: raise SystemExit('%s: %s not in fresh lift' % (curp, n))

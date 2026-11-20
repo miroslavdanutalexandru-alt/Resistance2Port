@@ -17,6 +17,9 @@
 #include <vector>
 
 extern "C" void (*volatile g_vfs_override_hook)(char* path, size_t cap) = nullptr;   // sys_fs.c in the game
+// r2_menurows.cpp (built-in options screen patch): off here, so only the mods folder is under test
+bool r2_menu_rows_enabled() { return false; }
+bool r2_menu_rows_patch_swf(const std::vector<uint8_t>&, std::vector<uint8_t>&, std::string* why) { if (why) *why = "test"; return false; }
 
 namespace fs = std::filesystem;
 using Bytes = std::vector<uint8_t>;

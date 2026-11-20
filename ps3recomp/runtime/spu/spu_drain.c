@@ -474,6 +474,7 @@ static void spu_drain_call_impl(spu_context* ctx, uint32_t return_pc);
 #ifdef _WIN32
 #include <windows.h>
 #include <intrin.h>
+#include "ps3emu/port_hitch.h"   /* [spike]: per-frame SPU job time by image */
 extern SPU_THREAD_LOCAL uint32_t g_spu_dma_ring_n;
 int ps3_host_prio_boost(void);
 #define SJT_NIMG 1024
@@ -487,6 +488,7 @@ static volatile long long s_sjt_next;
 static int s_sjt_on = -1, s_sjt_igimg = 0;
 static int s_sjt_focus[8], s_sjt_nfocus, s_sjt_boost[8], s_sjt_nboost;
 static long long s_sjt_qf, s_sjt_q0; static unsigned long long s_sjt_t0;
+extern int g_cpurep_spu_on; void cpurep_spu_init(void); void cpurep_spu_job_begin(spu_context* ctx, int img, uint32_t link, long busy); void cpurep_spu_job_end(int how); /* cpu-replay */
 uint32_t g_sjt_link_a = 0x3F8F4u, g_sjt_link_b = 0x2AA0u;
 static SPU_THREAD_LOCAL int t_sjt_img, t_sjt_boosted, t_sjt_prio;
 static SPU_THREAD_LOCAL uint32_t t_sjt_link, t_sjt_d0;
@@ -511,6 +513,8 @@ static void sjt_init(void)
     const char* e = getenv("SPU_JOB_TIMING");
     const int on = !(e && *e == '0');
     if ((e = getenv("SPU_IGJOB_LINK")) && *e) g_sjt_link_a = (uint32_t)strtoul(e, 0, 0) & SPU_LS_MASK;
+    /* R2 perf 1115: the WWS job-call return pc of the policy module (R3 0x2AA0; R2 0x35D8, set by the R2 main) */
+    if ((e = getenv("SPU_WWSJOB_LINK")) && *e) g_sjt_link_b = (uint32_t)strtoul(e, 0, 0) & SPU_LS_MASK;
     if ((e = getenv("SPU_IGJOB_IMG")) && *e) s_sjt_igimg = atoi(e);
     s_sjt_nfocus = sjt_list(getenv("SPU_JOB_FOCUS"), s_sjt_focus, 419);
     s_sjt_nboost = sjt_list(getenv("SPU_JOB_BOOST"), s_sjt_boost, 419);
@@ -521,10 +525,11 @@ static void sjt_init(void)
     char fb[64] = "", bb[64] = "";
     for (int i = 0, k = 0; i < s_sjt_nfocus; i++) k += snprintf(fb + k, sizeof fb - k, "%s%d", i ? "," : "", s_sjt_focus[i]);
     for (int i = 0, k = 0; i < s_sjt_nboost; i++) k += snprintf(bb + k, sizeof bb - k, "%s%d", i ? "," : "", s_sjt_boost[i]);
-    fprintf(stderr, "[spu-jobs] SPU_JOB_TIMING=%d focus=%s SPU_JOB_BOOST=%s%s ig link=0x%05X img=%d\n",
+    fprintf(stderr, "[spu-jobs] SPU_JOB_TIMING=%d focus=%s SPU_JOB_BOOST=%s%s ig link=0x%05X img=%d wws link=0x%05X\n",
             on, fb, s_sjt_nboost ? bb : "off", pb ? "" : " (host prio boost off: low core count)",
-            g_sjt_link_a, s_sjt_igimg);
+            g_sjt_link_a, s_sjt_igimg, g_sjt_link_b);
     if (!on) { g_sjt_link_a = g_sjt_link_b = 0xFFFFFFFFu; s_sjt_nboost = 0; }
+    cpurep_spu_init(); /* cpu-replay */
     s_sjt_on = on;
 }
 static int sjt_in(const int* l, int n, int img) { for (int i = 0; i < n; i++) if (l[i] == img) return 1; return 0; }
@@ -534,6 +539,7 @@ static void sjt_unboost(void)
 }
 static void sjt_drop(void)
 {
+    if (__builtin_expect(g_cpurep_spu_on, 0)) cpurep_spu_job_end(1); /* cpu-replay */
     sjt_unboost();
     t_sjt_link = 0;
     _InterlockedDecrement(&s_sjt_active);
@@ -586,20 +592,24 @@ void spu_jobtime_begin(spu_context* ctx, uint32_t link)
         }
     }
     t_sjt_img = img; t_sjt_link = link; t_sjt_d0 = g_spu_dma_ring_n; t_sjt_av = 0;
+    if (__builtin_expect(g_cpurep_spu_on, 0)) cpurep_spu_job_begin(ctx, img, link, busy); /* cpu-replay */
     ULONG64 c = 0; QueryThreadCycleTime(GetCurrentThread(), &c); t_sjt_c0 = c;
     QueryPerformanceCounter(&q); t_sjt_q0 = q.QuadPart;
 }
 
 /* Time the guest-memory fault hook spent on this thread (project main.cpp). */
 void spu_jobtime_av(long long qpc_ticks) { if (t_sjt_link) t_sjt_av += qpc_ticks; }
+/* The WWS job image timed on this thread, -1 = none (main.cpp [av-who]). */
+int spu_jobtime_cur_img(void) { return t_sjt_link ? t_sjt_img : -1; }
 
 static void sjt_line(char* b, size_t n, int img, const sjt_stat* d, double us_per_q, double cyc_per_us, double secs)
 {
     const long long r = d->runs;
     if (!r) { snprintf(b, n, "img %d: 0 runs", img); return; }
     const double wall = d->wall * us_per_q;
-    snprintf(b, n, "img %d: %lld runs (%.0f/s) avg %.0f max %.0f us, total %.1f ms, cpu %.0f%%, dma/run %.0f, busy-at-start avg %.1f max %ld, av %.2f ms%s",
-             img, r, r / secs, wall / r, d->wmax * us_per_q, wall / 1000.0,
+    const char* tg = port_hitch_job_tag(img);
+    snprintf(b, n, "img %d%s%s: %lld runs (%.0f/s) avg %.0f max %.0f us, total %.1f ms, cpu %.0f%%, dma/run %.0f, busy-at-start avg %.1f max %ld, av %.2f ms%s",
+             img, *tg ? " " : "", tg, r, r / secs, wall / r, d->wmax * us_per_q, wall / 1000.0,
              wall > 0 ? 100.0 * d->cyc / (wall * cyc_per_us) : 0.0, (double)d->dma / r,
              (double)d->busy / r, d->bmax, d->av * us_per_q / 1000.0,
              sjt_in(s_sjt_boost, s_sjt_nboost, img) ? " [boost]" : "");
@@ -651,6 +661,8 @@ static void spu_jobtime_end(void)
     _InterlockedExchangeAdd64(&st->dma, (long long)(uint32_t)(g_spu_dma_ring_n - t_sjt_d0));
     _InterlockedExchangeAdd64(&st->av, t_sjt_av);
     long long m = st->wmax; while (w > m && _InterlockedCompareExchange64(&st->wmax, w, m) != m) m = st->wmax;
+    port_hitch_spu_job(t_sjt_img, w);
+    if (__builtin_expect(g_cpurep_spu_on, 0)) cpurep_spu_job_end(0); /* cpu-replay */
     sjt_drop();
     const long long nx = s_sjt_next;
     if (q.QuadPart >= nx && _InterlockedCompareExchange64(&s_sjt_next, q.QuadPart + 5 * s_sjt_qf, nx) == nx && nx)
@@ -661,6 +673,7 @@ static void spu_jobtime_end(void)
 uint32_t g_sjt_link_a = 0xFFFFFFFFu, g_sjt_link_b = 0xFFFFFFFFu;
 void spu_jobtime_begin(spu_context* ctx, uint32_t link) { (void)ctx; (void)link; }
 void spu_jobtime_av(long long qpc_ticks) { (void)qpc_ticks; }
+int spu_jobtime_cur_img(void) { return -1; }
 static SPU_THREAD_LOCAL uint32_t t_sjt_link;
 static void spu_jobtime_end(void) {}
 #endif
@@ -755,3 +768,4 @@ static void spu_drain_call_impl(spu_context* ctx, uint32_t return_pc)
     }
 #undef SPU_DRAIN_POP_IRQ
 }
+#include "spu_cpurep.inl" /* cpu-replay: SPU job capture (PORT_SPU_CAPTURE) */

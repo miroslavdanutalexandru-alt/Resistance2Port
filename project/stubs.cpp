@@ -10,6 +10,7 @@
  * no lifted PRX and no overrides needs.
  */
 
+#include "../ps3recomp/libs/video/rsx_featcov.h"   /* rsx_featcov_dump at exit */
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -108,6 +109,7 @@ static void hle_game_process_exitspawn(ppu_context* ctx)
         target_elf = root + "\\game\\EBOOT.elf";
     } else {
         fprintf(stderr, "[exitspawn] no executable for \"%s\" -- exiting\n", path.c_str());
+        rsx_featcov_dump("exit");   /* [featcov] ExitProcess skips atexit */
         fflush(stderr); ExitProcess(0);
     }
     std::string datafile;
@@ -163,6 +165,7 @@ static void hle_game_process_exitspawn(ppu_context* ctx)
         fprintf(stderr, "[exitspawn] FAILED to start %s (error %lu)\n", target_exe.c_str(), GetLastError());
         fflush(stderr);
     }
+    rsx_featcov_dump("exit");
     ExitProcess(0);
 #else
     exit(0);
@@ -747,11 +750,11 @@ extern "C" volatile int g_port_space_start;
  *   +0x3E80/84/88  feet position x, height, y      (+0x340.. = eye, 1.7 above)
  *   +0xF0/F4/F8    velocity (copy at +0x110)        +0x1EB  1 = on the ground
  * The detector keeps the last 3 s of the player object; when the player drops
- * more than PORT_FALL_M (default 6) below the last ground they stood on within
+ * more than PORT_FALL_M (diagnostic, default 0 = off; e.g. 6) below the last ground they stood on within
  * 3 s of leaving it, it writes logs\fall_<ms>.bin (same format as
  * player_trace.bin) and a line in the log. F4 puts the player back on the
  * last ground they stood on for at least half a second (about 1.5 s before
- * leaving it) -- usable any time, not only after a detected fall.
+ * leaving it) -- usable any time, not only after a detected fall (only with PORT_FALL_M set).
  * -------------------------------------------------------------------------*/
 #define FALL_RING 270
 static uint8_t  s_fall_ring[FALL_RING][16384];
@@ -763,7 +766,7 @@ static void fall_watch(uint32_t player)
 {
     if (!player) return;
     static int on = -1; static float lim = 6.0f;
-    if (on < 0) { const char* e = getenv("PORT_FALL_M"); lim = e ? (float)atof(e) : 6.0f; on = lim > 0.0f; }
+    if (on < 0) { const char* e = getenv("PORT_FALL_M"); lim = e ? (float)atof(e) : 0.0f; on = lim > 0.0f; }
     const ULONGLONG now = GetTickCount64();
     const float fx = ml_rdf(player + 0x3E80), fz = ml_rdf(player + 0x3E84), fy = ml_rdf(player + 0x3E88);
     const int ground = vm_read8(player + 0x1EB) == 1;
@@ -829,7 +832,7 @@ static void fall_watch(uint32_t player)
     }
     /* F4: rescue */
     static int f4was = 0; const int f4 = (GetAsyncKeyState(VK_F4) & 0x8000) != 0;
-    if (f4 && !f4was && s_safe_n) {
+    if (on && f4 && !f4was && s_safe_n) {
         /* newest safe spot at least 1.5 s older than the moment ground was last left */
         const ULONGLONG ref = ground ? now : left_ground;
         int pick = -1;
@@ -855,7 +858,8 @@ static DWORD WINAPI ptrace_key_thread(LPVOID) {
     for (;;) { const int k = (GetAsyncKeyState(VK_F10) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000);
                if (k && !kw) InterlockedExchange(&s_ptrace_armed, 1); kw = k; Sleep(20); }
 }
-static int s_ptrace_key_init = (CloseHandle(CreateThread(NULL, 0, ptrace_key_thread, NULL, 0, NULL)), 0);
+/* diagnostic, off unless PORT_PTRACE=1 */
+static int s_ptrace_key_init = (getenv("PORT_PTRACE") && atoi(getenv("PORT_PTRACE")) == 1 ? CloseHandle(CreateThread(NULL, 0, ptrace_key_thread, NULL, 0, NULL)) : 0, 0);
 static ULONGLONG s_ml_script_until;   /* v169: scripted camera active until (ms) */
 /* Local co-op: how many local players are in the game (split-screen when 2).
  * The direct mouse look below is for one player; with two it is off and the
@@ -879,7 +883,7 @@ extern "C" void port_mouselook_pre(uint32_t player)
     g_port_space_start = 0;   /* v160v: in play */
     g_port_play_ms = GetTickCount64();   /* v162: in-game menu mode is off while this is fresh */
     g_port_pause_ui = 0;
-    /* v167 diag: Shift+F10 records the player object (first 16 KB, every frame,
+    /* v167 diag (PORT_PTRACE=1 only): Shift+F10 records the player object (first 16 KB, every frame,
      * 30 s) to logs\\player_trace.bin, to find where position / velocity live.
      * Record: u64 ms, u32 player ea, u32 0, then 16384 bytes big-endian as in memory. */
     { static int was = 0; static FILE* pf = NULL; static ULONGLONG t0 = 0; static unsigned nfr = 0;
@@ -1077,10 +1081,37 @@ static void r2ml_load(void)
 }
 static void r2ml_check(int fed, float rate, int* sign, int* bad, const char* what)
 {
-    if (!(fed >= 16 || fed <= -16) || !(rate > 1e-5f || rate < -1e-5f)) return;
+    /* The game's rate can lag the fed stick by a frame or two, so a fast
+     * reversal (or a key / mouse flick) looked like the other direction: 4
+     * such frames flipped the learned sign, and the next 4 flipped it back
+     * ("aim briefly inverted"). Only a clear deflection held in one direction
+     * for >= 250 ms counts now, and it takes 8 (15 once saved) such frames
+     * in a row. R2_ML_LEARN=0: never re-learn (use mouselook_r2.cfg / -1,-1).
+     * R2_ML_LEARN=legacy: the old learning (|fed| >= 16, no hold time, 4 frames). */
+    static int learn = -1;
+    if (learn < 0) { const char* e = getenv("R2_ML_LEARN");
+                     learn = (e && *e == '0') ? 0 : (e && !_stricmp(e, "legacy")) ? 2 : 1; }
+    if (!learn) return;
+    if (learn == 2) {
+        if (!(fed >= 16 || fed <= -16) || !(rate > 1e-5f || rate < -1e-5f)) return;
+        const int s = ((fed > 0) == (rate > 0)) ? 1 : -1;
+        if (s == *sign) { *bad = 0; return; }
+        if (++*bad >= (s_r2ml_saved ? 15 : 4)) {
+            *sign = s; *bad = 0; r2ml_save();
+            fprintf(stderr, "[mouselook] %s direction now %d (following the game's setting)%c", what, s, 10);
+        }
+        return;
+    }
+    static int last_s[2]; static ULONGLONG since[2];
+    const int ax = bad == &s_r2ml_bad_y;
+    const ULONGLONG now = GetTickCount64();
+    const int fs = fed >= 16 ? 1 : fed <= -16 ? -1 : 0;
+    if (fs != last_s[ax]) { last_s[ax] = fs; since[ax] = now; }
+    if (!(fed >= 40 || fed <= -40) || !(rate > 1e-5f || rate < -1e-5f)) return;
+    if (now - since[ax] < 250) return;
     const int s = ((fed > 0) == (rate > 0)) ? 1 : -1;
     if (s == *sign) { *bad = 0; return; }
-    if (++*bad >= (s_r2ml_saved ? 15 : 4)) {
+    if (++*bad >= (s_r2ml_saved ? 15 : 8)) {
         *sign = s; *bad = 0; r2ml_save();
         fprintf(stderr, "[mouselook] %s direction now %d (following the game's setting)%c", what, s, 10);
     }
@@ -1182,10 +1213,14 @@ extern "C" double r2_fps_target(void)
     { char fb[32]; snprintf(fb, sizeof fb, "%.3f", f); _putenv_s("PORT_FPS_EFFECTIVE", fb); snprintf(fb, sizeof fb, "%.3f", hz); _putenv_s("PORT_DISPLAY_HZ", fb); }   /* PORT_REFRESH_SWITCH (rsx_null_backend.c) */
     fprintf(stderr, "[fps] target %s%.3f (display %.3f Hz, RSX_VSYNC=%s)\n",
             f > 0.0 ? "" : "uncapped ", f, hz, v ? v : "(unset)");
+    if (f == 0.0 || f > 75.0)   /* the game's stick-to-movement path misbehaves at high frame rates */
+        fprintf(stderr, "[fps] WARNING: above 75 fps (%s) the left stick's movement breaks (the player jumps instead of "
+                        "walking smoothly: jump-to-move); 60 is the recommended cap (R2_FPS=60)\n",
+                f > 0.0 ? "capped" : "uncapped");
     if (f > 0.0 && f != 30.0) {   /* a fixed-refresh display only paces evenly at a divisor of its rate */
         const double q = hz / f;
         if (fabs(q - floor(q + 0.5)) > 0.03)
-            fprintf(stderr, "[fps] note: %.0f fps on a %.0f Hz display holds frames for alternating %d / %d refreshes (judder) unless VRR / G-Sync is on; even rates: %.0f or %.0f (R2_FPS); exclusive fullscreen switches to an even refresh (PORT_REFRESH_SWITCH)\n",
+            fprintf(stderr, "[fps] note: %.0f fps on a %.0f Hz display holds frames for alternating %d / %d refreshes (judder) unless VRR / G-Sync is on; even rates: %.0f or %.0f (R2_FPS); PORT_REFRESH_SWITCH=1 switches exclusive fullscreen to an even refresh (=2: borderless fullscreen too)\n",
                     f, hz, (int)floor(q), (int)ceil(q), hz / ceil(q), floor(q) >= 1.0 ? hz / floor(q) : hz);
     }
     return fps;
@@ -1228,13 +1263,21 @@ static void r2_pace_wait(uint64_t deadline)
 }
 
 extern "C" volatile LONG r2_game_frames;   /* main.cpp r2_crash.inc: hang watchdog */
+extern "C" volatile long g_port_frame_no;  /* cellPad.c: keyboard menu mode needs frames, not just time */
 extern "C" volatile int g_r2pc_paused;     /* r2_pcport.cpp: focus pause / quit prompt */
 extern "C" volatile int g_ps3_host_paused; /* sys_ppu_thread.c: idle the SPU / RSX wait loops */
+/* VKR2Upscaler.cpp (PORT_DLSS_RESET_HITCH_MS): bumped on every pause and resume so a pause is not a DLSS hitch;
+ * builds without the RPCS3 renderer link the local default */
+extern "C" volatile long g_port_pause_gen;
+extern "C" volatile long g_port_pause_gen_default = 0;
+#pragma comment(linker, "/alternatename:g_port_pause_gen=g_port_pause_gen_default")
 extern "C" void r2pf_frame_tick(void);       /* r2_pcfeat.cpp: F3 overlay frame times */
 extern "C" void r2x_frame_tick(void);        /* r2_pcextra.cpp: FX patches, benchmark, Reflex */
+#include "port_hitchcatch.h"                 /* PORT_HITCHCATCH=<ms>: stacks of the key threads on a hitch */
 extern "C" double r2_frame_period(double f1)
 {
     InterlockedIncrement(&r2_game_frames);
+    g_port_frame_no = g_port_frame_no + 1;   /* only this thread writes it */
     int hitch_discard = 0;
     { const uint64_t ht = port_hitch_t0();
       r2pf_frame_tick();
@@ -1246,7 +1289,9 @@ extern "C" double r2_frame_period(double f1)
     if (g_r2pc_paused) {
         /* parked at the frame boundary: SPU polls and the RSX FIFO wait nap too */
         g_ps3_host_paused = 1;
+        InterlockedIncrement(&g_port_pause_gen);
         while (g_r2pc_paused) { Sleep(5); InterlockedIncrement(&r2_game_frames); }
+        InterlockedIncrement(&g_port_pause_gen);
         g_ps3_host_paused = 0;
         hitch_discard = 1;
     }
@@ -1280,6 +1325,7 @@ extern "C" double r2_frame_period(double f1)
             port_log_async(1, "[fps] 5 s: %.1f fps (target 30)\n", n * 79800000.0 / (double)(now - t0));
             t0 = now; n = 0;
         }
+        port_hitchcatch_frame(g_port_frame_no, hitch_discard);
         port_hitch_frame(30.0, hitch_discard);
         return f1;
     }
@@ -1325,6 +1371,7 @@ extern "C" double r2_frame_period(double f1)
                   fps > 0.0 ? "" : "uncapped ", fps);
           t0 = now; n = 0;
       } }
+    port_hitchcatch_frame(g_port_frame_no, hitch_discard);
     port_hitch_frame(fps, hitch_discard);
     return 0.0001;   /* the game's own wait then never holds the frame */
 }
@@ -1730,6 +1777,8 @@ extern "C" void port_text_patch(uint32_t file_obj)
  * = [A], Circle = [B], L1 = [LB]... -- 0 PS3 icons for a Sony controller or
  * R2_PAD_GLYPHS=ps). R2_KEY_PROMPTS=0 turns this off. */
 #include <mutex>
+#include "ps3emu/port_pc_extras.h"   /* pcx_nx_label: Nintendo button labels */
+extern "C" int cellpad_nintendo_swap(void);
 struct R2Glyph { uint16_t cp; const char* pad; const char* hint; const char* fixed; const char* full; };
 static const R2Glyph s_r2_glyphs[] = {
     /* physical buttons */
@@ -1750,6 +1799,7 @@ static const R2Glyph s_r2_glyphs[] = {
 };
 static char s_r2_rep3[128][4], s_r2_repf[128][24]; static int s_r2_have[128];
 static char s_r2_xb3[128][4], s_r2_xbf[128][24];     /* the same glyphs as Xbox buttons */
+static char s_r2_nx3[128][4], s_r2_nxf[128][24];     /* ... and as Nintendo buttons (prompt mode 3) */
 /* PC port: a PS3 button as the Xbox controller button in the same place
  * (Cross = A, Circle = B, Square = X, Triangle = Y, L1/R1 = LB/RB, L2/R2 =
  * LT/RT, Select = View, Start = Menu, L3/R3 = LS/RS): 3-byte and full names. */
@@ -1764,6 +1814,22 @@ static void r2_xbox_names(const char* pad, char o3[4], char of[24])
     };
     for (auto& e : t) if (!_stricmp(pad, e.p)) { memcpy(o3, e.s3, 4); snprintf(of, 24, "%s", e.f); return; }
     memcpy(o3, "[?]", 4); snprintf(of, 24, "[?]");
+}
+/* PC port: the same as Nintendo (Switch) buttons, ps3emu/port_pc_extras.h pcx_nx_label: by position
+ * (Cross = B, Circle = A, Square = Y, Triangle = X), or by label with PAD_NINTENDO_SWAP (Cross = A). */
+static void r2_nx_names(const char* pad, char o3[4], char of[24])
+{
+    static const char* const t[13] = { "CIRCLE", "SQUARE", "CROSS", "TRIANGLE", "SELECT", "START",
+                                       "L1", "L2", "L3", "", "R1", "R2", "R3" };
+    const char* q = !_stricmp(pad, "INTERACT") ? "TRIANGLE" : pad;
+    for (int i = 0; i < 13; i++)
+        if (t[i][0] && !_stricmp(q, t[i])) {
+            const char* l = pcx_nx_label(i, cellpad_nintendo_swap() > 0);
+            snprintf(of, 24, "[%s]", l);
+            if (strlen(l) == 1) snprintf(o3, 4, "[%s]", l); else snprintf(o3, 4, "%-3s", l);
+            return;
+        }
+    r2_xbox_names(pad, o3, of);
 }
 static int r2_glyph_at(const uint8_t* q)          /* slot of a mapped glyph at q, or -1 */
 {
@@ -1802,13 +1868,39 @@ static int r2_key_for(const char* pad, const char* hint, char out3[4], char outf
     key3(k, out3); keyfull(k, outf);
     return 1;
 }
-struct R2RefRec { uint32_t ea, orig, kbm, xb; };
-struct R2ByteRec { uint32_t ea; uint8_t orig[3], kbm[3], xb[3]; };
+/* PC port: a PS3 button ("L1", "SELECT"...) named for port text outside the game's text files (the
+ * options screen's PC settings hint, r2_menurows.cpp). mode: 0 PS3
+ * ("L1"), 1 the key bound in controls.txt ("RMB", "Q"), 2 Xbox ("LB"), 3 Nintendo ("L"); -1 the
+ * current prompt mode (PS3 with R2_KEY_PROMPTS=0). A button no key is bound to keeps its PS3 name. */
+extern "C" volatile int g_port_input_mode;           /* cellPad.c: the current prompt mode */
+extern "C" void r2_button_name(const char* pad, int mode, char* out, int n)
+{
+    if (!out || n <= 0) return;
+    if (mode < 0) {
+        const char* e = getenv("R2_KEY_PROMPTS");
+        mode = (e && *e && !atoi(e)) ? 0 : g_port_input_mode;
+    }
+    char s3[4], f[64] = "";
+    if (mode == 1) { char k[64]; if (r2_bound_key(pad, "", k)) keyfull(k, f); }
+    else if (mode == 2) r2_xbox_names(pad, s3, f);
+    else if (mode == 3) r2_nx_names(pad, s3, f);
+    if (!f[0] || !strcmp(f, "[?]")) {
+        static const struct { const char* p; const char* s; } ps[] = { {"SELECT","Select"},{"START","Start"},{"CROSS","Cross"},
+            {"CIRCLE","Circle"},{"SQUARE","Square"},{"TRIANGLE","Triangle"} };
+        snprintf(f, sizeof f, "%s", pad);
+        for (auto& e : ps) if (!_stricmp(pad, e.p)) snprintf(f, sizeof f, "%s", e.s);
+    }
+    const size_t l = strlen(f);
+    if (l > 2 && f[0] == '[' && f[l - 1] == ']') snprintf(out, n, "%.*s", (int)(l - 2), f + 1);   /* "[LB]" -> "LB" */
+    else snprintf(out, n, "%s", f);
+}
+struct R2RefRec { uint32_t ea, orig, kbm, xb, nx; };
+struct R2ByteRec { uint32_t ea; uint8_t orig[3], kbm[3], xb[3], nx[3]; };
 struct R2TextFile { uint32_t base, end; int mode; std::vector<R2RefRec> refs; std::vector<R2ByteRec> bytes; };
 static std::mutex s_r2_mu;
 static std::vector<R2TextFile> s_r2_files;
 static volatile int s_r2_mode = -1;                  /* the mode every file is in, -1 = some differ */
-/* mode: 0 PS3 buttons, 1 keys, 2 Xbox buttons. Only where the memory still
+/* mode: 0 PS3 buttons, 1 keys, 2 Xbox buttons, 3 Nintendo buttons. Only where the memory still
  * holds one of the versions we wrote (the game may have reused it). */
 static void r2_apply(R2TextFile& t, int mode)
 {
@@ -1816,16 +1908,17 @@ static void r2_apply(R2TextFile& t, int mode)
     t.mode = mode;
     if (vm_read32(t.base) != 0x49474857u) return;    /* "IGHW": the file is gone */
     for (auto& r : t.refs) {
-        const uint32_t cur = vm_read32(r.ea), v[3] = { r.orig, r.kbm, r.xb };
-        if (cur != v[mode] && (cur == v[0] || cur == v[1] || cur == v[2])) vm_write32(r.ea, v[mode]); }
+        const uint32_t cur = vm_read32(r.ea), v[4] = { r.orig, r.kbm, r.xb, r.nx };
+        if (cur != v[mode] && (cur == v[0] || cur == v[1] || cur == v[2] || cur == v[3])) vm_write32(r.ea, v[mode]); }
     for (auto& b : t.bytes) {
-        uint8_t* q = vm_base + b.ea; const uint8_t* v[3] = { b.orig, b.kbm, b.xb };
-        if (memcmp(q, v[mode], 3) && (!memcmp(q, v[0], 3) || !memcmp(q, v[1], 3) || !memcmp(q, v[2], 3))) memcpy(q, v[mode], 3); }
+        uint8_t* q = vm_base + b.ea; const uint8_t* v[4] = { b.orig, b.kbm, b.xb, b.nx };
+        if (memcmp(q, v[mode], 3) && (!memcmp(q, v[0], 3) || !memcmp(q, v[1], 3) || !memcmp(q, v[2], 3) || !memcmp(q, v[3], 3)))
+            memcpy(q, v[mode], 3); }
 }
 static void r2_icons_mode(int mode);
 static void r2_input_mode(int mode)
 {
-    if (mode < 0 || mode > 2) mode = 1;
+    if (mode < 0 || mode > 3) mode = 1;
     r2_icons_mode(mode);
     if (s_r2_mode == mode) return;
     std::lock_guard<std::mutex> lk(s_r2_mu);
@@ -1833,7 +1926,6 @@ static void r2_input_mode(int mode)
     s_r2_mode = mode;
 }
 extern "C" void (*volatile g_r2_input_mode_cb)(int mode);
-extern "C" volatile int g_port_input_mode;           /* cellPad.c: the current prompt mode */
 /* PC port: console wording -> PC wording in every text file (all languages),
  * in place; see r2_pctext.cpp (R2_PC_TEXT=0 turns it off). Runs on each text
  * file as it is registered, before the button glyphs are handled. */
@@ -1865,6 +1957,7 @@ extern "C" void r2_text_patch(uint32_t file_obj)
                 memcpy(s_r2_rep3[i], g.fixed, 4); snprintf(s_r2_repf[i], 24, "%s", g.full);
                 const int right = g.cp == 0xE00E;
                 memcpy(s_r2_xb3[i], right ? "RSt" : "LSt", 4); snprintf(s_r2_xbf[i], 24, right ? "[Right Stick]" : "[Left Stick]");
+                memcpy(s_r2_nx3[i], s_r2_xb3[i], 4); memcpy(s_r2_nxf[i], s_r2_xbf[i], 24);
             } else {
                 int have = r2_key_for(g.pad, g.hint, s_r2_rep3[i], s_r2_repf[i]);
                 if (!have && !strcmp(g.pad, "INTERACT"))      /* no use key: the Triangle key */
@@ -1874,6 +1967,7 @@ extern "C" void r2_text_patch(uint32_t file_obj)
                     memcpy(s_r2_rep3[i], u, 4); memcpy(s_r2_repf[i], u, 4);
                 }
                 r2_xbox_names(g.pad, s_r2_xb3[i], s_r2_xbf[i]);
+                r2_nx_names(g.pad, s_r2_nx3[i], s_r2_nxf[i]);
             }
             s_r2_have[i] = 1; }
         g_r2_input_mode_cb = r2_input_mode;
@@ -1882,7 +1976,7 @@ extern "C" void r2_text_patch(uint32_t file_obj)
     for (size_t fi = 0; fi < s_r2_files.size(); fi++)
         if (s_r2_files[fi].base == base) { r2_apply(s_r2_files[fi], 0); s_r2_files.erase(s_r2_files.begin() + fi); break; }
     int kbm = g_port_input_mode;
-    if (kbm < 0 || kbm > 2) kbm = 1;
+    if (kbm < 0 || kbm > 3) kbm = 1;
     uint8_t* p = vm_base + base;
     std::vector<uint32_t> starts;                           /* strings with a glyph */
     for (uint32_t i = 0; i + 2 < end; i++) {
@@ -1936,28 +2030,31 @@ extern "C" void r2_text_patch(uint32_t file_obj)
     }
     std::vector<char> relocated(starts.size(), 0);
     if (!refs.empty()) {
-        std::string out, outx; std::vector<uint32_t> at(starts.size(), 0xFFFFFFFFu), atx(starts.size(), 0);
+        std::string out, outx, outn; std::vector<uint32_t> at(starts.size(), 0xFFFFFFFFu), atx(starts.size(), 0), atn(starts.size(), 0);
         for (auto& r : refs) {
             if (at[r.si] != 0xFFFFFFFFu) continue;
             const uint32_t o = starts[r.si];
             size_t m = 0; for (; o + m < end && p[o + m]; m++) {}
-            at[r.si] = (uint32_t)out.size(); atx[r.si] = (uint32_t)outx.size();
+            at[r.si] = (uint32_t)out.size(); atx[r.si] = (uint32_t)outx.size(); atn[r.si] = (uint32_t)outn.size();
             for (size_t i = 0; i < m; i++) {
                 const int k = (i + 2 < m) ? r2_glyph_at(p + o + i) : -1;
-                if (k >= 0) { out += s_r2_repf[k]; outx += s_r2_xbf[k]; i += 2; }
-                else { out += (char)p[o + i]; outx += (char)p[o + i]; }
+                if (k >= 0) { out += s_r2_repf[k]; outx += s_r2_xbf[k]; outn += s_r2_nxf[k]; i += 2; }
+                else { out += (char)p[o + i]; outx += (char)p[o + i]; outn += (char)p[o + i]; }
             }
-            out += '\0'; outx += '\0';
+            out += '\0'; outx += '\0'; outn += '\0';
         }
         const uint32_t blk = ps3_hle_heap_alloc((uint32_t)out.size() + 16);
         const uint32_t blkx = blk ? ps3_hle_heap_alloc((uint32_t)outx.size() + 16) : 0;
+        const uint32_t blkn = blkx ? ps3_hle_heap_alloc((uint32_t)outn.size() + 16) : 0;
         if (blk) {
             memcpy(vm_base + blk, out.data(), out.size());
             if (blkx) memcpy(vm_base + blkx, outx.data(), outx.size());
+            if (blkn) memcpy(vm_base + blkn, outn.data(), outn.size());
             for (auto& r : refs) {
                 const uint32_t ea = base + r.pos, orig = vm_read32(ea);
-                tf.refs.push_back({ ea, orig, blk + at[r.si] - base - r.rel,
-                                    blkx ? blkx + atx[r.si] - base - r.rel : orig });
+                const uint32_t xv = blkx ? blkx + atx[r.si] - base - r.rel : orig;
+                tf.refs.push_back({ ea, orig, blk + at[r.si] - base - r.rel, xv,
+                                    blkn ? blkn + atn[r.si] - base - r.rel : xv });
             }
             for (uint32_t si = 0; si < starts.size(); si++) if (at[si] != 0xFFFFFFFFu) relocated[si] = 1;
         }
@@ -1969,6 +2066,7 @@ extern "C" void r2_text_patch(uint32_t file_obj)
             const int k = r2_glyph_at(p + i);
             if (k < 0) continue;
             R2ByteRec b; b.ea = base + i; memcpy(b.orig, p + i, 3); memcpy(b.kbm, s_r2_rep3[k], 3); memcpy(b.xb, s_r2_xb3[k], 3);
+            memcpy(b.nx, s_r2_nx3[k], 3);
             tf.bytes.push_back(b); i += 2;
         }
     }
@@ -1977,7 +2075,7 @@ extern "C" void r2_text_patch(uint32_t file_obj)
     if (logged++ < 8)
         fprintf(stderr, "[prompts] text file 0x%08X: %zu string(s), %zu table reference(s) to full names, "
                 "%zu icon(s) as short names, showing %s%c", base, starts.size(), tf.refs.size(), tf.bytes.size(),
-                kbm == 1 ? "keys" : kbm == 2 ? "Xbox buttons" : "PS3 buttons", 10);
+                kbm == 1 ? "keys" : kbm == 2 ? "Xbox buttons" : kbm == 3 ? "Nintendo buttons" : "PS3 buttons", 10);
     s_r2_files.push_back(std::move(tf));
     if (s_r2_mode != kbm) s_r2_mode = -1;
 }
@@ -2000,7 +2098,7 @@ extern "C" void r2_text_patch(uint32_t file_obj)
 #pragma comment(lib, "gdi32.lib")
 extern "C" int32_t cellGcmMapMainMemory(uint32_t ea, uint32_t size, uint32_t* offset);
 extern "C" uint32_t cellGcmResolveLocated(int local, uint32_t offset);
-struct R2Icon { std::string name; uint32_t src, ea, hdr; int w, h, live; std::vector<uint8_t> pad, key, xb; };
+struct R2Icon { std::string name; uint32_t src, ea, hdr; int w, h, live; std::vector<uint8_t> pad, key, xb, nx; };   /* nx: Nintendo (mode 3) */
 static std::mutex s_icon_mu;
 static std::vector<R2Icon> s_icons;
 static uint32_t s_icon_blk = 0, s_icon_io = 0, s_icon_used = 0;
@@ -2161,7 +2259,7 @@ static void r2_icons_apply(int mode)                 /* s_icon_mu held */
     for (auto& ic : s_icons) {
         if (!ic.ea || !ic.hdr) continue;
         if (mode == 0) { if (ic.live) memcpy(vm_base + ic.ea, ic.pad.data(), ic.pad.size()); }
-        else memcpy(vm_base + ic.ea, mode == 2 ? ic.xb.data() : ic.key.data(), ic.key.size());
+        else memcpy(vm_base + ic.ea, mode == 2 ? ic.xb.data() : mode == 3 ? ic.nx.data() : ic.key.data(), ic.key.size());
     }
 }
 static void r2_icons_mode(int mode)
@@ -2207,7 +2305,7 @@ extern "C" void r2_menu_icon(ppu_context* ctx)
     if (w <= 0 || h <= 0 || w > 256 || h > 256) return;
     std::lock_guard<std::mutex> lk(s_icon_mu);
     int kbm = g_port_input_mode;
-    if (kbm < 0 || kbm > 2) kbm = 1;
+    if (kbm < 0 || kbm > 3) kbm = 1;
     if (s_icon_mode < 0) s_icon_mode = kbm;
     kbm = s_icon_mode;
     R2Icon* ic = nullptr;
@@ -2218,7 +2316,7 @@ extern "C" void r2_menu_icon(ppu_context* ctx)
         const int bound = r2_bound_key(pad, hint, key);
         if (!bound) fprintf(stderr, "[prompts] menu icon '%s': no key bound to %s, keeping the PS3 icon on keyboard%c", name, pad, 10);
         else r2_icon_label(key, label);
-        e.key.resize((size_t)w * h * 4); e.pad.resize(e.key.size()); e.xb.resize(e.key.size());
+        e.key.resize((size_t)w * h * 4); e.pad.resize(e.key.size()); e.xb.resize(e.key.size()); e.nx.resize(e.key.size());
         if (bound) r2_icon_render(label, w, h, e.key.data());
         /* Xbox-style button: original art -- a letter in a coloured circle, or a word on a dark key */
         { static const struct { const char* pad; const char* lb; int round; uint32_t body, ink; } xt[] = {
@@ -2227,6 +2325,10 @@ extern "C" void r2_menu_icon(ppu_context* ctx)
               { "START", "Menu", 0, 0x1C1C1C, 0xFFFFFF }, { "SELECT", "View", 0, 0x1C1C1C, 0xFFFFFF },
               { "L3", "LS", 1, 0x303030, 0xFFFFFF }, { "R3", "RS", 1, 0x303030, 0xFFFFFF } };
           for (auto& x : xt) if (!strcmp(x.pad, pad)) r2_icon_render(x.lb, w, h, e.xb.data(), x.round, x.body, x.ink); }
+        /* Nintendo-style button (prompt mode 3): white letter / sign on a dark disc */
+        { char n3[4], nf[24]; r2_nx_names(pad, n3, nf);
+          std::string lb(nf + 1); if (!lb.empty() && lb.back() == ']') lb.pop_back();
+          r2_icon_render(lb.c_str(), w, h, e.nx.data(), 1, 0x3A3A40, 0xF5F5F5); }
         static const int fmts[8] = { 0x81, 0, 0, 0, 0x85, 0x86, 0x87, 0x88 };
         const int fi = (int)((flags >> 8) & 0x1F) - 1, fmt = fi >= 0 && fi < 8 ? fmts[fi] : 0;
         const uint32_t src = cellGcmResolveLocated(((flags >> 1) & 1) == 0, vm_read32(hdr));
@@ -2252,7 +2354,8 @@ extern "C" void r2_menu_icon(ppu_context* ctx)
         s_icons.push_back(std::move(e));
         ic = &s_icons.back();
         if (ic->hdr) {
-            const uint8_t* img = kbm == 1 ? ic->key.data() : kbm == 2 ? ic->xb.data() : ic->live ? ic->pad.data() : ic->key.data();
+            const uint8_t* img = kbm == 1 ? ic->key.data() : kbm == 2 ? ic->xb.data() : kbm == 3 ? ic->nx.data() :
+                                 ic->live ? ic->pad.data() : ic->key.data();
             memcpy(vm_base + ic->ea, img, ic->key.size());
         }
         g_r2_input_mode_cb = r2_input_mode;
@@ -2692,6 +2795,7 @@ extern "C" uint64_t port_movie_evwait_us(void)
 }
 
 extern "C" void cellUserInfo_register_select(void);   /* libs/system/cellUserInfo.c */
+extern "C" void ps3_prof_start_sampler(void);   /* ppu_loader.cpp, PPU_PROF_SAMPLE */
 extern "C" void ps3_load_prx_modules(void)
 {
     ps3_hle_register_ctx(0xFC52A7A9u, "sys_game_process_exitspawn", hle_game_process_exitspawn);
@@ -2706,6 +2810,9 @@ extern "C" void ps3_load_prx_modules(void)
       if (dp && *dp) { snprintf(dbgpath, sizeof dbgpath, "%s", dp);
                        CreateThread(NULL, 0, debug_console, dbgpath, 0, NULL); }
       thrcpu_start(); }
+    /* PPU_PROF_SAMPLE=1: [PROF] top guest functions of this (main) thread every
+     * PPU_PROF_SECS s (ppu_loader.cpp). Diagnostic, off by default. */
+    { const char* ps = getenv("PPU_PROF_SAMPLE"); if (ps && atoi(ps) > 0) ps3_prof_start_sampler(); }
     if (getenv("WATCHDOG_AT")) CreateThread(NULL, 0, hang_watchdog, NULL, 0, NULL);
     if (getenv("FREEZE_RELAUNCH")) CreateThread(NULL, 0, freeze_relauncher, NULL, 0, NULL);
     CreateThread(NULL, 0, movie_watchdog, NULL, 0, NULL);   /* v126: logs\\moviehang_*.txt */
@@ -2782,15 +2889,75 @@ extern "C" int ps3_host_prio_boost(void);
 /* On many-core hosts the loop used to be a bare load-compare-branch. One PAUSE per lap
    frees the shared core for its SMT sibling, which on a 6c/12t CPU is often an SPU
    worker. The SPU's store still shows up within one lap of about 50 ns. R2_SPIN_PAUSE=0
-   restores the bare loop. */
+   restores the bare loop.
+   Low-core hosts used to call SwitchToThread every lap: ~63 % of the waiter's time went
+   to the kernel (spinbench, scratch\spinbench). Now SwitchToThread every
+   R2_SPIN_YIELD_EVERY-th lap (default 8; 1 = every lap as before) and 4 PAUSEs on the
+   other laps: same hand-off time when the SPU worker shares the core (52 us/round either
+   way), ~60 % less kernel time, and the SMT sibling sees PAUSE instead of syscalls. */
 extern "C" void r2_spin_relax(void)
 {
     static const bool low = !ps3_host_prio_boost();
     static const bool pause = [] { const char* e = getenv("R2_SPIN_PAUSE"); return !e || atoi(e) != 0; }();
+    static const unsigned every = [] { const char* e = getenv("R2_SPIN_YIELD_EVERY"); const int v = e && *e ? atoi(e) : 8;
+                                       return (unsigned)(v < 1 ? 1 : v > 64 ? 64 : v); }();
+    static thread_local unsigned lap;
 #ifdef PORT_TRACY
     PT_SPIN_LAP(PT_SPIN);   /* laps merge into one "spin" zone */
 #endif
-    if (low) SwitchToThread();
+    if (low) {
+        if (++lap >= every) { lap = 0; SwitchToThread(); }
+        else { YieldProcessor(); YieldProcessor(); YieldProcessor(); YieldProcessor(); }
+    }
     else if (pause) YieldProcessor();
 }
 
+
+/* R2_JOBWAIT_WAKE (PS3_USLEEP_WATCH in sys_timer.c): func_006B8BB4's usleep(128) poll of an SPU
+   job id (the "PC 0x006B8D3C" guest wait of [hitch]/[guestwait]: lr 0x006B8D3C, r3 = 128,
+   r11 = 0x8D, r28 = the wait record {u16 id, u32 mgr}). The predicate is the loop's own test
+   read with the same loads (ppu_recomp_003.cpp loc_006B8D2C -> func_0079F4DC(mgr, 3, id) ->
+   func_0079F394 / func_00B15354): p = u32[mgr] + 3*16 + 0x40; m = min(u16[p+2], u16[p+4..p+0xE]
+   (its loop is i <= 5: six more counters, checked against the lifted code by the r2_hot difftest));
+   func_0079F4DC returns 0 (the caller keeps waiting) exactly when m < id (cmplw; blt), so this is
+   done unless m < id (unsigned). [lo,hi) = [p+2, p+0x10)
+   is what it polls, so the wait is woken by the SPU store that completes the job instead of
+   spinning 128 us laps. Opt-in: R2_JOBWAIT_WAKE=1 installs the hook; unset / 0 = the old spin
+   (no in-game soak yet). */
+static int r2_jobwait_watch(void* vctx, uint32_t* lo, uint32_t* hi)
+{
+    ppu_context* ctx = (ppu_context*)vctx;
+    if ((uint32_t)ctx->lr != 0x006B8D3Cu || ctx->gpr[11] != 0x8D || ctx->gpr[3] != 0x80) return 0;
+    const uint32_t rec = (uint32_t)ctx->gpr[28];
+    if (rec < 0x10000u || rec >= 0xE0000000u) return 0;
+    const uint32_t id = vm_read16(rec + 0x0);
+    const uint32_t mgr = vm_read32(rec + 0x4);
+    if (mgr < 0x10000u || mgr >= 0xE0000000u) return 0;
+    const uint32_t p = vm_read32(mgr + 0x0) + 3u * 16u + 0x40u;
+    if (p < 0x10000u || p >= 0xE0000000u) return 0;
+    uint32_t m = vm_read16(p + 0x2);
+    for (uint32_t i = 0; i < 6; i++) {
+        const uint32_t c = vm_read16(p + 0x4 + 2 * i);
+        if (c < m) m = c;
+    }
+    if (!(m < id)) return 2;
+    *lo = p + 0x2; *hi = p + 0x10;
+    return 1;
+}
+extern "C" int (*volatile g_ps3_usleep_watch)(void* ctx, uint32_t* lo, uint32_t* hi);
+/* r2_native_jobs.c (R2_NATIVE_JOBS_PROF): is this usleep the 0x006B8D3C job wait? */
+extern "C" int r2_jobwait_is_main(void* vctx)
+{
+    const ppu_context* ctx = (const ppu_context*)vctx;
+    return (uint32_t)ctx->lr == 0x006B8D3Cu && ctx->gpr[11] == 0x8D && ctx->gpr[3] == 0x80;
+}
+extern "C" int ps3_host_nospin(void);
+/* Default: on with the no-spin profile (PORT_NOSPIN, on by default; auto =
+   < 12 logical CPUs), off otherwise; R2_JOBWAIT_WAKE=0/1 forces. */
+static const int s_r2_jobwait_install = [] {
+    const char* e = getenv("R2_JOBWAIT_WAKE");
+    const int on = e && *e ? atoi(e) != 0 : ps3_host_nospin();
+    if (on) g_ps3_usleep_watch = r2_jobwait_watch;
+    if (on && !(e && *e)) fprintf(stderr, "[nospin] R2_JOBWAIT_WAKE=1 (default with PORT_NOSPIN; R2_JOBWAIT_WAKE=0 = the old spin)\n");
+    return 0;
+}();

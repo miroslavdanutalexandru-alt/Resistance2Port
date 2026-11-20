@@ -983,21 +983,31 @@ uint32_t sys_net_bnet_inet_ntoa(uint32_t addr)
     return ea;
 }
 
+/* PORT_ONLINE (port_online.c): online.ini host.* / dns= redirection. */
+int (*g_net_resolve_hook)(const char* name, uint32_t* ip_out) = NULL;
+
 uint32_t sys_net_bnet_gethostbyname(const char* name)
 {
     const char* host = GUEST_PTR(EA(name), const char*);
     uint32_t h = scratch(&s_hostent_ea, HOSTENT_SCRATCH);
     struct addrinfo hints, *res = NULL;
+    struct sockaddr_in redirected;
+    const struct sockaddr_in* sa;
     if (!host || !h) return 0;
 
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
-        printf("[sys_net] gethostbyname('%s') failed\n", host);
-        if (scratch(&s_h_errno_ea, 4)) vm_write32(s_h_errno_ea, SYS_NET_HOST_NOT_FOUND);
-        return 0;
+    memset(&redirected, 0, sizeof(redirected));
+    if (g_net_resolve_hook && g_net_resolve_hook(host, (uint32_t*)&redirected.sin_addr)) {
+        sa = &redirected;
+    } else {
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) {
+            printf("[sys_net] gethostbyname('%s') failed\n", host);
+            if (scratch(&s_h_errno_ea, 4)) vm_write32(s_h_errno_ea, SYS_NET_HOST_NOT_FOUND);
+            return 0;
+        }
+        sa = (const struct sockaddr_in*)res->ai_addr;
     }
-    const struct sockaddr_in* sa = (const struct sockaddr_in*)res->ai_addr;
 
     memset(vm_ptr8(h), 0, HOSTENT_SCRATCH);
     vm_write32(h + 0,  h + 64);           /* h_name */
@@ -1011,7 +1021,7 @@ uint32_t sys_net_bnet_gethostbyname(const char* name)
 
     char ip[16];
     printf("[sys_net] gethostbyname('%s') -> %s\n", host, ip_str(&sa->sin_addr, ip));
-    freeaddrinfo(res);
+    if (res) freeaddrinfo(res);
     return h;
 }
 

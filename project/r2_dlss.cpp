@@ -3,6 +3,7 @@
 // by ps3recomp's native Vulkan renderer (rsx_vk_upscale.c: port_dlss_vk_get_api, the port-neutral table in
 // ps3recomp/libs/video/rsx_vk_dlss_api.h). Without it, or on a non-RTX GPU, both fall back to FSR 3.1.
 // Other ports can build this file under their own name and set their NGX project id (set_project).
+// Also NGX's D3D12 flavour (r2_dlss_d3d12_*) for the Direct3D 12 (experimental) renderer (rsx_d3d12_engine_aa.inc).
 // Built by build.bat: clang-cl /MT /LD r2_dlss.cpp tools\dlss\lib\nvsdk_ngx_s.lib
 
 #define WIN32_LEAN_AND_MEAN
@@ -11,6 +12,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <vulkan/vulkan.h>
@@ -19,6 +21,8 @@
 #include <nvsdk_ngx_helpers_vk.h>
 
 #include "../ps3recomp/libs/video/rsx_vk_dlss_api.h"
+#include "../ps3recomp/libs/video/port_dlss_quality.h"
+#pragma comment(lib, "version.lib")   // GetFileVersionInfoW: the nvngx_dlss.dll version log
 
 typedef void (*R2DlssLog)(const char* msg);
 
@@ -48,6 +52,58 @@ bool Ok(const char* what, NVSDK_NGX_Result r) {
 NVSDK_NGX_Resource_VK Res(VkImage img, VkImageView view, int fmt, unsigned w, unsigned h, bool depth, bool rw) {
     VkImageSubresourceRange range = { depth ? (VkImageAspectFlags)VK_IMAGE_ASPECT_DEPTH_BIT : (VkImageAspectFlags)VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     return NVSDK_NGX_Create_ImageView_Resource_VK(view, img, range, (VkFormat)fmt, w, h, rw);
+}
+
+// The nvngx_dlss.dll NGX actually loaded (an NVIDIA App / driver override can replace the one next to the game)
+// and its file version. false: not found / no version resource.
+bool DlssDllVersion(unsigned v[4], std::wstring& path) {
+    wchar_t buf[MAX_PATH] = {};
+    HMODULE m = GetModuleHandleW(L"nvngx_dlss.dll");
+    if (m && GetModuleFileNameW(m, buf, MAX_PATH)) path = buf;
+    else path = g_dir + L"\\nvngx_dlss.dll";
+    DWORD hnd = 0;
+    const DWORD n = GetFileVersionInfoSizeW(path.c_str(), &hnd);
+    if (!n) return false;
+    std::vector<char> data(n);
+    VS_FIXEDFILEINFO* fi = nullptr;
+    UINT len = 0;
+    if (!GetFileVersionInfoW(path.c_str(), 0, n, data.data()) ||
+        !VerQueryValueW(data.data(), L"\\", reinterpret_cast<void**>(&fi), &len) || !fi || len < sizeof(*fi))
+        return false;
+    v[0] = HIWORD(fi->dwFileVersionMS); v[1] = LOWORD(fi->dwFileVersionMS);
+    v[2] = HIWORD(fi->dwFileVersionLS); v[3] = LOWORD(fi->dwFileVersionLS);
+    return true;
+}
+
+// Preset / DLL logging (always on, log only). NGX has no "current preset" query, so this logs the requested
+// preset and the DLL version, and warns once when that DLL does not honour it (pdq_preset_check).
+void LogDllAndPreset(unsigned preset, const char* mode) {
+    static bool dll_logged;
+    static bool warned;
+    unsigned v[4] = {};
+    std::wstring path;
+    const bool have = DlssDllVersion(v, path);
+    if (!dll_logged) {
+        dll_logged = true;
+        char p8[MAX_PATH * 3] = {};
+        WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, p8, sizeof p8, nullptr, nullptr);
+        if (have) Log("nvngx_dlss.dll %u.%u.%u.%u (%s)", v[0], v[1], v[2], v[3], p8);
+        else Log("nvngx_dlss.dll version unknown (%s)", p8);
+        unsigned opt = 0, dev = 0;
+        if (g_params && NVSDK_NGX_SUCCEED(NVSDK_NGX_Parameter_GetUI(g_params, NVSDK_NGX_Parameter_OptLevel, &opt))) {
+            NVSDK_NGX_Parameter_GetUI(g_params, NVSDK_NGX_Parameter_IsDevSnippetBranch, &dev);
+            Log("DLSS snippet opt level %u%s", opt, dev ? " (dev branch)" : "");
+        }
+    }
+    const int pc = have ? pdq_preset_check(v[0], v[1], preset) : PDQ_PRESET_OK;
+    Log("DLSS preset requested for %s: %s%c (NGX has no applied-preset query; %s)", mode, preset ? "" : "default", preset ? pdq_preset_letter(preset) : ' ',
+        pc == PDQ_PRESET_OK ? "this DLL supports it" : pc == PDQ_PRESET_DEPRECATED ? "deprecated in this DLL" :
+        pc == PDQ_PRESET_REMOVED ? "removed in this DLL: NVIDIA's default is used" : "this DLL predates it: NVIDIA's default is used");
+    if ((preset == 5 || preset == 6) && pc != PDQ_PRESET_OK && !warned) {
+        warned = true;
+        Log("WARNING: preset %c was requested but nvngx_dlss.dll %u.%u %s; check the NVIDIA overlay (DLSS indicator) for the preset in use",
+            pdq_preset_letter(preset), v[0], v[1], pc == PDQ_PRESET_DEPRECATED ? "deprecates it (DLSS 4 DLLs may ignore or remap E/F)" : "ignores it");
+    }
 }
 } // namespace
 
@@ -127,6 +183,7 @@ __declspec(dllexport) int r2_dlss_create(VkCommandBuffer cmd, unsigned w, unsign
     }
     g_w = w; g_h = h;
     Log("DLSS feature %ux%u -> %ux%u (%s), preset %u", w, h, ow, oh, (unsigned)q < 6 ? qn[q] : "?", preset);
+    LogDllAndPreset(preset, (unsigned)q < 6 ? qn[q] : "?");
     return 1;
 }
 
@@ -310,3 +367,119 @@ extern "C" __declspec(dllexport) const port_dlss_vk_api* port_dlss_vk_get_api(un
 {
     return version >= 1u && version <= PORT_DLSS_VK_API_VERSION ? &g_api : nullptr;
 }
+
+// ---- Direct3D 12 (the "Direct3D 12 (experimental)" renderer, rsx_d3d12_engine.c) ----------------------
+// The same DLSS feature over NGX's D3D12 entry points; state separate from the Vulkan one above.
+// Inputs (colour RGBA16F, depth R32F, motion RG16F, optional R8 mask) in a shader-resource state, output
+// (RGBA16F, UAV) in UNORDERED_ACCESS. jitter: render pixels; mv * mv_scale = render pixels, current -> previous.
+namespace {
+ID3D12Device* g12_dev;
+bool g12_init;
+NVSDK_NGX_Parameter* g12_caps;
+NVSDK_NGX_Parameter* g12_params;
+NVSDK_NGX_Handle* g12_feature;
+unsigned g12_w, g12_h;
+
+void D12Release()
+{
+    if (g12_feature) { NVSDK_NGX_D3D12_ReleaseFeature(g12_feature); g12_feature = nullptr; }
+    if (g12_params) { NVSDK_NGX_D3D12_DestroyParameters(g12_params); g12_params = nullptr; }
+}
+} // namespace
+
+extern "C" {
+
+__declspec(dllexport) int r2_dlss_d3d12_init(ID3D12Device* dev, const wchar_t* dir, R2DlssLog log)
+{
+    g_log = log;
+    if (g12_init) return 1;
+    if (!dev) return 0;
+    g_dir = dir ? dir : L".";
+    static const wchar_t* paths[1];
+    paths[0] = g_dir.c_str();
+    NVSDK_NGX_FeatureCommonInfo common = {};
+    common.PathListInfo.Path = paths;
+    common.PathListInfo.Length = 1;
+    common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_OFF;
+    if (!Ok("NGX D3D12 init", NVSDK_NGX_D3D12_Init_with_ProjectID(g_project_id.c_str(), NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+                                                                  g_engine_version.c_str(), g_dir.c_str(), dev,
+                                                                  &common, NVSDK_NGX_Version_API)))
+        return 0;
+    g12_init = true; g12_dev = dev;
+    if (!Ok("NGX D3D12 capability query", NVSDK_NGX_D3D12_GetCapabilityParameters(&g12_caps))) return 0;
+    int avail = 0, drv = 0;
+    NVSDK_NGX_Parameter_GetI(g12_caps, NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &drv);
+    NVSDK_NGX_Parameter_GetI(g12_caps, NVSDK_NGX_Parameter_SuperSampling_Available, &avail);
+    if (drv) { Log("DLSS needs a newer NVIDIA driver"); return 0; }
+    if (!avail) { Log("DLSS is not available on this GPU"); return 0; }
+    return 1;
+}
+
+// Records feature creation into cmd. flags: 1 depth inverted, 2 HDR (+auto exposure). preset as r2_dlss_create.
+__declspec(dllexport) int r2_dlss_d3d12_create(ID3D12GraphicsCommandList* cmd, unsigned w, unsigned h,
+                                               unsigned ow, unsigned oh, int flags, unsigned preset)
+{
+    if (!g12_init || !g12_caps || !cmd) return 0;
+    D12Release();
+    if (!Ok("NGX D3D12 parameter allocation", NVSDK_NGX_D3D12_AllocateParameters(&g12_params))) return 0;
+    const char* keys[] = { NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
+                           NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
+                           NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality };
+    for (const char* k : keys) NVSDK_NGX_Parameter_SetUI(g12_params, k, preset);
+    NVSDK_NGX_DLSS_Create_Params cp = {};
+    cp.Feature.InWidth = w; cp.Feature.InHeight = h;
+    cp.Feature.InTargetWidth = ow; cp.Feature.InTargetHeight = oh;
+    const float r = ow ? (float)w / (float)ow : 1.0f;
+    const NVSDK_NGX_PerfQuality_Value q = r > 0.99f ? NVSDK_NGX_PerfQuality_Value_DLAA
+                                        : r > 0.62f ? NVSDK_NGX_PerfQuality_Value_MaxQuality
+                                        : r > 0.54f ? NVSDK_NGX_PerfQuality_Value_Balanced
+                                        : r > 0.42f ? NVSDK_NGX_PerfQuality_Value_MaxPerf
+                                                    : NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+    static const char* qn[] = { "Performance", "Balanced", "Quality", "Ultra Performance", "Ultra Quality", "DLAA" };
+    cp.Feature.InPerfQualityValue = q;
+    cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
+                              ((flags & 1) ? NVSDK_NGX_DLSS_Feature_Flags_DepthInverted : 0) |
+                              ((flags & 2) ? (NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure) : 0);
+    if (!Ok("DLSS D3D12 feature creation", NGX_D3D12_CREATE_DLSS_EXT(cmd, 1, 1, &g12_feature, g12_params, &cp)) ||
+        !g12_feature) {
+        g12_feature = nullptr;
+        return 0;
+    }
+    g12_w = w; g12_h = h;
+    Log("DLSS (D3D12) feature %ux%u -> %ux%u (%s), preset %u", w, h, ow, oh, (unsigned)q < 6 ? qn[q] : "?", preset);
+    std::swap(g_params, g12_params);      // LogDllAndPreset reads g_params' snippet level
+    LogDllAndPreset(preset, (unsigned)q < 6 ? qn[q] : "?");
+    std::swap(g_params, g12_params);
+    return 1;
+}
+
+__declspec(dllexport) int r2_dlss_d3d12_eval(ID3D12GraphicsCommandList* cmd, ID3D12Resource* color,
+                                             ID3D12Resource* depth, ID3D12Resource* mv, ID3D12Resource* mask,
+                                             ID3D12Resource* out, unsigned out_w, unsigned out_h,
+                                             float jx, float jy, float mvsx, float mvsy, int reset, float frame_ms)
+{
+    (void)out_w; (void)out_h;
+    if (!g12_feature || !g12_params || !cmd) return 0;
+    NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
+    ep.Feature.pInColor = color;
+    ep.Feature.pInOutput = out;
+    ep.pInDepth = depth;
+    ep.pInMotionVectors = mv;
+    ep.pInBiasCurrentColorMask = mask;
+    ep.InJitterOffsetX = jx; ep.InJitterOffsetY = jy;
+    ep.InRenderSubrectDimensions.Width = g12_w; ep.InRenderSubrectDimensions.Height = g12_h;
+    ep.InReset = reset;
+    ep.InMVScaleX = mvsx; ep.InMVScaleY = mvsy;
+    ep.InPreExposure = 1.0f; ep.InExposureScale = 1.0f;
+    ep.InFrameTimeDeltaInMsec = frame_ms;
+    return Ok("DLSS D3D12 evaluation", NGX_D3D12_EVALUATE_DLSS_EXT(cmd, g12_feature, g12_params, &ep)) ? 1 : 0;
+}
+
+__declspec(dllexport) void r2_dlss_d3d12_shutdown(void)
+{
+    D12Release();
+    if (g12_caps) { NVSDK_NGX_D3D12_DestroyParameters(g12_caps); g12_caps = nullptr; }
+    if (g12_init) { NVSDK_NGX_D3D12_Shutdown1(g12_dev); g12_init = false; g12_dev = nullptr; }
+}
+
+} // extern "C"

@@ -66,17 +66,53 @@ void spu_lockline_lock(void)
         g_spu_rt.lock_n++; g_spu_rt.lock_t += t1.QuadPart - t0.QuadPart;
     }
 }
+/* PORT_NOTIFY_ALL_WRITES ranges that found the lock taken (spu_coh_notify_range):
+ * the holder applies them before it lets go, so nothing waits on the lock. */
+#define g_coh_pend_flag g_lockline_pair[2]
+static void coh_drain_pending_locked(void);
+static int spu_lockline_trylock(void) { return !_InterlockedExchange(&g_lockline, 1); }
+#ifdef SPU_COH_TEST_UNLOCK_HOOK
+static void (*g_coh_test_unlock_hook)(void);   /* tests: run just before the release */
+#endif
+/* Dekker pairing with coh_pend_push's caller: it publishes the flag (full
+ * barrier) then tries the lock; this releases the lock (full barrier) then
+ * reads the flag. At least one side sees the other, so a range queued while
+ * the lock was held is drained by someone before everyone lets go. Every
+ * drain is under the lock and followed by a seq bump (spu_coh_llar_fast). */
 void spu_lockline_unlock(void)
 {
-    g_lockline_seq = g_lockline_seq + 1;   /* single writer: the lock holder */
-    _InterlockedExchange(&g_lockline, 0);
+    for (;;) {
+        if (g_coh_pend_flag) coh_drain_pending_locked();
+#ifdef SPU_COH_TEST_UNLOCK_HOOK
+        if (g_coh_test_unlock_hook) g_coh_test_unlock_hook();
+#endif
+        g_lockline_seq = g_lockline_seq + 1;   /* single writer: the lock holder */
+        _InterlockedExchange(&g_lockline, 0);
+        if (!g_coh_pend_flag || !spu_lockline_trylock()) return;
+    }
 }
 #else
 #include <stdatomic.h>
 static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
 SPU_THREAD_LOCAL spu_rt_lane g_spu_rt;
+static atomic_int g_coh_pend_flag;
+static void coh_drain_pending_locked(void);
 void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { } }
-void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
+static int spu_lockline_trylock(void) { return !atomic_flag_test_and_set_explicit(&g_lockline, memory_order_seq_cst); }
+#ifdef SPU_COH_TEST_UNLOCK_HOOK
+static void (*g_coh_test_unlock_hook)(void);
+#endif
+void spu_lockline_unlock(void)   /* see the Dekker note above */
+{
+    for (;;) {
+        if (atomic_load(&g_coh_pend_flag)) coh_drain_pending_locked();
+#ifdef SPU_COH_TEST_UNLOCK_HOOK
+        if (g_coh_test_unlock_hook) g_coh_test_unlock_hook();
+#endif
+        atomic_flag_clear_explicit(&g_lockline, memory_order_seq_cst);
+        if (!atomic_load(&g_coh_pend_flag) || !spu_lockline_trylock()) return;
+    }
+}
 #endif
 
 /* ===========================================================================
@@ -371,6 +407,134 @@ void spu_coh_notify_write(uint32_t ea)
             spu_ch_wake(c);
         }
     }
+}
+volatile long long g_spu_coh_range_wakes = 0;
+volatile long long g_spu_coh_range_deferred = 0;
+
+/* Under the lock-line lock. */
+static void coh_range_locked(uint32_t l0, uint32_t l1)
+{
+    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
+        spu_context* c = entry->ctx;
+        if (!c || !c->resv_valid) continue;
+        const uint32_t rl = c->resv_ea >> SPU_COH_LINE_SHIFT;
+        if (rl < l0 || rl > l1) continue;
+        SPU_EVENT_SET(c, SPU_EVENT_LR);
+        c->resv_valid = 0;
+        g_spu_lr_raise++;
+        g_spu_coh_range_wakes++;
+        spu_ch_wake(c);
+    }
+}
+
+/* The queue of deferred ranges (in lines). Its own lock is held for a few
+ * plain stores only, never across anything that can fault or take a lock.
+ * When full, the last slot widens to cover the new range: a wider range only
+ * breaks reservations a write may have touched, never misses one. */
+#define COH_PEND_MAX 16
+static volatile long s_pend_lock;
+static uint32_t s_pend_lo[COH_PEND_MAX], s_pend_hi[COH_PEND_MAX];
+static unsigned s_pend_n;
+static void coh_pend_acquire(void)
+{
+#if defined(_MSC_VER)
+    while (_InterlockedExchange(&s_pend_lock, 1)) _mm_pause();
+#else
+    while (__atomic_exchange_n(&s_pend_lock, 1, __ATOMIC_ACQUIRE)) { }
+#endif
+}
+static void coh_pend_release(void)
+{
+#if defined(_MSC_VER)
+    _InterlockedExchange(&s_pend_lock, 0);
+#else
+    __atomic_store_n(&s_pend_lock, 0, __ATOMIC_RELEASE);
+#endif
+}
+static void coh_pend_push(uint32_t l0, uint32_t l1)
+{
+    coh_pend_acquire();
+    if (s_pend_n < COH_PEND_MAX) {
+        s_pend_lo[s_pend_n] = l0; s_pend_hi[s_pend_n] = l1; s_pend_n++;
+    } else {
+        unsigned i = COH_PEND_MAX - 1;
+        if (l0 < s_pend_lo[i]) s_pend_lo[i] = l0;
+        if (l1 > s_pend_hi[i]) s_pend_hi[i] = l1;
+    }
+#if defined(_MSC_VER)
+    _InterlockedExchange(&g_coh_pend_flag, 1);
+#else
+    atomic_store(&g_coh_pend_flag, 1);
+#endif
+    coh_pend_release();
+    g_spu_coh_range_deferred++;
+}
+static void coh_drain_pending_locked(void)
+{
+    uint32_t lo[COH_PEND_MAX], hi[COH_PEND_MAX];
+    coh_pend_acquire();
+    const unsigned n = s_pend_n;
+    for (unsigned i = 0; i < n; i++) { lo[i] = s_pend_lo[i]; hi[i] = s_pend_hi[i]; }
+    s_pend_n = 0;
+#if defined(_MSC_VER)
+    _InterlockedExchange(&g_coh_pend_flag, 0);
+#else
+    atomic_store(&g_coh_pend_flag, 0);
+#endif
+    coh_pend_release();
+    for (unsigned i = 0; i < n; i++) coh_range_locked(lo[i], hi[i]);
+}
+
+void spu_coh_notify_range(uint32_t ea, uint32_t size)
+{
+    static int s_on = -1;
+    if (!size || !s_coh_armed) return;
+    if (__builtin_expect(s_on < 0, 0)) {
+        /* Default off since 2026-11-17: the T1 retest brought back black ADS
+         * frames (22 label-77 double stores) with it on; 1 = on. */
+        const char* e = getenv("PORT_NOTIFY_ALL_WRITES");
+        s_on = (e && e[0] == '1');
+    }
+    if (!s_on) return;
+    const uint64_t end = (uint64_t)ea + size;
+    const uint32_t l0 = ea >> SPU_COH_LINE_SHIFT;
+    const uint32_t l1 = (uint32_t)((end > 0x100000000ull ? 0xFFFFFFFFull : end - 1) >> SPU_COH_LINE_SHIFT);
+    /* The data stores must be visible before the bitmap is read: a GETLLAR
+     * that sets its bit after this scan copies the new bytes. */
+#if defined(_MSC_VER)
+    MemoryBarrier();
+#else
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+    int any = 0;
+    for (uint32_t l = l0; ; ) {
+        if ((l & 7u) == 0 && l + 7u <= l1) {
+            if (s_coh_bitmap[l >> 3]) { any = 1; break; }
+            if (l + 7u == l1) break;
+            l += 8u;
+            continue;
+        }
+        if ((s_coh_bitmap[l >> 3] >> (l & 7u)) & 1u) { any = 1; break; }
+        if (l == l1) break;
+        l++;
+    }
+    if (!any) return;
+    /* Never wait for the lock here. The callers include a texture-cache flush
+     * run by the access-violation handler of a thread whose faulting memcpy
+     * is under this same lock (spu_dma.h PUT, ppu_memory.h VM_WRITE_COH), and
+     * RSX code holding locks such a faulting thread then needs. A taken lock
+     * gets the range queued instead; its holder applies it in unlock. */
+    if (spu_lockline_trylock()) {
+        coh_range_locked(l0, l1);
+        spu_lockline_unlock();
+        return;
+    }
+    coh_pend_push(l0, l1);
+    /* The flag is published with a full barrier (coh_pend_push); now try the
+     * lock. Either this succeeds and our unlock drains, or the holder's
+     * post-release flag check sees the flag and re-takes the lock to drain
+     * (spu_lockline_unlock), or a later holder's unlock does. */
+    if (spu_lockline_trylock()) spu_lockline_unlock();
 }
 
 #ifdef __cplusplus

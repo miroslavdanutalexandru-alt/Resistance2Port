@@ -15,6 +15,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "../../runtime/spu/spu_coherency.h" /* the blit row copy's reservation bookkeeping */
+#include "../../runtime/spu/spu_put_order.h" /* GCM_PUT_ORDER: g_gcm_ea_io_tab */
 #include "rsx_commands.h"                    /* rsx_state, rsx_process_command_buffer */
 #include "../../include/ps3emu/guest_call.h" /* g_ps3_guest_caller for direct handler dispatch */
 #include "../../include/ps3emu/ps3_ftrace.h"  /* PS3_FTRACE timeline */
@@ -39,6 +40,7 @@ char* rsx_getenv(const char* name);
 #else
 #include <time.h>
 #endif
+#include "../../runtime/platform/port_hires_sleep.h"   /* port_sleep_1ms (perf final pass) */
 
 /* ---------------------------------------------------------------------------
  * Timestamp helpers (same pattern as sys_timer)
@@ -627,6 +629,9 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
       void gcm_forget_spu_blocks(void);
       gcm_forget_spu_blocks();
       g_spu_put_hook = gcm_note_spu_put; }
+    /* GCM_PUT_ORDER (runtime/spu/spu_put_order.h): SPU PUTs over a park at
+     * their head write it last; they find the park through this table. */
+    g_gcm_ea_io_tab = s_io_address_table;
 
     if (r2rsx_enabled()) {
         if (r2rsx_context_allocate(GCM_CONTROL_GUEST_ADDR - 0x40u, R2RSX_LABEL_EA,
@@ -1320,6 +1325,16 @@ static int s_park_pass = 0;           /* this drain stopped on a self-JUMP park 
 /* How long a self-JUMP park may stand with `put` somewhere else before the
  * drain gives up on it being patched and follows `put` instead. */
 #define GCM_PARK_GRACE_MS 50ull
+/* GCM_PARK_WAIT_MS=<ms> overrides it (GoW-Ascension-Recomp, MIT: a title whose
+ * SPU jobs patch the park after moving put needs far longer once recompiled;
+ * following put early skips the frame and the label it releases). Unset = 50. */
+static unsigned long long gcm_park_grace_ms(void)
+{
+    static unsigned long long ms = ~0ull;
+    if (ms == ~0ull) { const char* e = getenv("GCM_PARK_WAIT_MS");
+                       ms = e ? strtoull(e, NULL, 0) : GCM_PARK_GRACE_MS; }
+    return ms;
+}
 /* How close `current` must get to `end` before the runtime will recycle a ring
  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
  * title that is merely near the end from being touched. */
@@ -4930,7 +4945,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       const unsigned long long now = ps3_ms_now();
                       if (park_off != s_fifo_getoff || park_put != put) {
                           park_off = s_fifo_getoff; park_put = put; park_since = now;
-                      } else if (now - park_since >= GCM_PARK_GRACE_MS) {
+                      } else if (now - park_since >= gcm_park_grace_ms()) {
                           park_off = 0;
                           gcm_fifo_dump_around(s_fifo_getoff);
                           gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
@@ -5793,7 +5808,7 @@ void cellGcm_fifo_recycle_count(u32 ctx_ea, u32 count)
     s_fifo_recycle_waiting = 1;
     while (io_begin != 0xFFFFFFFFu && s_fifo_back_jumps == back_jumps0 &&
            idle < 2000 && spins < 60000) {
-        Sleep(1); spins++;
+        port_sleep_1ms(); spins++;   /* hi-res 1 ms nap; PORT_HIRES_SLEEP=0: Sleep(1) */
         if (s_fifo_getoff != last_get) { last_get = s_fifo_getoff; idle = 0; }
         else idle++;
         if (s_recdbg && spins % 1000 == 0)
@@ -6711,7 +6726,8 @@ u32 cellGcmResolveLocated(int local, u32 offset)
 /* NID: 0xF80196C1 */
 u32* cellGcmGetLabelAddress(u8 index)
 {
-    if (index >= CELL_GCM_MAX_LABEL_COUNT) {
+    /* every u8 index is a valid label (256 labels); the guard only matters if the count ever shrinks */
+    if ((u32)index >= CELL_GCM_MAX_LABEL_COUNT) {
         printf("[cellGcmSys] WARNING: GetLabelAddress index %u out of range\n", index);
         return NULL;
     }

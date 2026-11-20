@@ -1,0 +1,4 @@
+{"pre": {}, "post": {"spuelf0_spu_func_00008240": [{"at": 1,
+ "ctx": "void spuelf0_spu_func_00008240(spu_context* ctx) {", "rm": [],
+ "add": ["        { extern int r2nj_gate(spu_context*, int, void (*)(spu_context*)); if (r2nj_gate(ctx, 1, spuelf0_spu_func_00008240)) SPU_RET(ctx); }  /* R2_NATIVE_JOBS hook (edge zlib) */"]}]},
+ "preamble": []}

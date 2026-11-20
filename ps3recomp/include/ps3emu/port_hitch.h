@@ -6,7 +6,14 @@
  * interlocked add, no lock, no I/O. Once per game frame the frame limiter
  * (project/stubs.cpp, r2_frame_period) calls port_hitch_frame(), which takes the
  * accumulators and prints a single [hitch] line for a frame over PORT_HITCH_MS
- * (default 25 ms) and a [hitch] 5 s summary (p50 / p99 / max frame time).
+ * (default 25 ms, raised to 1.5x the last 5 s p50 unless PORT_HITCH_ADAPT=0; at most
+ * PORT_HITCH_LINES=10 lines per 5 s) and a [hitch] 5 s summary (p50 / p99 / max frame time).
+ * With it a [spike] line (PORT_SPIKE_LOG=0 off) lists every timed contributor of
+ * that frame largest first (GPU busy from RSX_GPU_TIME timestamps, the top 3 guest
+ * wait sites, SPU job lane time, RSX readbacks / blits / texture uploads / shader
+ * compiles ...), the event counts (draws, submits, forced ZCULL submits, ads-rb
+ * kicks, same-slot texture re-uploads) and the top SPU job images. Shares the
+ * [hitch] per-frame line cap (PORT_HITCH_LINES, default 10 per 5 s).
  *
  * Header-only (selectany state) so C runtime libs, the RPCS3 RSX library and the
  * port all share one copy without a link dependency. The reporting half is
@@ -15,6 +22,7 @@
 #ifndef PORT_HITCH_H
 #define PORT_HITCH_H
 #include <stdint.h>
+#include <stdlib.h>
 #include <intrin.h>
 
 #ifdef __cplusplus
@@ -44,10 +52,27 @@ enum port_hitch_cat {
     PH_RING,        /* PPU (any thread): command ring wrap, waiting for the RSX to drain it */
     PH_AVFLUSH,     /* PPU / SPU (any thread): fault on a GPU-written surface, RSX readback */
     PH_MAINRSX,     /* frame-loop thread's share of PH_RING + PH_AVFLUSH (not "game" time)  */
+    /* [spike] contributors (R2 perf 2026-11-15; listed only on the >PORT_HITCH_MS line) */
+    PH_GPU,         /* GPU: primary command buffer execution time (RSX_GPU_TIME timestamps)  */
+    PH_READBACK,    /* rsx::thread: texture-cache flush / ads-rb readback waits              */
+    PH_BLIT,        /* rsx::thread: blit engine (image copies / scaling)                     */
+    PH_DRAW,        /* rsx::thread: draw calls (count only)                                  */
+    PH_ZFORCE,      /* rsx::thread: forced ZCULL submits (idle / crit flush; count only)     */
+    PH_ADSKICK,     /* rsx::thread: ads-rb early readback copies kicked (count only)         */
+    PH_REUPLOAD,    /* rsx::thread: texture re-uploads, same address and size (count only)   */
+    PH_GPURAW,      /* GPU: per-command-buffer begin->end sum, overlaps counted twice (RSX_GPU_TIME_UNION evidence) */
+    PH_RPASS,       /* rsx/offloader: vkCmdBeginRenderPass calls (count only)                 */
+    PH_BARRIER,     /* rsx/offloader: vkCmdPipelineBarrier calls from vk::insert_*_barrier (count only) */
+    PH_INSTDRAW,    /* rsx::thread: draw clauses issued as one hardware-instanced draw (count only) */
+    PH_DSDIRECT,    /* rsx/offloader: scaled depth/stencil copies as one NEAREST blit (RSX_DEPTH_BLIT_DIRECT; count only) */
+    PH_DSCARRIER,   /* rsx/offloader: scaled depth/stencil copies through the typeless colour carrier (count only) */
+    /* why each command buffer was submitted (g_port_submit_why, counted in close_and_submit; count only) */
+    PH_SW_OTHER, PH_SW_BINDDMA, PH_SW_AV, PH_SW_ZHINT, PH_SW_ZHARD, PH_SW_BLIT, PH_SW_LABEL, PH_SW_ADS, PH_SW_PRESENT, PH_SW_HARD,
     PH_COUNT
 };
 
 #define PORT_HITCH_LR_SLOTS 6
+#define PORT_HITCH_JOB_IMGS 1024
 
 typedef struct port_hitch_state {
     volatile int64_t acc[PH_COUNT];   /* TSC ticks since the last frame                 */
@@ -59,12 +84,48 @@ typedef struct port_hitch_state {
     /* main thread only: guest waits (usleep / lwmutex / lwcond) by guest call site, QPC ticks */
     uint32_t         lr[PORT_HITCH_LR_SLOTS];
     int64_t          lr_qpc[PORT_HITCH_LR_SLOTS];
+    /* [spike]: SPU job wall time by job image id (spu_drain.c [spu-jobs]), QPC ticks + runs since the last frame */
+    volatile int64_t job_qpc[PORT_HITCH_JOB_IMGS];
+    volatile long    job_runs[PORT_HITCH_JOB_IMGS];
 } port_hitch_state;
 
 #ifdef __cplusplus
 __declspec(selectany) port_hitch_state g_port_hitch = {};
 #else
 __declspec(selectany) port_hitch_state g_port_hitch = { { 0 } };
+#endif
+
+/* Optional job-image classifier set by the game project (R2: main.cpp): a short class name
+ * ("phys", "pcf", "water", ...) for an SPU job image id, or NULL. Tags the [spike] and
+ * [spu-jobs] job lists and sums [spike] SPU time per class (PORT_SPU_JOB_TAGS=0 off). */
+typedef const char* (*port_hitch_job_tag_fn)(int img);
+__declspec(selectany) port_hitch_job_tag_fn g_port_hitch_job_tag = 0;
+static __inline const char* port_hitch_job_tag(int img)
+{
+    const port_hitch_job_tag_fn f = g_port_hitch_job_tag;
+    const char* t = f ? f(img) : 0;
+    return t ? t : "";
+}
+
+/* PORT_HITCH_RSX_SPLIT (default off; 1 = rsx::thread flip intervals over 25 ms, <ms> >= 5 = that threshold): a
+ * "[hitch] rsx flip" line per long flip-to-flip interval of rsx::thread (the [hitch] line only has its length,
+ * rsx-iv): the rsx-cpu split of that interval (PORT_RSX_CPU_PROF, forced to every frame unless set), the thread's
+ * CPU time against the wall time (off-cpu = blocked in the kernel / driver, sleeping in a wait, or preempted) and
+ * the timed waits of the interval. While on, the timed categories are also added to the never-reset totals below;
+ * off, one load and branch per event. At most PORT_HITCH_LINES (10) lines per 5 s. fn is set by port_hitch_frame
+ * (stubs.cpp) and called on rsx::thread by port_rcpu_flip. */
+typedef struct port_hitch_split_state {
+    volatile int     on;
+    double           thr_ms;
+    volatile int64_t acc[PH_COUNT];
+    volatile long    cnt[PH_COUNT];
+    void (*volatile fn)(int sampled);
+} port_hitch_split_state;
+
+#ifdef __cplusplus
+__declspec(selectany) port_hitch_split_state g_port_hsplit = {};
+#else
+__declspec(selectany) port_hitch_split_state g_port_hsplit = { 0 };
 #endif
 
 static __inline uint64_t port_hitch_t0(void) { return __rdtsc(); }
@@ -74,6 +135,10 @@ static __inline void port_hitch_add_ticks(int cat, int64_t d)
     if (d <= 0) return;
     _InterlockedExchangeAdd64((volatile long long*)&g_port_hitch.acc[cat], d);
     _InterlockedIncrement(&g_port_hitch.cnt[cat]);
+    if (g_port_hsplit.on) {
+        _InterlockedExchangeAdd64((volatile long long*)&g_port_hsplit.acc[cat], d);
+        _InterlockedIncrement(&g_port_hsplit.cnt[cat]);
+    }
     if (d > g_port_hitch.mx[cat]) g_port_hitch.mx[cat] = d;   /* racy max: diagnostics only */
 }
 
@@ -95,8 +160,10 @@ static __inline void port_hitch_poll_step(int cat, uint64_t* last)
     if (k > 0.0 && d > 0 && (double)d < k * 5e5) {
         _InterlockedExchangeAdd64((volatile long long*)&g_port_hitch.acc[cat], d);
         if (d > g_port_hitch.mx[cat]) g_port_hitch.mx[cat] = d;
+        if (g_port_hsplit.on) _InterlockedExchangeAdd64((volatile long long*)&g_port_hsplit.acc[cat], d);
     } else {
         _InterlockedIncrement(&g_port_hitch.cnt[cat]);
+        if (g_port_hsplit.on) _InterlockedIncrement(&g_port_hsplit.cnt[cat]);
     }
 }
 
@@ -111,6 +178,21 @@ static __inline void port_hitch_max_ticks(int cat, int64_t d)
 {
     if (d > g_port_hitch.mx[cat]) g_port_hitch.mx[cat] = d;
     _InterlockedIncrement(&g_port_hitch.cnt[cat]);
+}
+
+/* Count-only [spike] categories (PH_DRAW, PH_ZFORCE, ...). */
+static __inline void port_hitch_count(int cat, long n)
+{
+    if (n > 0 && !g_port_hitch.off) _InterlockedExchangeAdd(&g_port_hitch.cnt[cat], n);
+}
+
+/* One finished SPU job: its image id and wall time in QPC ticks (spu_drain.c). */
+static __inline void port_hitch_spu_job(int img, int64_t qpc)
+{
+    if (g_port_hitch.off || qpc <= 0) return;
+    if (img < 0 || img >= PORT_HITCH_JOB_IMGS) img = 0;
+    _InterlockedExchangeAdd64((volatile long long*)&g_port_hitch.job_qpc[img], qpc);
+    _InterlockedIncrement(&g_port_hitch.job_runs[img]);
 }
 
 /* 1 on the game's frame-loop thread (set by port_hitch_frame). */
@@ -147,12 +229,243 @@ static __inline void port_hitch_guest_wait(uint32_t lr, int64_t qpc)
     if (g_port_hitch.lr_qpc[lo] <= qpc) { g_port_hitch.lr[lo] = lr; g_port_hitch.lr_qpc[lo] = qpc; }
 }
 
+/* ------------------------------------------------------------------------- */
+/* rsx::thread CPU time by category (PORT_RSX_CPU_PROF, default off; 1 = every frame;
+ * N = 1 in N; also off with PORT_HITCH_LOG=0).
+ * Exclusive time: the thread is always in exactly one category. Scopes (port_rcpu_scope) switch the current one
+ * and restore the previous on exit; everything outside a scope is RC_FIFO (command decode / method handlers,
+ * which also holds the FIFO-empty and semaphore-acquire waits: the summary subtracts PH_FIFOIDLE and PH_LABEL
+ * from it). One rdtsc and two plain adds per switch, written by rsx::thread only (other threads fail the thread
+ * id check and return at once); the frame loop reads the 64-bit accumulators without a lock every 5 s. */
+enum port_rcpu_cat {
+    RC_FIFO = 0,  /* decode, method handlers, idle and label waits (outside every scope)            */
+    RC_STATE,     /* draw begin/end bookkeeping, program env + constants, descriptors, dynamic state  */
+    RC_SHADER,    /* VP/FP resolve + pipeline lookup                                                 */
+    RC_VERTEX,    /* vertex / index upload and vertex layout (vertex_cache)                          */
+    RC_TEXTURE,   /* texture cache lookups, uploads, sampler setup, view binding                     */
+    RC_SURFACE,   /* surface cache: framebuffer bind / memory locks                                  */
+    RC_DRAW,      /* draw command recording                                                          */
+    RC_ZCULL,     /* ZCULL / occlusion report handling (incl. waits for results)                     */
+    RC_SUBMIT,    /* flush_command_queue: close + submit the command buffer (incl. hard-sync waits)   */
+    RC_READBACK,  /* texture-cache flush / ads-rb readback waits                                     */
+    RC_PRESENT,   /* flip: present, DLSS/AA, overlays, frame limiter                                 */
+    RC_BLIT,      /* blit engine                                                                     */
+    RC_COUNT
+};
+
+typedef struct port_rcpu_state {
+    volatile unsigned long tid;       /* rsx::thread id; 0 = profiler off / not bound */
+    volatile unsigned long atid;      /* tid while the current frame is sampled, else 0 (port_rcpu_flip) */
+    uint32_t         every;           /* sample 1 frame in every (PORT_RSX_CPU_PROF, default off)        */
+    volatile uint32_t flips, flips_sampled; /* flip_command calls; flip intervals that were sampled  */
+    int              cur;
+    uint64_t         last;
+    volatile int64_t acc[RC_COUNT];   /* TSC ticks, monotonic (the reader takes differences) */
+} port_rcpu_state;
+
+#ifdef __cplusplus
+__declspec(selectany) port_rcpu_state g_port_rcpu = {};
+#else
+__declspec(selectany) port_rcpu_state g_port_rcpu = { 0 };
+#endif
+
+/* PORT_HITCH_RSX_SPLIT method split (on with the split, PORT_HITCH_RSX_METH=0 off): rsx::thread decode self time
+ * (RC_FIFO; nested scopes such as state/texture/submit excluded) per FIFO method register
+ * and per housekeeping pass, reset at every flip. A long flip's "[hitch] rsx flip" line is followed by a
+ * "[hitch] rsx decode" line naming the top methods. Two rdtsc per method while on; off, one load and branch.
+ * Written and read on rsx::thread only. */
+#define PORT_RMETH_HK_LIGHT 0x4000
+#define PORT_RMETH_HK_FULL  0x4001
+#define PORT_RMETH_HK_IDLE  0x4002   /* both passes while the FIFO is idle: inside fifo-idle, not decode */
+#define PORT_RMETH_KEYS     0x4003
+typedef struct port_rcpu_meth_state {
+    int      on;
+    uint32_t nt;
+    int64_t  t[PORT_RMETH_KEYS];
+    uint32_t n[PORT_RMETH_KEYS];
+    uint16_t touched[PORT_RMETH_KEYS];
+} port_rcpu_meth_state;
+
+#ifdef __cplusplus
+__declspec(selectany) port_rcpu_meth_state g_port_rmeth = {};
+#else
+__declspec(selectany) port_rcpu_meth_state g_port_rmeth = { 0 };
+#endif
+
+/* PORT_HITCH_RSX_METH: NV0039_BUFFER_NOTIFY (0x2328, the memory-to-memory copy) by phase (nv0039.cpp), in rsx::thread wall
+ * ticks (nested profiler scopes such as a zcull wait or a fault's GPU readback included). Printed after the method line
+ * of a long flip and reset with it. rsx::thread only. */
+enum { PORT_NV39_PRE = 0, PORT_NV39_INVAL, PORT_NV39_MM, PORT_NV39_COPY, PORT_NV39_WBAR, PORT_NV39_PHASES };
+typedef struct port_rnv39_state {
+    int64_t  t[PORT_NV39_PHASES];
+    int64_t  copy_max;      /* slowest single copy */
+    int64_t  fault_t;       /* rsx::thread time in the access-violation hook during the copies */
+    uint64_t bytes;         /* bytes written */
+    uint32_t n, n_local, n_overlap, n_faulted, faults, inval_pages;
+} port_rnv39_state;
+
+#ifdef __cplusplus
+__declspec(selectany) port_rnv39_state g_port_rnv39 = {};
+#else
+__declspec(selectany) port_rnv39_state g_port_rnv39 = { 0 };
+#endif
+
+/* Command buffer submits on rsx::thread, never reset (the per-frame PH_SUBMIT count is reset by the frame thread):
+ * rsx::thread compares it before/after a ZCULL hint for the [spike] zcull-forced count. */
+__declspec(selectany) volatile uint64_t g_port_rsx_submit_serial = 0;
+
+/* [spike] submit reasons: a flush site stores its PH_SW_* here before flush_command_queue; the submit counts it
+ * and resets it to PH_SW_OTHER. rsx::thread only (a stale value from another thread only mislabels one submit). */
+__declspec(selectany) volatile long g_port_submit_why = PH_SW_OTHER;
+static __inline void port_submit_counted(void)
+{
+    const long w = g_port_submit_why;
+    g_port_submit_why = PH_SW_OTHER;
+    port_hitch_count((w >= PH_SW_OTHER && w <= PH_SW_HARD) ? (int)w : PH_SW_OTHER, 1);
+}
+
+/* Called once on rsx::thread before its FIFO loop. */
+static __inline void port_rcpu_bind(void)
+{
+#if defined(_M_X64) || defined(__x86_64__)
+    const char* e = getenv("PORT_RSX_CPU_PROF");
+    const char* h = getenv("PORT_HITCH_LOG");
+    if ((e && *e == '0') || (h && *h == '0')) return;
+    /* unset: off (diagnostic; 1 = every frame, N >= 2: 1 in N; two rdtsc per scope cost ~0.4 ms per sampled frame
+     * at 2400 draws). PORT_HITCH_RSX_SPLIT also turns it on (every frame unless this is set). */
+    const char* sp = getenv("PORT_HITCH_RSX_SPLIT");
+    const int split = sp && *sp && *sp != '0';
+    if (!split && !(e && *e >= '1' && *e <= '9')) return;
+    if (split) {
+        const double v = atof(sp);
+        g_port_hsplit.thr_ms = v >= 5.0 ? v : 25.0;
+        g_port_hsplit.on = 1;
+        const char* m = getenv("PORT_HITCH_RSX_METH");
+        g_port_rmeth.on = !(m && *m == '0');
+    }
+    const int ev = e && *e >= '1' && *e <= '9' ? atoi(e) : split ? 1 : 8;
+    g_port_rcpu.every = ev < 1 ? 1u : (uint32_t)ev;
+    g_port_rcpu.cur = RC_FIFO;
+    g_port_rcpu.last = __rdtsc();
+    g_port_rcpu.tid = __readgsdword(0x48);
+    g_port_rcpu.atid = g_port_rcpu.every <= 1 ? g_port_rcpu.tid : 0;
+#endif
+}
+
+/* Switch to cat; returns the previous category for port_rcpu_leave, or -1 (not rsx::thread / off). */
+static __inline int port_rcpu_enter(int cat)
+{
+#if defined(_M_X64) || defined(__x86_64__)
+    if (__readgsdword(0x48) != g_port_rcpu.atid) return -1;
+    const uint64_t now = __rdtsc();
+    const int prev = g_port_rcpu.cur;
+    g_port_rcpu.acc[prev] += (int64_t)(now - g_port_rcpu.last);
+    g_port_rcpu.last = now;
+    g_port_rcpu.cur = cat;
+    return prev;
+#else
+    (void)cat; return -1;
+#endif
+}
+
+static __inline void port_rcpu_leave(int prev)
+{
+    if (prev < 0 || !g_port_rcpu.atid) return;   /* sampling stopped inside the scope: drop it */
+    const uint64_t now = __rdtsc();
+    g_port_rcpu.acc[g_port_rcpu.cur] += (int64_t)(now - g_port_rcpu.last);
+    g_port_rcpu.last = now;
+    g_port_rcpu.cur = prev;
+}
+
+/* Accrue the open interval now (idle loops on rsx::thread): a long wait (pause, alt-tab) is counted in the frames it
+ * spans, so the [hitch] summary drops it with the discarded frames instead of adding it to the first frame after it. */
+static __inline void port_rcpu_tick(void)
+{
+#if defined(_M_X64) || defined(__x86_64__)
+    if (__readgsdword(0x48) != g_port_rcpu.atid) return;
+    const uint64_t now = __rdtsc();
+    g_port_rcpu.acc[g_port_rcpu.cur] += (int64_t)(now - g_port_rcpu.last);
+    g_port_rcpu.last = now;
+#endif
+}
+
+/* Decode time so far (RC_FIFO), open interval accrued. */
+static __inline int64_t port_rmeth_fifo(void)
+{
+    port_rcpu_tick();
+    return g_port_rcpu.acc[RC_FIFO];
+}
+
+/* Around a FIFO method handler / housekeeping pass: begin returns a mark, or -1 (off / not a sampled rsx::thread frame). */
+static __inline int64_t port_rmeth_begin(void)
+{
+#if defined(_M_X64) || defined(__x86_64__)
+    if (!g_port_rmeth.on || __readgsdword(0x48) != g_port_rcpu.atid) return -1;
+    return port_rmeth_fifo();
+#else
+    return -1;
+#endif
+}
+
+static __inline void port_rmeth_end(uint32_t key, int64_t mark)
+{
+#if defined(_M_X64) || defined(__x86_64__)
+    if (mark < 0 || key >= PORT_RMETH_KEYS || __readgsdword(0x48) != g_port_rcpu.atid) return;
+    const int64_t d = port_rmeth_fifo() - mark;
+    if (g_port_rmeth.n[key]++ == 0 && g_port_rmeth.nt < PORT_RMETH_KEYS) g_port_rmeth.touched[g_port_rmeth.nt++] = (uint16_t)key;
+    if (d > 0) g_port_rmeth.t[key] += d;
+#else
+    (void)key; (void)mark;
+#endif
+}
+
+/* rsx::thread, at each flip_command before its scope opens (only RC_FIFO is current): starts or stops sampling, so
+ * a sampled interval is a whole flip-to-flip frame. The summary scales sampled time by flips / flips_sampled. */
+static __inline void port_rcpu_flip(void)
+{
+#if defined(_M_X64) || defined(__x86_64__)
+    if (!g_port_rcpu.tid || __readgsdword(0x48) != g_port_rcpu.tid) return;
+    const int was_on = g_port_rcpu.atid != 0;
+    if (was_on) g_port_rcpu.flips_sampled = g_port_rcpu.flips_sampled + 1;
+    const uint32_t n = g_port_rcpu.flips + 1;
+    g_port_rcpu.flips = n;
+    if (g_port_hsplit.on) {   /* PORT_HITCH_RSX_SPLIT: report the interval that ends here */
+        void (*const f)(int) = g_port_hsplit.fn;
+        if (f) {
+            if (was_on) {
+                const uint64_t t = __rdtsc();
+                g_port_rcpu.acc[g_port_rcpu.cur] += (int64_t)(t - g_port_rcpu.last);
+                g_port_rcpu.last = t;
+            }
+            f(was_on);
+        }
+    }
+    const int want = g_port_rcpu.every <= 1 || n % g_port_rcpu.every == 0;
+    if (want == was_on) return;
+    const uint64_t now = __rdtsc();
+    if (was_on) g_port_rcpu.acc[g_port_rcpu.cur] += (int64_t)(now - g_port_rcpu.last);
+    g_port_rcpu.cur = RC_FIFO;
+    g_port_rcpu.last = now;
+    g_port_rcpu.atid = want ? g_port_rcpu.tid : 0;
+#endif
+}
+
 /* Once per game frame, on the frame-loop thread. target_fps <= 0: uncapped.
  * discard = 1 after a pause / long wait that is not a hitch. */
 void port_hitch_frame(double target_fps, int discard);
 
 #ifdef __cplusplus
 }
+
+/* rsx::thread CPU category scope (PORT_RSX_CPU_PROF) */
+struct port_rcpu_scope
+{
+    int prev;
+    explicit port_rcpu_scope(int cat) : prev(port_rcpu_enter(cat)) {}
+    ~port_rcpu_scope() { port_rcpu_leave(prev); }
+    port_rcpu_scope(const port_rcpu_scope&) = delete;
+    port_rcpu_scope& operator=(const port_rcpu_scope&) = delete;
+};
 #endif
 
 /* ------------------------------------------------------------------------- */
@@ -289,6 +602,126 @@ static inline void port_hitch_present(void)
 #include <vector>
 #include "../../runtime/syscalls/ps3_waitstat.h"
 
+/* PORT_HITCH_RSX_METH: the decode self time of the flip interval by method register (top 8) and housekeeping pass.
+ * dec = the line's decode ms (RC_FIFO minus fifo-idle and label); label = the semaphore-acquire wait, which runs inside
+ * the NV406E acquire handler (0x0068) and so is in that method's time; f = ms per TSC tick. */
+static void port_hitch_rsx_meth_line(double dec, double label, double f)
+{
+    enum { TOP = 8 };
+    uint32_t top[TOP]; int nt = 0;
+    double sum = 0.0;
+    for (uint32_t j = 0; j < g_port_rmeth.nt; j++) {
+        const uint32_t key = g_port_rmeth.touched[j];
+        if (key == PORT_RMETH_HK_IDLE) continue;
+        sum += (double)g_port_rmeth.t[key] * f;
+        if (key >= 0x4000) continue;
+        int p = nt < TOP ? nt++ : TOP;
+        if (p == TOP) { if (g_port_rmeth.t[key] <= g_port_rmeth.t[top[TOP - 1]]) continue; p = TOP - 1; }
+        while (p > 0 && g_port_rmeth.t[top[p - 1]] < g_port_rmeth.t[key]) { top[p] = top[p - 1]; p--; }
+        top[p] = key;
+    }
+    char ms[512]; int o = 0;
+    ms[0] = 0;
+    for (int i = 0; i < nt && o < (int)sizeof ms - 48; i++)
+        o += snprintf(ms + o, sizeof ms - o, " 0x%04x %.2f/%u", top[i] << 2, (double)g_port_rmeth.t[top[i]] * f, g_port_rmeth.n[top[i]]);
+    port_log_async(1, "[hitch] rsx decode %.1f ms by method (offset ms/calls, self time):%s | housekeeping light %.2f/%u full %.2f/%u (fifo idle %.2f/%u)"
+                      " | outside handlers (FIFO fetch, flow control, loop) %.1f (0x0068 includes the label wait)\n",
+                   dec, ms, (double)g_port_rmeth.t[PORT_RMETH_HK_LIGHT] * f, g_port_rmeth.n[PORT_RMETH_HK_LIGHT],
+                   (double)g_port_rmeth.t[PORT_RMETH_HK_FULL] * f, g_port_rmeth.n[PORT_RMETH_HK_FULL],
+                   (double)g_port_rmeth.t[PORT_RMETH_HK_IDLE] * f, g_port_rmeth.n[PORT_RMETH_HK_IDLE], (std::max)(0.0, dec + label - sum));
+    const port_rnv39_state* v = &g_port_rnv39;
+    if (v->n)
+        port_log_async(1, "[hitch] rsx nv0039 (0x2328 wall ms): %u copies %.2f MB (dst local mem %u, overlapping %u) | barriers %.2f"
+                          " | preinval %.2f (%u pages) | lock + mm_flush %.2f | copy %.2f (max %.3f; %u copies faulted, %u faults,"
+                          " %.2f in the fault hook) | unlock + write barrier %.2f\n",
+                       v->n, (double)v->bytes / 1048576.0, v->n_local, v->n_overlap, (double)v->t[PORT_NV39_PRE] * f,
+                       (double)v->t[PORT_NV39_INVAL] * f, v->inval_pages, (double)v->t[PORT_NV39_MM] * f,
+                       (double)v->t[PORT_NV39_COPY] * f, (double)v->copy_max * f, v->n_faulted, v->faults, (double)v->fault_t * f,
+                       (double)v->t[PORT_NV39_WBAR] * f);
+}
+
+static void port_hitch_rsx_meth_reset(void)
+{
+    for (uint32_t j = 0; j < g_port_rmeth.nt; j++) {
+        const uint32_t key = g_port_rmeth.touched[j];
+        g_port_rmeth.t[key] = 0;
+        g_port_rmeth.n[key] = 0;
+    }
+    g_port_rmeth.nt = 0;
+    memset(&g_port_rnv39, 0, sizeof g_port_rnv39);
+}
+
+/* PORT_HITCH_RSX_SPLIT: rsx::thread, at every flip (port_rcpu_flip). sampled = the rsx-cpu split covers the interval. */
+static void port_hitch_rsx_split(int sampled)
+{
+    static uint64_t t_prev = 0, win_t0 = 0;
+    static int64_t rc_prev[RC_COUNT], ph_prev[PH_COUNT];
+    static long cn_prev[PH_COUNT];
+    static ULONG64 cyc_prev = 0;
+    static unsigned lines = 0, skipped = 0, cap = 10;
+    const uint64_t now = __rdtsc();
+    const double k = g_port_hitch.tsc_per_ns;
+    ULONG64 cyc = 0;
+    const int have_cyc = QueryThreadCycleTime(GetCurrentThread(), &cyc) != 0;
+    int64_t rc[RC_COUNT], ph[PH_COUNT];
+    long cn[PH_COUNT];
+    for (int i = 0; i < RC_COUNT; i++) rc[i] = g_port_rcpu.acc[i];
+    for (int i = 0; i < PH_COUNT; i++) { ph[i] = g_port_hsplit.acc[i]; cn[i] = g_port_hsplit.cnt[i]; }
+    if (!t_prev) {
+        if (const char* m = getenv("PORT_HITCH_LINES")) { const int v = atoi(m); cap = v < 0 ? 0u : v > 1000 ? 1000u : (unsigned)v; }
+        port_log_async(1, "[hitch] rsx flip split on (PORT_HITCH_RSX_SPLIT): rsx::thread flip intervals over %.0f ms are listed with "
+                          "their rsx-cpu split (every frame sampled: PORT_RSX_CPU_PROF=%u), thread cpu vs wall and the timed waits\n",
+                       g_port_hsplit.thr_ms, g_port_rcpu.every);
+        win_t0 = now;
+    } else if (k > 0.0) {
+        if ((double)(now - win_t0) >= k * 5e9) {
+            if (skipped) port_log_async(1, "[hitch] rsx flip: %u more long flips in the last 5 s not listed\n", skipped);
+            lines = skipped = 0;
+            win_t0 = now;
+        }
+        const double f = 1.0 / (k * 1e6);
+        const double iv = (double)(now - t_prev) * f;
+        if (iv > g_port_hsplit.thr_ms && iv < 2000.0) {
+            if (lines >= cap) skipped++;
+            else {
+                lines++;
+                double ms[PH_COUNT]; long c[PH_COUNT];
+                for (int i = 0; i < PH_COUNT; i++) { ms[i] = (double)(ph[i] - ph_prev[i]) * f; c[i] = cn[i] - cn_prev[i]; }
+                const double cpu = have_cyc && cyc_prev ? (double)(cyc - cyc_prev) * f : -1.0;
+                const double waits = ms[PH_FIFOIDLE] + ms[PH_LABEL] + ms[PH_ZCULL] + ms[PH_HARDSYNC] + ms[PH_GPUWAIT] + ms[PH_ACQUIRE] + ms[PH_RSXLIMIT];
+                const double off = cpu >= 0.0 ? (std::max)(0.0, iv - cpu) : -1.0;
+                char rs[512] = " | rsx-cpu: not sampled (PORT_RSX_CPU_PROF > 1)";
+                double dec = -1.0, dec_label = 0.0;
+                if (sampled) {
+                    double r[RC_COUNT] = {};
+                    for (int i = 0; i < RC_COUNT; i++) r[i] += (double)(rc[i] - rc_prev[i]) * f;
+                    const double idle = (std::min)(r[RC_FIFO], ms[PH_FIFOIDLE]);
+                    const double label = (std::min)(r[RC_FIFO] - idle, ms[PH_LABEL]);
+                    dec = r[RC_FIFO] - idle - label;
+                    dec_label = label;
+                    snprintf(rs, sizeof rs, " | rsx-cpu: decode %.1f state %.1f shader %.1f vertex %.1f tex %.1f surface %.1f draw %.1f"
+                                            " zcull %.1f submit %.1f readback %.1f present %.1f blit %.1f (+ fifo-idle %.1f label %.1f)",
+                             r[RC_FIFO] - idle - label, r[RC_STATE], r[RC_SHADER], r[RC_VERTEX], r[RC_TEXTURE], r[RC_SURFACE], r[RC_DRAW],
+                             r[RC_ZCULL], r[RC_SUBMIT], r[RC_READBACK], r[RC_PRESENT], r[RC_BLIT], idle, label);
+                }
+                port_log_async(1, "[hitch] rsx flip %.1f ms: thread cpu %.1f off-cpu %.1f (outside the timed waits >= %.1f)%s"
+                                  " | waits fifo-idle %.1f label %.1f/%ld zcull %.1f/%ld hard-sync %.1f/%ld gpu-wait %.1f acquire %.1f rsx-limit %.1f"
+                                  " | present %.1f dlss %.1f submits %ld tex %.1f/%ld pipe %.1f/%ld | guest threads on rsx: ring %.1f/%ld av-flush %.1f/%ld\n",
+                               iv, cpu, off, off >= 0.0 ? (std::max)(0.0, off - waits) : -1.0, rs,
+                               ms[PH_FIFOIDLE], ms[PH_LABEL], c[PH_LABEL], ms[PH_ZCULL], c[PH_ZCULL], ms[PH_HARDSYNC], c[PH_HARDSYNC],
+                               ms[PH_GPUWAIT], ms[PH_ACQUIRE], ms[PH_RSXLIMIT], ms[PH_PRESENT], ms[PH_DLSS], c[PH_SUBMIT],
+                               ms[PH_TEX], c[PH_TEX], ms[PH_PIPE], c[PH_PIPE], ms[PH_RING], c[PH_RING], ms[PH_AVFLUSH], c[PH_AVFLUSH]);
+                if (dec >= 0.0 && g_port_rmeth.on) port_hitch_rsx_meth_line(dec, dec_label, f);
+            }
+        }
+    }
+    port_hitch_rsx_meth_reset();
+    t_prev = now;
+    cyc_prev = have_cyc ? cyc : 0;
+    for (int i = 0; i < RC_COUNT; i++) rc_prev[i] = rc[i];
+    for (int i = 0; i < PH_COUNT; i++) { ph_prev[i] = ph[i]; cn_prev[i] = cn[i]; }
+}
+
 extern "C" void port_hitch_frame(double target_fps, int discard)
 {
     static int init = 0, on = 1;
@@ -297,28 +730,39 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
     static uint64_t tsc0 = 0, last = 0, sum_t0 = 0;
     static std::vector<float> win;
     static unsigned n_over = 0, n_2x = 0, lines_s = 0, dropped = 0, n_disc = 0;
-    static uint64_t line_win_t0 = 0;
+    static unsigned lines_cap = 10;     /* PORT_HITCH_LINES: per-frame lines per 5 s window */
+    static int adapt = 1;               /* PORT_HITCH_ADAPT=0: fixed threshold */
+    static double adapt_p50 = 0.0;      /* previous window's p50 */
     static ps3_waitstat* ws = NULL;
     static unsigned long long ws_prev4[4] = { 0, 0, 0, 0 };
     static ULONG64 cyc_prev = 0;
     static double sm_game = 0, sm_gw = 0, sm_cpu = 0, sm_fifo = 0, sm_label = 0, sm_zcull = 0, sm_hard = 0, sm_rlim = 0, sm_sub = 0, sm_lim = 0;
     static double sm_mrsx = 0, sm_ring = 0, sm_av = 0;
+    static double sm_gpu = 0, sm_gpuraw = 0, sm_spu = 0, sm_draw = 0, sm_rb = 0, sm_rp = 0, sm_bar = 0;
+    static double sm_why[PH_SW_HARD - PH_DSDIRECT + 1] = {};
+    static long sm_gpu_n = 0;
+    static int spike_on = 1;
     static double prev_ft = 0.0;
     if (!init) {
         init = 1;
         const char* e = getenv("PORT_HITCH_LOG");
         on = !(e && *e == '0');
         g_port_hitch.off = !on;
+        { const char* s = getenv("PORT_SPIKE_LOG"); spike_on = !(s && *s == '0'); }
         if (const char* m = getenv("PORT_HITCH_MS")) { const double v = atof(m); if (v >= 5.0) thr_ms = v; }
+        if (const char* m = getenv("PORT_HITCH_LINES")) { const int v = atoi(m); lines_cap = v < 0 ? 0u : v > 1000 ? 1000u : (unsigned)v; }
+        { const char* a = getenv("PORT_HITCH_ADAPT"); adapt = !(a && *a == '0'); }
         QueryPerformanceFrequency(&qf);
         QueryPerformanceCounter(&q0);
         tsc0 = __rdtsc();
-        last = tsc0; sum_t0 = tsc0; line_win_t0 = tsc0;
+        last = tsc0; sum_t0 = tsc0;
         g_port_hitch.main_tid = GetCurrentThreadId();
         win.reserve(1024);
-        if (on) fprintf(stderr, "[hitch] logger on: frames over %.0f ms (or 2x the %.1f fps target) are listed with a breakdown; "
-                                "5 s summary p50/p99/max (PORT_HITCH_LOG=0 off, PORT_HITCH_MS=<ms>)\n", thr_ms, target_fps);
+        if (on) fprintf(stderr, "[hitch] logger on: frames over %.0f ms (or 2x the %.1f fps target, or 1.5x the last 5 s p50) are listed "
+                                "with a breakdown, at most %u per 5 s; 5 s summary p50/p99/max (PORT_HITCH_LOG=0 off, PORT_HITCH_MS=<ms>, "
+                                "PORT_HITCH_LINES=<n>, PORT_HITCH_ADAPT=0)\n", thr_ms, target_fps, lines_cap);
         ws = ps3_waitstat_self();
+        g_port_hsplit.fn = on ? port_hitch_rsx_split : NULL;
     }
     if (!on) return;
     const uint64_t now = __rdtsc();
@@ -347,12 +791,40 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
         ws_prev4[0] = s0; ws_prev4[1] = s1; ws_prev4[2] = s2; ws_prev4[3] = s3;
         ws_ms = ws_spin + ws_sleep + ws_lwm + ws_lwc;
     }
-    /* the guest call site the frame loop waited at longest */
+    /* the guest call sites the frame loop waited at longest (top 3 for [spike]) */
     uint32_t top_lr = 0; double top_ms = 0.0;
+    uint32_t t3_lr[3] = { 0, 0, 0 }; double t3_ms[3] = { 0.0, 0.0, 0.0 };
     for (int i = 0; i < PORT_HITCH_LR_SLOTS; i++) {
         const double v = (double)g_port_hitch.lr_qpc[i] * 1000.0 / (double)qf.QuadPart;
         if (v > top_ms) { top_ms = v; top_lr = g_port_hitch.lr[i]; }
+        for (int t = 0; t < 3; t++)
+            if (v > t3_ms[t]) {
+                for (int u = 2; u > t; u--) { t3_ms[u] = t3_ms[u - 1]; t3_lr[u] = t3_lr[u - 1]; }
+                t3_ms[t] = v; t3_lr[t] = g_port_hitch.lr[i]; break; }
         g_port_hitch.lr[i] = 0; g_port_hitch.lr_qpc[i] = 0;
+    }
+    /* SPU job wall time by job image since the last frame (top 4 for [spike]) */
+    double spu_ms = 0.0; long spu_runs = 0;
+    int j4_img[4] = { -1, -1, -1, -1 }; double j4_ms[4] = { 0, 0, 0, 0 }; long j4_runs[4] = { 0, 0, 0, 0 };
+    const char* cls_n[8]; double cls_ms[8]; long cls_runs[8]; int ncls = 0;
+    for (int i = 0; i < PORT_HITCH_JOB_IMGS; i++) {
+        if (!g_port_hitch.job_runs[i] && !g_port_hitch.job_qpc[i]) continue;
+        const double v = (double)_InterlockedExchange64((volatile long long*)&g_port_hitch.job_qpc[i], 0) * 1000.0 / (double)qf.QuadPart;
+        const long r = _InterlockedExchange(&g_port_hitch.job_runs[i], 0);
+        spu_ms += v; spu_runs += r;
+        {   /* per job class (g_port_hitch_job_tag) */
+            const char* tg = port_hitch_job_tag(i);
+            if (*tg) {
+                int c = 0;
+                while (c < ncls && strcmp(cls_n[c], tg)) c++;
+                if (c == ncls && ncls < 8) { cls_n[ncls] = tg; cls_ms[ncls] = 0.0; cls_runs[ncls] = 0; ncls++; }
+                if (c < ncls) { cls_ms[c] += v; cls_runs[c] += r; }
+            }
+        }
+        for (int t = 0; t < 4; t++)
+            if (v > j4_ms[t]) {
+                for (int u = 3; u > t; u--) { j4_ms[u] = j4_ms[u - 1]; j4_img[u] = j4_img[u - 1]; j4_runs[u] = j4_runs[u - 1]; }
+                j4_ms[t] = v; j4_img[t] = i; j4_runs[t] = r; break; }
     }
     /* CPU time the frame-loop thread actually ran: "game" minus this = preempted / not scheduled */
     double cpu_ms = -1.0;
@@ -365,6 +837,22 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
     }
     const double ft = k > 0.0 ? (double)(now - last) / (k * 1e6) : 0.0;
     last = now;
+    /* rsx::thread CPU split: per-frame deltas, so a discarded frame's interval (pause, alt-tab) is dropped and not
+     * counted as decode work in the 5 s summary */
+    static int64_t rc_last[RC_COUNT] = {};
+    static int64_t rc_win[RC_COUNT] = {};
+    for (int i = 0; i < RC_COUNT; i++) {
+        const int64_t a = g_port_rcpu.acc[i];
+        if (!(k <= 0.0 || discard)) rc_win[i] += a - rc_last[i];
+        rc_last[i] = a;
+    }
+    static uint32_t rc_fl_last = 0, rc_fs_last = 0;
+    static uint64_t rc_fl_win = 0, rc_fs_win = 0;   /* flips and sampled flips in the window (PORT_RSX_CPU_PROF=N) */
+    {
+        const uint32_t fl = g_port_rcpu.flips, fs = g_port_rcpu.flips_sampled;
+        if (!(k <= 0.0 || discard)) { rc_fl_win += (uint32_t)(fl - rc_fl_last); rc_fs_win += (uint32_t)(fs - rc_fs_last); }
+        rc_fl_last = fl; rc_fs_last = fs;
+    }
     if (k <= 0.0 || discard) { n_disc += discard ? 1 : 0; return; }
 
     win.push_back((float)ft);
@@ -375,14 +863,19 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
         sm_fifo += ms[PH_FIFOIDLE]; sm_label += ms[PH_LABEL]; sm_zcull += ms[PH_ZCULL]; sm_hard += ms[PH_HARDSYNC];
         sm_rlim += ms[PH_RSXLIMIT]; sm_sub += cnt[PH_SUBMIT]; sm_lim += ms[PH_LIMIT];
         sm_mrsx += ms[PH_MAINRSX]; sm_ring += ms[PH_RING]; sm_av += ms[PH_AVFLUSH];
+        sm_gpu += ms[PH_GPU]; sm_gpuraw += ms[PH_GPURAW]; sm_gpu_n += cnt[PH_GPU]; sm_spu += spu_ms; sm_draw += cnt[PH_DRAW]; sm_rb += ms[PH_READBACK];
+        sm_rp += cnt[PH_RPASS]; sm_bar += cnt[PH_BARRIER];
+        for (int i = PH_DSDIRECT; i <= PH_SW_HARD; i++) sm_why[i - PH_DSDIRECT] += cnt[i];
     }
     const double period = target_fps > 0.0 ? 1000.0 / target_fps : 0.0;
-    const double thr = (std::max)(thr_ms, period * 1.5);
+    /* adaptive: a game steadily over the fixed threshold (30-40 fps under 25 ms) lists only frames well above its
+     * own p50, not every frame; the list is capped per 5 s window (the summary counts the rest) */
+    const double thr = (std::max)((std::max)(thr_ms, period * 1.5), adapt ? adapt_p50 * 1.5 : 0.0);
     const int over2x = period > 0.0 && ft > 2.0 * period;
     if (ft > thr || over2x) {
         n_over += ft > thr; n_2x += over2x;
-        if ((double)(now - line_win_t0) > k * 1e9) { line_win_t0 = now; lines_s = 0; }
-        if (lines_s++ < 20) {
+        if (!(ft > thr) && adapt) { /* over 2x a target the game does not reach: counted, not listed */ }
+        else if (lines_s++ < lines_cap) {
             char cpu[32] = "";
             if (cpu_ms >= 0.0) snprintf(cpu, sizeof cpu, " (cpu %.1f)", cpu_ms);
             port_log_async(1, "[hitch] %.1f ms%s (prev %.1f) | game %.1f%s limiter %.1f extras %.1f sync %.1f guestwait %.1f"
@@ -397,6 +890,61 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
                     ms[PH_RSXLIMIT], ms[PH_PIPE], cnt[PH_PIPE],
                     ms[PH_TEX], cnt[PH_TEX], mxms[PH_TEX], ms[PH_RING], cnt[PH_RING], ms[PH_AVFLUSH], cnt[PH_AVFLUSH],
                     ms[PH_AUDIO], mxms[PH_PRESENT_IV], cnt[PH_PRESENT_IV]);
+            if (spike_on) {
+                /* [spike]: every timed contributor of this frame, largest first, then the event counts. RSX/GPU
+                 * entries overlap the main thread's waits (they are what it waited for), so they do not add up. */
+                struct { const char* n; double v; long c; uint32_t lr; } e[32];
+                int ne = 0;
+#define PH_SPK(name, val, count) do { e[ne].n = name; e[ne].v = (val); e[ne].c = (count); e[ne].lr = 0; ne++; } while (0)
+                PH_SPK("game(ppu)", game, -1);
+                for (int t = 0; t < 3; t++)
+                    if (t3_lr[t]) { e[ne].n = "wait@"; e[ne].v = t3_ms[t]; e[ne].c = -1; e[ne].lr = t3_lr[t]; ne++; }
+                PH_SPK("gpu-busy", ms[PH_GPU], cnt[PH_GPU]);
+                PH_SPK("spu-jobs(lane-sum)", spu_ms, spu_runs);
+                PH_SPK("rsx-fifo-idle", ms[PH_FIFOIDLE], -1);
+                PH_SPK("present", ms[PH_PRESENT], -1);
+                PH_SPK("gpu-wait", ms[PH_GPUWAIT], cnt[PH_GPUWAIT]);
+                PH_SPK("dlss", ms[PH_DLSS], -1);
+                PH_SPK("readback", ms[PH_READBACK], cnt[PH_READBACK]);
+                PH_SPK("blit", ms[PH_BLIT], cnt[PH_BLIT]);
+                PH_SPK("tex-upload", ms[PH_TEX], cnt[PH_TEX]);
+                PH_SPK("pipe-compile", ms[PH_PIPE], cnt[PH_PIPE]);
+                PH_SPK("zcull-read", ms[PH_ZCULL], cnt[PH_ZCULL]);
+                PH_SPK("hard-sync", ms[PH_HARDSYNC], cnt[PH_HARDSYNC]);
+                PH_SPK("label", ms[PH_LABEL], cnt[PH_LABEL]);
+                PH_SPK("submit", ms[PH_SUBMIT], cnt[PH_SUBMIT]);
+                PH_SPK("av-flush", ms[PH_AVFLUSH], cnt[PH_AVFLUSH]);
+                PH_SPK("ring", ms[PH_RING], cnt[PH_RING]);
+                PH_SPK("audio-wait", ms[PH_AUDIO], -1);
+#undef PH_SPK
+                std::sort(e, e + ne, [](const auto& a, const auto& b) { return a.v > b.v; });
+                char top[640]; size_t o = 0;
+                for (int i = 0; i < ne && o < sizeof top - 64; i++) {
+                    if (e[i].v < 0.05) break;
+                    if (e[i].lr) o += snprintf(top + o, sizeof top - o, "%s%s0x%08X %.1f", i ? ", " : "", e[i].n, e[i].lr, e[i].v);
+                    else if (e[i].c >= 0) o += snprintf(top + o, sizeof top - o, "%s%s %.1f/%ld", i ? ", " : "", e[i].n, e[i].v, e[i].c);
+                    else o += snprintf(top + o, sizeof top - o, "%s%s %.1f", i ? ", " : "", e[i].n, e[i].v);
+                }
+                char jobs[384] = ""; size_t jo = 0;
+                for (int t = 0; t < 4 && j4_img[t] >= 0 && jo < sizeof jobs - 48; t++) {
+                    const char* tg = port_hitch_job_tag(j4_img[t]);
+                    jo += snprintf(jobs + jo, sizeof jobs - jo, "%simg %d%s%s %.1f/%ld", t ? ", " : "", j4_img[t],
+                                   *tg ? ":" : "", tg, j4_ms[t], j4_runs[t]);
+                }
+                if (ncls && jo < sizeof jobs - 48) {
+                    jo += snprintf(jobs + jo, sizeof jobs - jo, " | spu by class:");
+                    for (int c = 0; c < ncls && jo < sizeof jobs - 32; c++)
+                        jo += snprintf(jobs + jo, sizeof jobs - jo, " %s %.1f/%ld", cls_n[c], cls_ms[c], cls_runs[c]);
+                }
+                port_log_async(1, "[spike] %.1f ms | top: %s | counts: draws %ld (instanced clauses %ld) submits %ld zcull-forced %ld ads-kicks %ld"
+                                  " tex-uploads %ld (same-slot %ld) readbacks %ld blits %ld render-passes %ld barriers %ld | spu top jobs: %s\n",
+                        ft, top, cnt[PH_DRAW], cnt[PH_INSTDRAW], cnt[PH_SUBMIT], cnt[PH_ZFORCE], cnt[PH_ADSKICK], cnt[PH_TEX], cnt[PH_REUPLOAD],
+                        cnt[PH_READBACK], cnt[PH_BLIT], cnt[PH_RPASS], cnt[PH_BARRIER], jo ? jobs : "none timed");
+                port_log_async(1, "[spike] submit reasons: bind-dma %ld av-flush %ld zcull-hint %ld zcull-hard %ld blit %ld label %ld"
+                                  " ads %ld present %ld hard-sync %ld other %ld | depth scale copies: direct %ld carrier %ld\n",
+                        cnt[PH_SW_BINDDMA], cnt[PH_SW_AV], cnt[PH_SW_ZHINT], cnt[PH_SW_ZHARD], cnt[PH_SW_BLIT], cnt[PH_SW_LABEL],
+                        cnt[PH_SW_ADS], cnt[PH_SW_PRESENT], cnt[PH_SW_HARD], cnt[PH_SW_OTHER], cnt[PH_DSDIRECT], cnt[PH_DSCARRIER]);
+            }
         } else dropped++;
     }
     prev_ft = ft;
@@ -405,6 +953,7 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
         std::sort(s.begin(), s.end());
         const size_t n = s.size();
         const float p50 = s[n / 2], p99 = s[(std::min)(n - 1, (n * 99) / 100)], mx = s[n - 1];
+        adapt_p50 = p50;
         double sd = 0.0, mean = 0.0;
         for (float v : s) mean += v;
         mean /= (double)n;
@@ -412,15 +961,51 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
         const double dn = (double)n;
         char extra[64] = "";
         if (dropped) snprintf(extra, sizeof extra, " (%u lines not shown)", dropped);
+        char gpu_s[48] = "n/a";
+        if (sm_gpu_n) snprintf(gpu_s, sizeof gpu_s, "%.1f (cb-sum %.1f)", sm_gpu / dn, sm_gpuraw / dn);
+        /* rsx::thread CPU split (PORT_RSX_CPU_PROF): decode = RC_FIFO minus the FIFO-empty and label waits it holds */
+        char rcpu_s[384] = "";
+        if (g_port_rcpu.tid && rc_fs_win) {
+            const double rc_scale = (double)rc_fl_win / (double)rc_fs_win;   /* 1 when every frame is sampled */
+            double r[RC_COUNT], tot = 0.0;
+            for (int i = 0; i < RC_COUNT; i++) {
+                r[i] = (double)rc_win[i] / (k * 1e6) / dn * rc_scale;
+                tot += r[i];
+            }
+            const double idle = (std::min)(r[RC_FIFO], sm_fifo / dn);
+            const double label = (std::min)(r[RC_FIFO] - idle, sm_label / dn);
+            const double decode = r[RC_FIFO] - idle - label;
+            const double busy = tot - idle - label - r[RC_READBACK] - r[RC_PRESENT];
+            const double dpf = sm_draw / dn;
+            snprintf(rcpu_s, sizeof rcpu_s,
+                     " | rsx-cpu per frame: work %.1f (%.1f us/draw) = decode %.2f state %.2f shader %.2f vertex %.2f tex %.2f surface %.2f"
+                     " draw %.2f zcull %.2f submit %.2f blit %.2f; present %.2f readback %.2f label %.2f idle %.2f",
+                     busy, dpf > 0.0 ? busy * 1000.0 / dpf : 0.0, decode, r[RC_STATE], r[RC_SHADER], r[RC_VERTEX], r[RC_TEXTURE],
+                     r[RC_SURFACE], r[RC_DRAW], r[RC_ZCULL], r[RC_SUBMIT], r[RC_BLIT], r[RC_PRESENT], r[RC_READBACK], label, idle);
+        }
+        char why_s[320];
+        {
+#define PH_W(c) (sm_why[(c) - PH_DSDIRECT] / dn)
+            snprintf(why_s, sizeof why_s, " | submit reasons per frame: bind-dma %.1f av-flush %.1f zcull-hint %.1f zcull-hard %.1f blit %.1f"
+                     " label %.1f ads %.1f present %.1f hard-sync %.1f other %.1f | depth scale copies direct %.1f carrier %.1f",
+                     PH_W(PH_SW_BINDDMA), PH_W(PH_SW_AV), PH_W(PH_SW_ZHINT), PH_W(PH_SW_ZHARD), PH_W(PH_SW_BLIT), PH_W(PH_SW_LABEL),
+                     PH_W(PH_SW_ADS), PH_W(PH_SW_PRESENT), PH_W(PH_SW_HARD), PH_W(PH_SW_OTHER), PH_W(PH_DSDIRECT), PH_W(PH_DSCARRIER));
+#undef PH_W
+        }
         port_log_async(1, "[hitch] 5 s: %zu frames, frame time p50 %.1f p99 %.1f max %.1f ms (sd %.2f) | over %.0f ms: %u, over 2x target: %u%s"
                           " | per frame: game %.1f (cpu %.1f) guestwait %.1f on-rsx %.2f limiter %.1f | rsx fifo-idle %.1f label %.1f zcull %.2f hard-sync %.2f"
-                          " rsx-limit %.1f submits %.1f | guest threads on rsx: ring %.2f av-flush %.2f\n",
+                          " rsx-limit %.1f submits %.1f | guest threads on rsx: ring %.2f av-flush %.2f | gpu-busy %s spu-jobs(lane-sum) %.1f"
+                          " draws %.0f render-passes %.0f barriers %.0f readback %.2f%s%s\n",
                 n, p50, p99, mx, sqrt(sd / dn), thr, n_over, n_2x, extra,
                 sm_game / dn, sm_cpu / dn, sm_gw / dn, sm_mrsx / dn, sm_lim / dn, sm_fifo / dn, sm_label / dn, sm_zcull / dn, sm_hard / dn,
-                sm_rlim / dn, sm_sub / dn, sm_ring / dn, sm_av / dn);
+                sm_rlim / dn, sm_sub / dn, sm_ring / dn, sm_av / dn, gpu_s, sm_spu / dn, sm_draw / dn, sm_rp / dn, sm_bar / dn, sm_rb / dn, rcpu_s, why_s);
         sm_game = sm_gw = sm_cpu = sm_fifo = sm_label = sm_zcull = sm_hard = sm_rlim = sm_sub = sm_lim = 0.0;
         sm_mrsx = sm_ring = sm_av = 0.0;
-        win.clear(); n_over = n_2x = dropped = n_disc = 0;
+        for (int i = 0; i < RC_COUNT; i++) rc_win[i] = 0;
+        rc_fl_win = rc_fs_win = 0;
+        sm_gpu = sm_gpuraw = sm_spu = sm_draw = sm_rb = sm_rp = sm_bar = 0.0; sm_gpu_n = 0;
+        for (double& w : sm_why) w = 0.0;
+        win.clear(); n_over = n_2x = dropped = n_disc = lines_s = 0;
         sum_t0 = now;
     }
 }

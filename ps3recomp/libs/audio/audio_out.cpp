@@ -44,6 +44,9 @@ extern "C" void audio_out_default_config(AudioOutConfig* c, unsigned rate, unsig
     c->target_frames = buffer_ms * ms;
     c->threshold = 0.75;              /* RPCS3's default time_stretching_threshold */
     c->min_tempo = 0.5;
+    /* 2 = (fill/threshold)^2. Issue #6 found 0.5x grainy; PORT_AUDIO_STRETCH_MIN=0.8 PORT_AUDIO_STRETCH_CURVE=1
+     * (linear, like RPCS3) stretches less but runs dry sooner: test_audio_out's fps-drop case then underruns. */
+    c->curve = 2;
     c->fade_frames = 5 * ms;
     c->guard_frames = 15 * ms;
     c->device_frames = 30 * ms;
@@ -60,6 +63,7 @@ extern "C" void audio_out_env_config(AudioOutConfig* c, unsigned period)
     c->threshold = env_uint("PORT_AUDIO_STRETCH_THRESHOLD", (unsigned)(c->threshold * 100.0 + 0.5), 1, 100) / 100.0;
     { const char* e = getenv("PORT_AUDIO_STRETCH_MIN");
       if (e && *e) { double v = atof(e); if (!(v >= 0.1)) v = 0.1; if (v > 1.0) v = 1.0; c->min_tempo = v; } }
+    c->curve = env_uint("PORT_AUDIO_STRETCH_CURVE", c->curve ? c->curve : 2, 1, 2);
     c->fade_frames = env_uint("PORT_AUDIO_FADE_MS", c->fade_frames / ms, 1, 50) * ms;
     c->device_frames = env_uint("PORT_AUDIO_DEVICE_MS", c->device_frames / ms, 5, 500) * ms;
     /* the device consumes whole engine periods: keep >= 3 queued, and conceal
@@ -80,6 +84,7 @@ extern "C" AudioOut* audio_out_create(const AudioOutConfig* cfg)
     if (!(ao->cfg.threshold > 0.0)) ao->cfg.threshold = 0.75;
     if (!(ao->cfg.min_tempo >= 0.1)) ao->cfg.min_tempo = 0.1;
     if (ao->cfg.min_tempo > 1.0) ao->cfg.min_tempo = 1.0;
+    if (ao->cfg.curve != 1) ao->cfg.curve = 2;
     if (ao->cfg.fade_frames < 16) ao->cfg.fade_frames = 16;
     ao->ring.assign((size_t)ao->cfg.ring_frames * 2, 0.0f);
     /* RPCS3's audio_resampler settings, except: a 25 ms sequence instead of
@@ -96,6 +101,19 @@ extern "C" AudioOut* audio_out_create(const AudioOutConfig* cfg)
     ao->st.setSetting(SETTING_USE_AA_FILTER, 0);
     ao->st.setTempo(1.0);
     return ao;
+}
+
+extern "C" unsigned audio_out_set_target(AudioOut* ao, unsigned frames)
+{
+    /* keep room in the ring for twice the target (the ring is sized at create) */
+    const unsigned hi = ao->cfg.ring_frames / 2;
+    if (frames > hi) frames = hi;
+    if (frames < 256) frames = 256;
+    ao->cfg.target_frames = frames;
+    unsigned r = frames / 4;
+    if (r < ao->cfg.guard_frames + ao->cfg.fade_frames) r = ao->cfg.guard_frames + ao->cfg.fade_frames;
+    ao->cfg.resume_frames = r;
+    return frames;
 }
 
 extern "C" void audio_out_destroy(AudioOut* ao) { delete ao; }
@@ -144,8 +162,8 @@ static void feed(AudioOut* ao, unsigned need)
 /* Tempo control, driven by the device clock: called for every chunk handed to
  * the device, so it keeps reacting while the producer is stalled. Like
  * RPCS3, nothing happens above the threshold; below it the tempo follows
- * (fill / threshold)^2 (RPCS3 uses the plain ratio; squaring settles at a
- * fuller buffer for the same slowdown, leaving room for stalls). It drops
+ * (fill / threshold)^2 (RPCS3 uses the plain ratio, PORT_AUDIO_STRETCH_CURVE=1;
+ * squaring settles at a fuller buffer for the same slowdown, leaving room for stalls). It drops
  * quickly (25 % of the way per 256 frames played) and recovers gently
  * (+0.01 per 256 frames), so it settles where the slowed playback matches
  * what the game delivers instead of oscillating. */
@@ -157,7 +175,7 @@ static void update_tempo(AudioOut* ao, unsigned dq, unsigned played)
     double want = 1.0;
     if (fill < ao->cfg.threshold) {
         want = fill / ao->cfg.threshold;
-        want *= want;
+        if (ao->cfg.curve == 2) want *= want;
         if (want < ao->cfg.min_tempo) want = ao->cfg.min_tempo;
     }
     const double steps = played / 256.0;

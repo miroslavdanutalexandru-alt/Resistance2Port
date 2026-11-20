@@ -93,6 +93,23 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);  /* thread exit */
  * write does not cost it its reservation on hardware. */
 void spu_coh_notify_write_except(uint32_t ea, const void* self);
 
+/* PORT_NOTIFY_ALL_WRITES (default 0; 1 = on): a writer outside the PPU/SPU
+ * store paths -- the RSX (labels, reports, DMA/blit engines, surface flushes,
+ * snapshot serves) -- wrote [ea, ea+size). Every SPU whose live reservation is
+ * on one of those lines loses it and is woken, as spu_coh_notify_write does
+ * per line. Only when the reserved-line bitmap has a bit in the range does it
+ * try the lock-line lock, so an unreserved range (the common case, including
+ * multi-MB writebacks) costs a bitmap scan and no lock. It never waits for the
+ * lock: when it is taken (by this very thread, e.g. a flush in the
+ * access-violation handler of a faulting locked memcpy, or by another), the
+ * range is queued and the holder applies it in spu_lockline_unlock. Safe to
+ * call with the lock or any RSX lock held. */
+void spu_coh_notify_range(uint32_t ea, uint32_t size);
+/* Reservations spu_coh_notify_range took away (each one a wake that the
+ * waiter would otherwise only have seen on its PORT_SPU_SCHED_MS re-poll). */
+extern volatile long long g_spu_coh_range_wakes;
+extern volatile long long g_spu_coh_range_deferred; /* ranges queued because the lock was taken */
+
 /* Count of LR events delivered. A parked SPURS service that never wakes with
  * this at zero is a coherence miss; nonzero moves the question downstream. */
 extern unsigned long g_spu_lr_raise;

@@ -4,3 +4,4 @@
 
 # applied with git apply to an LF checkout of RPCS3: keep byte-exact
 *.patch -text
+*.profdata binary

@@ -25,6 +25,7 @@
 #include "ps3emu/log_first.h"
 #include "../syscalls/ps3_waitstat.h"   /* ps3_waitstat, ps3_perf_on */
 #include "ps3emu/port_hitch.h"            /* [hitch]: guest wait call sites of the frame loop */
+#include "../platform/port_hires_sleep.h"   /* port_sleep_1ms (perf pass 9) */
 
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
@@ -371,10 +372,9 @@ static void sys_lwcond_create(ppu_context* ctx)
 }
 static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
 /* PS3_LWCOND_WAKE (default on; =0 or PS3_PERF_ALL=0 off): the wait below is a
- * 1 ms poll. A signal now bumps a per-lwcond sequence word and wakes the
- * waiters parked on it (WaitOnAddress), so a signalled wait returns at once
- * instead of after the full Sleep(1). The poll stays as the fallback, so a
- * signal sent before the waiter parks costs at most the old 1 ms. */
+ * bounded park (lwc_wait_ms; it was a 1 ms poll). A signal bumps a per-lwcond sequence word and wakes the
+ * waiters parked on it (WaitOnAddress), so a signalled wait returns at once.
+ * With PS3_LWCOND_WAKE=0 the wait is the old Sleep(1) poll. */
 static volatile LONG s_lwc_seq[256];
 static inline volatile LONG* lwc_seq(uint32_t lwcond) { return &s_lwc_seq[(lwcond * 2654435761u) >> 24]; }
 static int lwc_wake_on(void)
@@ -391,6 +391,30 @@ static void lwc_wake(ppu_context* ctx)
         WakeByAddressAll((PVOID)q);
     }
     ctx->gpr[3] = 0;
+}
+/* How long a wait parks before the guest loop re-checks (PORT_LWCOND_POLL_MS,
+ * default 50; 1 = the old fixed 1 ms poll). With PS3_LWCOND_WAKE every signal
+ * wakes the waiter at once: seq0 is read while the waiter still holds the
+ * lwmutex, so a signal sent after the guest's predicate check (under the same
+ * lwmutex) always changes *seq before or during WaitOnAddress. The bounded park
+ * only covers a signal sent without the lwmutex (a race real lv2 has too) and
+ * hash-slot sharing, which only causes spurious wakes. ~15 R2 threads (stream
+ * service, disk I/O) sat in this 1 ms poll: ~38% of the game's CPU in the
+ * kernel on a 4c/8t CPU. The guest timeout (r4, usec, 0 = infinite) is honoured
+ * up to the cap; the return stays CELL_OK as before (a legal spurious wake). */
+static DWORD lwc_wait_ms(uint64_t timeout_us)
+{
+    static volatile long cap = -1;
+    if (cap < 0) {
+        const char* e = getenv("PORT_LWCOND_POLL_MS");
+        long v = (e && *e) ? atol(e) : 50;
+        if (v < 1) v = 1; if (v > 1000) v = 1000;
+        fprintf(stderr, "[lwcond] wait park cap %ld ms (PORT_LWCOND_POLL_MS; 1 = old 1 ms poll)\n", v);
+        cap = v;
+    }
+    uint64_t ms = timeout_us ? (timeout_us + 999) / 1000 : (uint64_t)cap;
+    if (ms > (uint64_t)cap) ms = (uint64_t)cap;
+    return ms ? (DWORD)ms : 1;
 }
 static void sys_lwcond_signal(ppu_context* ctx)     { lwc_wake(ctx); }
 static void sys_lwcond_signal_all(ppu_context* ctx) { lwc_wake(ctx); }
@@ -416,8 +440,8 @@ static void sys_lwcond_wait(ppu_context* ctx)
         vm_write32(lwmutex + LWM_RECUR, 0);
         vm_write32(lwmutex + LWM_OWNER, 0);
         ReleaseSemaphore(s, 1, NULL);
-        if (lwc_wake_on()) { LONG cmp = seq0; WaitOnAddress((volatile VOID*)seq, &cmp, sizeof cmp, 1); }
-        else Sleep(1);
+        if (lwc_wake_on()) { LONG cmp = seq0; WaitOnAddress((volatile VOID*)seq, &cmp, sizeof cmp, lwc_wait_ms(ctx->gpr[4])); }
+        else port_sleep_1ms();
         WaitForSingleObject(s, INFINITE);
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
@@ -586,6 +610,7 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
  * _sys_net_errno_loc returns a POINTER the game dereferences. */
 #define SYS_NET_EWOULDBLOCK_V 35
 extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
+extern "C" void port_online_register(void);    /* libs/network/port_online.c */
 extern "C" void np_score_register_ctx(void);   /* libs/network/sceNpScore.c */
 extern "C" void cellSaveData_register_ctx_handlers(void); /* libs/system/cellSaveData.c */
 extern "C" void avconf_register_ctx(void);     /* libs/misc/cellAvconfExt.c */
@@ -914,7 +939,9 @@ extern "C" void ppu_sysprx_register(void)
 
     /* PS3_NET_ONLINE: real host sockets (libs/network/sysNet.c). Registered
      * first because the first registration of a NID wins, so these shadow the
-     * offline model below; without the variable nothing changes. */
+     * offline model below; without the variable nothing changes.
+     * PORT_ONLINE=1 (libs/network/port_online.c) implies it. */
+    port_online_register();
     if (getenv("PS3_NET_ONLINE")) ps3_net_host_register(gcm_guest_alloc);
     /* sceNpScore ranking calls take up to 15 arguments: the ones past r10
      * come off the stack, so they need the full context. */

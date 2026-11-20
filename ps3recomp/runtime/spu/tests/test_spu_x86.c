@@ -83,6 +83,9 @@ int main(int argc, char** argv) {
           g = spu_cfltu(a, i8); w = spu_cfltu_ref(a, i8); if (!same(g, w)) report("cfltu", a, b, c, g, w, i8);
           g = spu_csflt(a, i8); w = spu_csflt_ref(a, i8); if (!same(g, w)) report("csflt", a, b, c, g, w, i8);
           g = spu_cuflt(a, i8); w = spu_cuflt_ref(a, i8); if (!same(g, w)) report("cuflt", a, b, c, g, w, i8); }
+        /* SPU_W0/SPU_H0 (tools/spu_w0.py) == the plain preferred-slot field reads */
+        if (SPU_W0(a) != a._u32[0] || SPU_H0(a) != a._u16[0] || (uint32_t)SPU_H0(a) != (a._u32[0] & 0xFFFFu)) {
+            if (fails++ < 20) printf("FAIL SPU_W0/H0 a=%08X %08X %08X %08X\n", a._u32[0], a._u32[1], a._u32[2], a._u32[3]); }
     }
     printf("integer/permute/convert: %d failures over %ld iterations\n", fails, N);
 

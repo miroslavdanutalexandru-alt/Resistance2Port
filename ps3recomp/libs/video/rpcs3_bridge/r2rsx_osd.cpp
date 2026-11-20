@@ -10,6 +10,12 @@
 #include "Emu/RSX/VK/VKR2Hdr.h"
 
 #include "r2rsx_bridge.h"
+#include "../rsx_d3d12_engine.h"
+
+// The Direct3D 12 renderer (R2_RSX=d3d12) draws the port UI itself: every r2rsx_osd_* call goes there
+// while it presents. Without rsx_d3d12_engine.c in the link the default below says "not running".
+extern "C" const rsx_d3d12_osd_api* r2rsx_osd_d3d12_none(void) { return nullptr; }
+#pragma comment(linker, "/alternatename:rsx_d3d12_engine_osd_api=r2rsx_osd_d3d12_none")
 
 #include <windows.h>
 #include <algorithm>
@@ -280,11 +286,13 @@ namespace
 
 extern "C" int r2rsx_osd_wanted(void)
 {
+	if (auto* d = rsx_d3d12_engine_osd_api()) return d->wanted();
 	return r2rsx_enabled() && mode_from_env();
 }
 
 extern "C" int r2rsx_osd_ready(void)
 {
+	if (auto* d = rsx_d3d12_engine_osd_api()) return d->ready();
 	if (!r2rsx_osd_wanted()) return 0;
 	auto* thr = rsx::get_current_renderer();
 	if (!thr || !thr->overlay_manager()) return 0;
@@ -305,6 +313,7 @@ extern "C" int r2rsx_osd_ready(void)
 
 extern "C" void r2rsx_osd_layer(int slot, const void* bgra, int w, int h, int x, int y, int ref_w, int ref_h, float alpha)
 {
+	if (auto* d = rsx_d3d12_engine_osd_api()) { d->layer(slot, bgra, w, h, x, y, ref_w, ref_h, alpha); return; }
 	if (slot < 0 || slot >= k_slots || !r2rsx_osd_wanted()) return;
 	std::vector<u8> px;
 	float gain = 1.f;
@@ -338,6 +347,7 @@ extern "C" void r2rsx_osd_layer(int slot, const void* bgra, int w, int h, int x,
 
 extern "C" void r2rsx_osd_hide(int slot)
 {
+	if (auto* d = rsx_d3d12_engine_osd_api()) { d->hide(slot); return; }
 	if (slot < 0 || slot >= k_slots) return;
 	{
 		std::lock_guard lock(s_mtx);
@@ -350,6 +360,7 @@ extern "C" void r2rsx_osd_hide(int slot)
 
 extern "C" int r2rsx_osd_visible(int slot)
 {
+	if (auto* d = rsx_d3d12_engine_osd_api()) return d->visible(slot);
 	std::lock_guard lock(s_mtx);
 	if (slot < 0)
 	{
@@ -363,6 +374,7 @@ extern "C" int r2rsx_osd_visible(int slot)
 
 extern "C" void r2rsx_osd_suppress(int on)
 {
+	if (auto* d = rsx_d3d12_engine_osd_api()) { d->suppress(on); return; }
 	s_suppress.store(on ? 1 : 0);
 	s_change.fetch_add(1);
 	kick(0);
@@ -370,11 +382,13 @@ extern "C" void r2rsx_osd_suppress(int on)
 
 extern "C" unsigned r2rsx_osd_presents(void)
 {
+	if (auto* d = rsx_d3d12_engine_osd_api()) return d->presents();
 	return s_presents.load();
 }
 
 extern "C" void r2rsx_osd_refresh(void)
 {
+	if (auto* d = rsx_d3d12_engine_osd_api()) { d->refresh(); return; }
 	// A change made while the game is parked shows with the next native flip; ask again if none came.
 	if (s_change.load() != s_drawn.load()) kick(33000);
 }

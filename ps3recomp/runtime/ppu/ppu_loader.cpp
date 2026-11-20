@@ -354,6 +354,7 @@ static void sc_trace(uint64_t num, ppu_context* ctx, uint64_t a3, uint64_t a4,
 #ifdef _WIN32
 #include <windows.h>
 #include <tlhelp32.h>
+#include <psapi.h>   /* K32EnumProcessModules (PPU_PROF_SAMPLE) */
 
 /* ---------------------------------------------------------------------------
  * PS3_SAMPLE=<ms>: a sampling profiler over GUEST code.
@@ -2192,57 +2193,195 @@ extern "C" uint32_t ppu_prof_resolve_host(void* ra)
 }
 
 #ifdef _WIN32
-/* PPU_PROF_SAMPLE: sampling profiler for one host thread. Suspends it every
- * ms, unwinds its host stack and counts inclusive hits per guest function. */
+/* PPU_PROF_SAMPLE=1 (off by default; project/stubs.cpp starts it on the main
+ * guest thread): sampling profiler. Every PPU_PROF_MS (default 1) ms it
+ * suspends the thread, unwinds its host stack and counts per lifted guest
+ * function the samples it is on the stack (incl) and the samples it is the
+ * innermost lifted frame (self -- that includes the runtime/HLE host code it
+ * called). A frame counts as lifted only when its host function starts
+ * exactly at a registered lifted function, so runtime code is never charged
+ * to the nearest guest function below it. The leaf host function is counted
+ * as well (module+RVA): syscalls, natives and waits. "in-OS" = samples whose
+ * leaf is in ntdll/KernelBase/kernel32/win32u (sleeping, yielding, waiting).
+ * Prints the top PPU_PROF_TOP (default 40) functions every PPU_PROF_SECS
+ * (default 10) s for PPU_PROF_REPEAT windows (default 0 = until exit).
+ * Costs the sampled thread a few percent (one suspend per sample).
+ * While the thread is suspended nothing may take a lock it could hold
+ * (RtlLookupFunctionEntry takes the inverted function table and dynamic
+ * function table locks), so frames are looked up lock-free in a cached copy of
+ * each module's .pdata (refreshed per window while the thread runs; modules
+ * are ref-held until the next refresh so they cannot unload under the walk).
+ * RtlVirtualUnwind only reads code/stack. The walk stops at code outside a
+ * known image (JIT, dynamic function tables). */
 static HANDLE s_prof_target;
-static DWORD WINAPI ppu_prof_sampler(LPVOID)
+static DWORD s_prof_tid;
+struct ppu_prof_mod { DWORD64 base, end; const RUNTIME_FUNCTION* pd; DWORD n; HMODULE h; };
+enum { PPU_PROF_MODS = 512 };
+static ppu_prof_mod s_pm[PPU_PROF_MODS];
+static int s_pm_n;
+static void ppu_prof_refresh_mods(void)
 {
-    enum { N = 1 << 16 };
-    static uint32_t key[N], cnt[N], self_[N];
-    int secs = 10; if (const char* e = getenv("PPU_PROF_SECS")) secs = atoi(e);
-    DWORD end = GetTickCount() + secs * 1000; unsigned total = 0;
-    auto bump = [&](uint32_t g, uint32_t* arr) {
-        uint32_t i = (g * 2654435761u) & (N - 1);
-        while (key[i] && key[i] != g) i = (i + 1) & (N - 1);
-        key[i] = g; arr[i]++; };
-    while (GetTickCount() < end) {
-        Sleep(1);
-        if (SuspendThread(s_prof_target) == (DWORD)-1) break;
-        CONTEXT c; c.ContextFlags = CONTEXT_FULL;
-        if (GetThreadContext(s_prof_target, &c)) {
-            uint32_t seen[48]; int ns = 0;
-            for (int d = 0; d < 48 && c.Rip; d++) {
-                uint32_t g = ppu_prof_resolve_host((void*)c.Rip);
-                bool dup = false; for (int k = 0; k < ns; k++) if (seen[k] == g) dup = true;
-                if (g && !dup) { seen[ns++] = g; bump(g, cnt); if (d == 0 || ns == 1) bump(g, self_); }
-                DWORD64 base; PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c.Rip, &base, NULL);
-                if (!f) { c.Rip = *(DWORD64*)c.Rsp; c.Rsp += 8; continue; }
-                PVOID hd; DWORD64 ef;
-                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, f, &c, &hd, &ef, NULL);
-            }
-            total++;
+    static HMODULE hm[PPU_PROF_MODS];
+    static ppu_prof_mod nm[PPU_PROF_MODS];
+    DWORD need = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), hm, sizeof hm, &need)) return;
+    int n = (int)(need / sizeof(HMODULE)), k = 0;
+    if (n > PPU_PROF_MODS) n = PPU_PROF_MODS;
+    for (int i = 0; i < n; i++) {
+        HMODULE h = NULL;
+        if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCSTR)hm[i], &h) || !h) continue;
+        const BYTE* b = (const BYTE*)h;
+        const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(b + ((const IMAGE_DOS_HEADER*)b)->e_lfanew);
+        const IMAGE_DATA_DIRECTORY& dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if (!dd.VirtualAddress || dd.Size < sizeof(RUNTIME_FUNCTION)) { FreeLibrary(h); continue; }
+        ppu_prof_mod m = { (DWORD64)b, (DWORD64)b + nt->OptionalHeader.SizeOfImage,
+                           (const RUNTIME_FUNCTION*)(b + dd.VirtualAddress),
+                           (DWORD)(dd.Size / sizeof(RUNTIME_FUNCTION)), h };
+        int j = k++;
+        for (; j > 0 && nm[j - 1].base > m.base; j--) nm[j] = nm[j - 1];
+        nm[j] = m;
+    }
+    for (int i = 0; i < s_pm_n; i++) FreeLibrary(s_pm[i].h);
+    memcpy(s_pm, nm, sizeof(ppu_prof_mod) * k);
+    s_pm_n = k;
+}
+/* Lock-free RtlLookupFunctionEntry over the cached images. *base = 0 when pc
+ * is in no known image; f = NULL with *base != 0 is a leaf function. */
+static PRUNTIME_FUNCTION ppu_prof_lookup(DWORD64 pc, DWORD64* base)
+{
+    *base = 0;
+    int lo = 0, hi = s_pm_n;
+    while (lo < hi) { const int mid = (lo + hi) / 2; if (s_pm[mid].base <= pc) lo = mid + 1; else hi = mid; }
+    if (!lo || pc >= s_pm[lo - 1].end) return NULL;
+    const ppu_prof_mod& m = s_pm[lo - 1];
+    *base = m.base;
+    const DWORD rva = (DWORD)(pc - m.base);
+    DWORD l = 0, h = m.n;
+    while (l < h) {
+        const DWORD mid = (l + h) / 2;
+        const RUNTIME_FUNCTION* f = &m.pd[mid];
+        if (rva < f->BeginAddress) h = mid;
+        else if (rva >= f->EndAddress) l = mid + 1;
+        else {
+            for (int c = 0; c < 8 && (f->UnwindData & 1); c++)
+                f = (const RUNTIME_FUNCTION*)(m.base + (f->UnwindData & ~1u));
+            return (PRUNTIME_FUNCTION)f;
         }
-        ResumeThread(s_prof_target);
     }
-    fprintf(stderr, "[PROF] %u samples\n", total);
-    for (int r = 0; r < 80; r++) {
-        uint32_t best = 0, bi = 0;
-        for (uint32_t i = 0; i < N; i++) if (cnt[i] > best) { best = cnt[i]; bi = i; }
-        if (!best) break;
-        fprintf(stderr, "[PROF] func_%08X incl=%5.1f%% self=%5.1f%%\n", key[bi],
-                100.0 * best / total, 100.0 * self_[bi] / total);
-        cnt[bi] = 0;
+    return NULL;
+}
+static uint32_t ppu_prof_exact(DWORD64 host)
+{
+    uint32_t lo = 0, hi = g_inv_n;
+    while (lo < hi) {
+        const uint32_t mid = (lo + hi) / 2;
+        const DWORD64 h = (DWORD64)g_inv[mid].host;
+        if (h == host) return g_inv[mid].guest;
+        if (h < host) lo = mid + 1; else hi = mid;
     }
-    fflush(stderr);
     return 0;
 }
+static DWORD WINAPI ppu_prof_sampler(LPVOID)
+{
+    enum { N = 1 << 16, NH = 1 << 12 };
+    static uint32_t key[N], cnt[N], self_[N];
+    static DWORD64 hkey[NH]; static uint32_t hcnt[NH];
+    auto envi = [](const char* n, int d) { const char* e = getenv(n); return e && *e ? atoi(e) : d; };
+    int secs = envi("PPU_PROF_SECS", 10), ms = envi("PPU_PROF_MS", 1), top = envi("PPU_PROF_TOP", 40);
+    const int repeat = envi("PPU_PROF_REPEAT", 0);
+    if (secs < 1) secs = 1;
+    if (ms < 1) ms = 1;
+    if (top < 1) top = 1;
+    HMODULE os_mod[4] = { GetModuleHandleA("ntdll.dll"), GetModuleHandleA("KernelBase.dll"),
+                          GetModuleHandleA("kernel32.dll"), GetModuleHandleA("win32u.dll") };
+    fprintf(stderr, "[PROF] sampling thread %lu every %d ms, top %d every %d s (PPU_PROF_SAMPLE/MS/TOP/SECS/REPEAT)\n",
+            (unsigned long)s_prof_tid, ms, top, secs);
+    auto bump = [&](uint32_t g, uint32_t* arr) {
+        uint32_t i = (g * 2654435761u) & (N - 1);
+        for (uint32_t p = 0; p < N && key[i] && key[i] != g; p++) i = (i + 1) & (N - 1);
+        if (key[i] && key[i] != g) return;
+        key[i] = g; arr[i]++; };
+    for (int win = 1; !repeat || win <= repeat; win++) {
+        ppu_prof_refresh_mods();
+        const ULONGLONG end = GetTickCount64() + (ULONGLONG)secs * 1000;
+        unsigned total = 0, os = 0, noguest = 0;
+        while (GetTickCount64() < end) {
+            Sleep(ms);
+            if (SuspendThread(s_prof_target) == (DWORD)-1) return 0;
+            CONTEXT c; c.ContextFlags = CONTEXT_FULL;
+            DWORD64 leaf = 0; int got = 0;
+            uint32_t seen[48]; int ns = 0;
+            if (GetThreadContext(s_prof_target, &c)) {
+                got = 1;
+                for (int d = 0; d < 48 && c.Rip; d++) {
+                    DWORD64 base = 0; PRUNTIME_FUNCTION f = ppu_prof_lookup(c.Rip, &base);
+                    const DWORD64 start = f ? base + f->BeginAddress : c.Rip;
+                    if (d == 0) leaf = start;
+                    const uint32_t g = f ? ppu_prof_exact(start) : 0;
+                    bool dup = false; for (int k = 0; k < ns; k++) if (seen[k] == g) dup = true;
+                    if (g && !dup && ns < 48) seen[ns++] = g;
+                    if (!base || (!f && d)) break;
+                    if (!f) { c.Rip = *(DWORD64*)c.Rsp; c.Rsp += 8; continue; }
+                    PVOID hd; DWORD64 ef;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, f, &c, &hd, &ef, NULL);
+                }
+            }
+            ResumeThread(s_prof_target);
+            if (!got) continue;
+            total++;
+            for (int k = 0; k < ns; k++) bump(seen[k], cnt);
+            if (ns) bump(seen[0], self_); else noguest++;
+            HMODULE m = NULL;
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)leaf, &m);
+            for (HMODULE o : os_mod) if (m && m == o) { os++; break; }
+            uint32_t i = (uint32_t)((leaf >> 4) * 2654435761u) & (NH - 1);
+            for (uint32_t p = 0; p < NH && hkey[i] && hkey[i] != leaf; p++) i = (i + 1) & (NH - 1);
+            if (!hkey[i] || hkey[i] == leaf) { hkey[i] = leaf; hcnt[i]++; }
+        }
+        if (!total) { fprintf(stderr, "[PROF] window %d: no samples\n", win); continue; }
+        fprintf(stderr, "[PROF] window %d (%d s): %u samples, in-OS %.1f%%, no lifted frame %.1f%%\n",
+                win, secs, total, 100.0 * os / total, 100.0 * noguest / total);
+        for (int r = 0; r < top; r++) {
+            uint32_t best = 0, bi = 0;
+            for (uint32_t i = 0; i < N; i++) if (cnt[i] > best) { best = cnt[i]; bi = i; }
+            if (!best) break;
+            fprintf(stderr, "[PROF] func_%08X incl=%5.1f%% self=%5.1f%%\n", key[bi],
+                    100.0 * best / total, 100.0 * self_[bi] / total);
+            cnt[bi] = 0;
+        }
+        for (int r = 0; r < 12; r++) {
+            uint32_t best = 0, bi = 0;
+            for (uint32_t i = 0; i < NH; i++) if (hcnt[i] > best) { best = hcnt[i]; bi = i; }
+            if (!best) break;
+            HMODULE m = NULL; char mn[MAX_PATH] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)hkey[bi], &m) && m) {
+                GetModuleFileNameA(m, mn, sizeof mn);
+            }
+            const char* bn = strrchr(mn, '\\');
+            const uint32_t g = ppu_prof_exact(hkey[bi]);
+            if (g) fprintf(stderr, "[PROF] leaf func_%08X %5.1f%%\n", g, 100.0 * best / total);
+            else fprintf(stderr, "[PROF] leaf %s+0x%llX %5.1f%%\n", bn ? bn + 1 : mn,
+                         (unsigned long long)(hkey[bi] - (DWORD64)m), 100.0 * best / total);
+            hcnt[bi] = 0;
+        }
+        fflush(stderr);
+        memset(key, 0, sizeof key); memset(cnt, 0, sizeof cnt); memset(self_, 0, sizeof self_);
+        memset(hkey, 0, sizeof hkey); memset(hcnt, 0, sizeof hcnt);
+    }
+    return 0;
+}
+/* Samples the calling thread. */
 extern "C" void ps3_prof_start_sampler(void)
 {
     if (s_prof_target) return;
     ppu_prof_resolve_host(nullptr);
-    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
-                    &s_prof_target, THREAD_ALL_ACCESS, FALSE, 0);
-    CreateThread(NULL, 0, ppu_prof_sampler, NULL, 0, NULL);
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                         &s_prof_target, THREAD_ALL_ACCESS, FALSE, 0)) { s_prof_target = NULL; return; }
+    s_prof_tid = GetCurrentThreadId();
+    HANDLE h = CreateThread(NULL, 0, ppu_prof_sampler, NULL, 0, NULL);
+    if (h) { SetThreadPriority(h, THREAD_PRIORITY_HIGHEST); CloseHandle(h); }
 }
 #endif
 
@@ -2446,7 +2585,7 @@ extern "C" void ppu_dump_guest_stack(ppu_context* ctx, const char* tag)
     fprintf(stderr, "%s\n", gs);
 }
 
-/* Allocation-size probe (temporary, LBP resource-loader OOM). Hooked at the
+/* Allocation-size probe (debug aid for out-of-memory in a resource loader). Hooked at the
  * aligned allocator func_004C22D0 entry. Fires only when the requested size is
  * insane (>= 0x40000000 or in the 0xD0000000 stack window = a pointer passed as
  * a size), then dumps size/obj/sp/lr + a scan of the guest stack for game .text
@@ -3253,6 +3392,29 @@ extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
  * in lv2_syscall() below. */
 #define PS3_SC_INFLIGHT_MAX 64
 extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
+/* Last lv2 syscall number per guest thread (kept after it returns): crash reports. */
+extern "C" uint32_t g_sc_last[PS3_SC_INFLIGHT_MAX] = { 0 };
+/* r3/r4 of that syscall (the wait object / address of a blocking one) and its
+ * GetTickCount() at entry: hang reports (sys_ppu_thread.c ppu_hang_guest_threads). */
+extern "C" uint32_t g_sc_arg[PS3_SC_INFLIGHT_MAX][2] = { { 0 } };
+extern "C" uint32_t g_sc_t0[PS3_SC_INFLIGHT_MAX] = { 0 };
+
+/* Crash reporter (port_crash.h guest_state): the calling host thread's guest
+ * PPU state. Runs on the faulting thread, maybe out of stack: loads only.
+ * Returns 0 when this is not a guest thread. PORT_CRASH_EXTRA=0: not called. */
+extern "C" unsigned ppu_thread_prof_pc(unsigned tid);
+extern "C" int ppu_crash_guest_state(uint64_t* tid, uint32_t* lr, uint32_t* sp, uint32_t* sc_in,
+                                     uint32_t* sc_last, uint32_t* callsite)
+{
+    ppu_context* c = g_active_ctx;
+    if (!c) return 0;
+    const uint64_t t = c->thread_id;
+    *tid = t; *lr = (uint32_t)c->lr; *sp = (uint32_t)c->gpr[1];
+    *sc_in = t < PS3_SC_INFLIGHT_MAX ? g_sc_inflight[t] : 0;
+    *sc_last = t < PS3_SC_INFLIGHT_MAX ? g_sc_last[t] : 0;
+    *callsite = ppu_thread_prof_pc((unsigned)t);
+    return 1;
+}
 
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
@@ -3308,7 +3470,12 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     PT_BEGIN(PT_SYSCALL, num);
 #endif
     { unsigned t = (unsigned)ctx->thread_id;
-      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = (uint32_t)num; }
+      if (t < PS3_SC_INFLIGHT_MAX) {
+          g_sc_arg[t][0] = (uint32_t)ctx->gpr[3]; g_sc_arg[t][1] = (uint32_t)ctx->gpr[4];
+#ifdef _WIN32
+          g_sc_t0[t] = (uint32_t)GetTickCount();
+#endif
+          g_sc_inflight[t] = (uint32_t)num; g_sc_last[t] = (uint32_t)num; } }
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall
      * callsite (lr) in the runtime-side thread info. cia itself is the thread
      * entry OPD (load-bearing for the entry trampoline) -- do not touch it. */

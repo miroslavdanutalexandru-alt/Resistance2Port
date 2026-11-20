@@ -24,6 +24,14 @@ int ps3_perf_on(const char* name, int def);
 extern volatile long g_guest_mem_seq;
 void ps3_guest_mem_notify(uint32_t ea);
 void ps3_guest_mem_notify_put(uint32_t ea);   /* SPU plain PUT; PS3_USLEEP_NOTIFY_PUT */
+
+/* PS3_USLEEP_WATCH: the game recognises a short sys_timer_usleep made by one
+ * of its poll loops (ctx = the ppu_context of the caller). Returns 0 = not a
+ * watched loop, 1 = the loop's condition is not met yet ([*lo,*hi) = the guest
+ * bytes it polls; the usleep blocks until an SPU store lands there or a
+ * timeout), 2 = already met (the usleep returns at once). Must be exact and
+ * side-effect free: it is called up to twice per usleep. */
+extern int (*volatile g_ps3_usleep_watch)(void* ctx, uint32_t* lo, uint32_t* hi);
 extern void (*volatile g_guest_mem_notify)(uint32_t ea);
 
 /* Per-host-thread wait accounting (the [thrcpu] table in debugtools.inc):

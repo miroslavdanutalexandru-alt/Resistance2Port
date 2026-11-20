@@ -37,7 +37,7 @@ extern "C" void spu_dbg_dump_ls(unsigned which, unsigned lsa, unsigned len, void
 static void dbg_out_str(const char* s) { dbg_printf("%s", s); }
 extern "C" volatile int g_port_trace_left;
 extern "C" volatile unsigned long long g_pad_inj_until;
-extern "C" volatile unsigned int g_pad_inj_btn, g_pad_inj_sticks;
+extern "C" volatile unsigned int g_pad_inj_btn, g_pad_inj_sticks, g_pad_inj_clear;
 extern "C" unsigned long long ps3_ms_now(void);
 /* While dump_threads holds a thread suspended, dbg_printf formats into this
  * buffer instead of a stream: the suspended thread may own stderr's CRT lock,
@@ -794,7 +794,20 @@ static void dbg_prof_frame_threads_cpu(unsigned sec)
  * second: main -> logical CPU PORT_MAIN_CPU (default 2), every other thread
  * of the process -> all CPUs except that one and its sibling (CPU ^ 1).
  * PORT_MAIN_CORE=0 disables. */
+extern "C" unsigned long spurs_synth_host_tid(void);   /* cellSpurs.c */
+/* What main_core_keeper decided, for the P-core placement (cpu_profile.inc, port_cpu_sets.h): state 0 = not yet,
+ * 1 = it hard-pins (rest = the mask every other thread gets), 2 = it does not pin. tid: the threads it pinned --
+ * main, RSX FIFO thread / rsx::thread, rawSPU0, audio synth lane. */
+extern "C" { volatile long port_keeper_state = 0; volatile unsigned long long port_keeper_rest = 0;
+             volatile unsigned long port_keeper_tid[4] = { 0, 0, 0, 0 }; }
+static DWORD main_core_keeper_pin(void);
 static DWORD WINAPI main_core_keeper(LPVOID)
+{
+    const DWORD r = main_core_keeper_pin();   /* returns only when it does not pin */
+    InterlockedExchange(&port_keeper_state, 2);
+    return r;
+}
+static DWORD main_core_keeper_pin(void)
 {
     SetThreadDescription(GetCurrentThread(), L"affinity keeper");
     const char* e = getenv("PORT_MAIN_CPU");
@@ -860,24 +873,69 @@ static DWORD WINAPI main_core_keeper(LPVOID)
         rest |= spair; smine = spair = 0;   /* keep >= 4 CPUs for everything else */
     }
     /* PORT_REST_SMT: what the "other threads" (SPURS lanes, rawSPU1, RSX
-     * workers, driver, audio) may run on. 0 (default) = only whole cores no
+     * workers, driver, audio) may run on. 0 = only whole cores no
      * hot thread owns -- every pinned hot thread keeps its SMT sibling idle.
      * 1 = also the siblings of the rawSPU0 and FIFO cores (2 more logical
      * CPUs on 6C/12T); 2 = also the main thread's sibling. More room for the
-     * SPURS lanes, at the cost of SMT contention on those hot threads. */
+     * SPURS lanes, at the cost of SMT contention on those hot threads.
+     * spu0 (R2 default when unset) = only the rawSPU0 core's sibling: rawSPU0
+     * is ~90% of a core of GETLLAR polling (native_hot_r2.md; with
+     * SPU_FAST_LLPOLL it pauses between polls), so a lane there runs ~1.18x
+     * slower (replay, 5600X: job 203 2013 -> 2369 us) instead of ~1.7x when
+     * two lanes share a rest core (-> 3448 us). The FIFO core's sibling stays
+     * idle: rsx::thread does real work. */
     const char* rs = getenv("PORT_REST_SMT");
-    const int rest_smt = rs ? atoi(rs) : 0;
+    const int rest_smt = (!rs || !*rs || !_stricmp(rs, "spu0")) ? -1 : atoi(rs);
+    if (rest_smt == -1) rest |= spair & ~smine;
     if (rest_smt >= 1) rest |= (fpair & ~fmine) | (spair & ~smine);
     if (rest_smt >= 2) rest |= pair & ~mine;
+    /* The SPURS audio synth lane (one lane, ~98% of realtime even on a 5600X:
+     * scratch\r2_audio_lowcore.md, scratch\cpu_nospin.md).
+     *   PORT_SYNTH_CPU=<cpu>: hard-pin it there; that whole core leaves the
+     *     rest mask (its SMT sibling stays idle), kept only while >= 4 CPUs
+     *     remain for everything else.
+     *   unset, exactly 12 logical CPUs (the 6C/12T profile): a soft ideal-
+     *     processor hint on the last whole core of the rest mask, away from
+     *     core 0's interrupts; it still runs anywhere in the rest mask.
+     *   unset, > 12 logical CPUs: nothing (as before).
+     * PORT_PLACE_AUDIO=0 = neither. */
+    const char* yae = getenv("PORT_PLACE_AUDIO");
+    const char* ye = getenv("PORT_SYNTH_CPU");
+    int ycpu = -1, yideal = -1;
+    DWORD_PTR ymine = 0;
+    if (!(yae && *yae && atoi(yae) == 0)) {
+        if (ye && *ye && atoi(ye) >= 0 && atoi(ye) < 64) {
+            ycpu = atoi(ye);
+            const DWORD_PTR ym = (DWORD_PTR)1 << ycpu, yp = ym | core_of(ycpu);
+            const DWORD_PTR left = rest & ~yp;
+            if ((proc & ym) && !(yp & (pair | fpair | spair)) && (!pm || (pm & ym)) &&
+                (pm ? port_popcount_dt(left & pm) : port_popcount_dt(left)) >= 4) { ymine = ym; rest = left; }
+            else fprintf(stderr, "[affinity] PORT_SYNTH_CPU=%d unusable (hot core, outside the mask or < 4 CPUs left): not pinned%c", ycpu, 10);
+        } else if (!(ye && *ye) && nlog == 12) {
+            for (int c = 63; c >= 0 && yideal < 0; c--) {
+                const int f = topo_cpu(c, -1);
+                if (f < 0 || f >= 64) continue;
+                const DWORD_PTR cm = core_of(f);
+                if ((cm & rest) == cm && (!pm || (pm >> f & 1))) yideal = f;
+            }
+        }
+    }
     if (!(proc & mine) || !rest) return 0;
     /* Thread snapshot every 1 s while threads keep appearing, then every
      * PORT_KEEPER_MS (default 5000) -- each snapshot walks every thread of the
      * system, and at 1 Hz the two keepers were 4-7% CPU each. */
     const char* ke = getenv("PORT_KEEPER_MS");
     const DWORD idle_ms = ke && atoi(ke) >= 250 ? (DWORD)atoi(ke) : 5000;
-    fprintf(stderr, "[affinity] main thread %lu -> CPU %d, RSX FIFO/rsx::thread -> CPU %d, rawSPU0 -> CPU %d, other threads -> mask 0x%llX (rescan %lu ms, PORT_PIN_TOPO=%d PORT_REST_SMT=%d)%c",
+    fprintf(stderr, "[affinity] main thread %lu -> CPU %d, RSX FIFO/rsx::thread -> CPU %d, rawSPU0 -> CPU %d, other threads -> mask 0x%llX     (rescan %lu ms, PORT_PIN_TOPO=%d PORT_REST_SMT=%s)%c",
             (unsigned long)s_dbg_main_tid, cpu, fmine ? fcpu : -1, smine ? scpu : -1, (unsigned long long)rest,
-            (unsigned long)idle_ms, topo, rest_smt, 10);
+                (unsigned long)idle_ms, topo, rest_smt == -1 ? "spu0" : rest_smt >= 2 ? "2" : rest_smt == 1 ? "1" : "0", 10);
+    if (ymine || yideal >= 0)
+        fprintf(stderr, "[affinity] audio synth lane -> %s CPU %d (PORT_SYNTH_CPU=<cpu> pins, PORT_PLACE_AUDIO=0 off)%c",
+                ymine ? "pinned to" : "ideal", ymine ? ycpu : yideal, 10);
+    port_keeper_rest = (unsigned long long)rest;
+    port_keeper_tid[0] = s_dbg_main_tid;
+    InterlockedExchange(&port_keeper_state, 1);
+    DWORD syn_done = 0;
     typedef HRESULT (WINAPI* gtd_t)(HANDLE, PWSTR*);
     static gtd_t gtd = (gtd_t)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
     DWORD fifo_done = 0, spu0_done = 0;
@@ -892,8 +950,26 @@ static DWORD WINAPI main_core_keeper(LPVOID)
         const DWORD stid = smine ? (DWORD)spu_raw_host_tid(0) : 0;
         if (stid && stid != spu0_done) {
             HANDLE sh = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, stid);
-            if (sh) { SetThreadAffinityMask(sh, smine); CloseHandle(sh); spu0_done = stid; fresh = 1;
+            if (sh) { SetThreadAffinityMask(sh, smine); CloseHandle(sh); spu0_done = stid; fresh = 1; port_keeper_tid[2] = stid;
                       fprintf(stderr, "[affinity] rawSPU0 thread %lu pinned to CPU %d%c", (unsigned long)stid, scpu, 10); }
+        }
+        const DWORD ytid = (ymine || yideal >= 0) ? (DWORD)spurs_synth_host_tid() : 0;
+        if (ytid && ytid != syn_done && ytid != stid && ytid != s_dbg_main_tid) {
+            HANDLE yh = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, ytid);
+            if (yh) {
+                if (ymine) SetThreadAffinityMask(yh, ymine);
+                else SetThreadIdealProcessor(yh, (DWORD)yideal);
+                CloseHandle(yh);
+                /* the list moved to another lane: the old one rejoins the rest */
+                if (ymine && syn_done) {
+                    HANDLE oh = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, syn_done);
+                    if (oh) { SetThreadAffinityMask(oh, rest); CloseHandle(oh); }
+                }
+                syn_done = ytid; fresh = 1;
+                if (ymine) port_keeper_tid[3] = ytid;
+                fprintf(stderr, "[affinity] audio synth lane thread %lu %s CPU %d%c", (unsigned long)ytid,
+                        ymine ? "pinned to" : "ideal", ymine ? ycpu : yideal, 10);
+            }
         }
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         THREADENTRY32 te; te.dwSize = sizeof te;
@@ -902,10 +978,11 @@ static DWORD WINAPI main_core_keeper(LPVOID)
                 if (te.th32OwnerProcessID != pid) continue;
                 const DWORD tid = te.th32ThreadID;
                 if (tid == stid) continue;
+                if (ymine && tid == syn_done) continue;
                 if (ftid && tid == ftid) {
                     if (fifo_done != ftid) {
                         HANDLE fh = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, ftid);
-                        if (fh) { SetThreadAffinityMask(fh, fmine); CloseHandle(fh); fifo_done = ftid; fresh = 1;
+                        if (fh) { SetThreadAffinityMask(fh, fmine); CloseHandle(fh); fifo_done = ftid; fresh = 1; port_keeper_tid[1] = ftid;
                                   fprintf(stderr, "[affinity] RSX FIFO thread %lu pinned to CPU %d%c", (unsigned long)ftid, fcpu, 10); }
                     }
                     continue;
@@ -922,7 +999,7 @@ static DWORD WINAPI main_core_keeper(LPVOID)
                 if (gtd && SUCCEEDED(gtd(th, &d)) && d && d[0]) { named = 1; is_rsx = !wcscmp(d, L"rsx::thread"); }
                 if (d) LocalFree(d);
                 if (is_rsx && fmine && !fifo_done) {
-                    SetThreadAffinityMask(th, fmine); fifo_done = tid;
+                    SetThreadAffinityMask(th, fmine); fifo_done = tid; port_keeper_tid[1] = tid;
                     fprintf(stderr, "[affinity] rsx::thread %lu pinned to CPU %d%c", (unsigned long)tid, fcpu, 10);
                 } else if (k == nd) {
                     SetThreadAffinityMask(th, tid == s_dbg_main_tid ? mine : rest);
@@ -1311,7 +1388,7 @@ static DWORD WINAPI debug_console(LPVOID param)
             /* pad <hexbuttons> <lx> <ly> <rx> <ry> <ms>: hold on port 0 (sticks 0..255, 128 = centre) */
             unsigned bt = 0, lx = 128, ly = 128, rx = 128, ry = 128, ms = 500;
             sscanf(cmd, "%*s %x %u %u %u %u %u", &bt, &lx, &ly, &rx, &ry, &ms);
-            g_pad_inj_btn = bt; g_pad_inj_sticks = ((lx & 255) << 24) | ((ly & 255) << 16) | ((rx & 255) << 8) | (ry & 255);
+            g_pad_inj_clear = 0; g_pad_inj_btn = bt; g_pad_inj_sticks = ((lx & 255) << 24) | ((ly & 255) << 16) | ((rx & 255) << 8) | (ry & 255);
             g_pad_inj_until = ps3_ms_now() + ms;
             dbg_printf("  pad btn=0x%04X l=(%u,%u) r=(%u,%u) for %u ms%c", bt, lx, ly, rx, ry, ms, 10);
         } else if (!strcmp(verb, "spu")) {

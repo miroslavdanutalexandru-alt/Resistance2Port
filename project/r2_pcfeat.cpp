@@ -8,6 +8,8 @@
 //
 // R2_OVERLAY   unset: off, F3 toggles | 1: on at start, F3 toggles | 0: off and F3 does nothing
 // R2_OVERLAY_POS  tl (default) | tr | bl | br  corner of the game window
+// PORT_OVERLAY_GRAPH  1 (default): a frame-time graph (last 120 frames) under the text | 0: text only
+// PORT_UI_SCALE   auto (by output height) | 75..200: size of the overlay, toasts and hints (port_osd.h)
 //
 // Lines: game fps and frame time (avg / worst over the last 0.5 s, from the game's frame
 // limiter), RSX (GPU-side) frames per second, draws per frame and the average CPU time per draw
@@ -15,6 +17,7 @@
 //
 // Exports for the in-game PC Options menu: r2pf_overlay_get / r2pf_overlay_set,
 // r2pf_toast(title, text, badge) (queued, 5 s each, top-right),
+// r2pf_trophy(line1, name, grade, trp, id) (PS3-style trophy pop-up in the same queue, port_trophy_popup.h),
 // r2pf_hint(title, text, ms) (own panel at the bottom, shown at once, replaces the previous hint).
 //
 // r2pf_status(text): a centred status panel ("Compiling shaders N / M" with a progress bar) shown
@@ -39,6 +42,7 @@
 #include <algorithm>
 
 #include "port_osd.h"
+#include "port_trophy_popup.h"
 
 extern "C" void* g_kbm_hwnd;                                                        // cellPad.c
 extern "C" void r2rsx_prof_enable(int on);                                          // r2rsx_bridge.cpp
@@ -54,9 +58,14 @@ std::atomic<int> s_thread_started{0};
 // Game frame times (QPC ticks between r2_frame_period calls)
 std::mutex s_ft_mtx;
 double s_ft_sum = 0, s_ft_max = 0; int s_ft_n = 0;
+PcxFtRing s_ft_ring = {};            // F3 frame-time graph (PORT_OVERLAY_GRAPH), under s_ft_mtx
+std::atomic<int> s_graph{1};
+int s_ui_pct = 100;                  // PORT_UI_SCALE for the fixed-pixel panels, ui thread only
 LARGE_INTEGER s_qpf;
 
-struct Toast { std::wstring title, text; char badge; };
+// trophy: a PS3-style trophy pop-up (port_trophy_popup.h; title = its first line, text = the name,
+// badge = the grade) with the icon TROPnnn.PNG of trophy `tid` from `trp` when that reads
+struct Toast { std::wstring title, text; char badge; bool trophy = false; std::string trp; int tid = -1; };
 std::mutex s_toast_mtx;
 std::deque<Toast> s_toasts;
 
@@ -86,7 +95,7 @@ bool game_visible(RECT& client_screen)
 }
 
 // ---- overlay ----
-HWND s_ov = nullptr, s_tw = nullptr, s_hw = nullptr;
+HWND s_ov = nullptr, s_tw = nullptr, s_hw = nullptr, s_pw = nullptr;   // s_pw: trophy pop-up (per-pixel alpha)
 HFONT s_font = nullptr, s_font_b = nullptr, s_font_badge = nullptr;
 wchar_t s_ov_text[512] = L"";
 int s_ov_w = 0, s_ov_h = 0;
@@ -100,6 +109,7 @@ void ov_measure()
     SelectObject(dc, of);
     DeleteDC(dc);
     s_ov_w = r.right + 16; s_ov_h = r.bottom + 10;
+    if (s_graph) s_ov_h += pcx_ui_px(48, s_ui_pct) + 6;
 }
 
 void paint_ov(HDC dc, const RECT& rc)
@@ -112,6 +122,36 @@ void paint_ov(HDC dc, const RECT& rc)
     RECT t{ 8, 5, rc.right - 4, rc.bottom - 2 };
     DrawTextW(dc, s_ov_text, -1, &t, DT_NOPREFIX);
     SelectObject(dc, of);
+    if (!s_graph) return;
+    // frame-time graph: one bar per frame, green / yellow (> 20 ms) / red (> 40 ms); lines at 16.7 and 33.3 ms
+    PcxFtRing r;
+    { std::lock_guard<std::mutex> lk(s_ft_mtx); r = s_ft_ring; }
+    const int gh = pcx_ui_px(48, s_ui_pct), gx = 8, gy = rc.bottom - gh - 6, gw = rc.right - 16;
+    if (gw < 8 || gh < 8) return;
+    HBRUSH gb = CreateSolidBrush(RGB(24, 28, 34));
+    RECT g{ gx, gy, gx + gw, gy + gh };
+    FillRect(dc, &g, gb); DeleteObject(gb);
+    const float top = pcx_ft_ceiling(&r);
+    HBRUSH ln = CreateSolidBrush(RGB(70, 76, 86));
+    for (float m : { 16.7f, 33.3f }) {
+        if (m >= top) continue;
+        const int ly = gy + gh - (int)(gh * m / top);
+        RECT l{ gx, ly, gx + gw, ly + 1 };
+        FillRect(dc, &l, ln);
+    }
+    DeleteObject(ln);
+    HBRUSH col[3] = { CreateSolidBrush(RGB(110, 220, 110)), CreateSolidBrush(RGB(235, 200, 70)), CreateSolidBrush(RGB(240, 80, 70)) };
+    const unsigned n = r.count;
+    for (unsigned i = 0; i < n; i++) {
+        const float v = pcx_ft_at(&r, i);
+        int bh = (int)(gh * std::min(v, top) / top + 0.5f);
+        if (bh < 1) bh = 1;
+        const int x0 = gx + (int)((long long)gw * (PCX_FT_N - n + i) / PCX_FT_N);
+        const int x1 = std::max(x0 + 1, gx + (int)((long long)gw * (PCX_FT_N - n + i + 1) / PCX_FT_N));
+        RECT b{ x0, gy + gh - bh, x1, gy + gh };
+        FillRect(dc, &b, col[v > 40.0f ? 2 : v > 20.0f ? 1 : 0]);
+    }
+    for (HBRUSH b : col) DeleteObject(b);
 }
 
 LRESULT layer_msg(HWND h, UINT m, WPARAM w, LPARAM l, void (*paint)(HDC, const RECT&))
@@ -184,7 +224,20 @@ bool game_shown(RECT& client_screen)
 
 // ---- toast and hint ----
 Toast s_cur; bool s_cur_on = false; ULONGLONG s_cur_t0 = 0, s_prev_now = 0;
-const int TW = 360, TH = 72;
+int TW = 360, TH = 72;              // times PORT_UI_SCALE (ui_thread)
+
+// Trophy pop-up pixels (straight alpha) of s_cur, rendered when it comes up; empty for plain toasts.
+ptp::Image s_pop;
+
+void render_trophy(int ch)
+{
+    ptp::Popup p;
+    p.line1 = s_cur.title; p.name = s_cur.text; p.grade = s_cur.badge;
+    if (!s_cur.trp.empty() && !ptp::trp_icon(s_cur.trp.c_str(), s_cur.tid, p.icon))
+        fprintf(stderr, "[trophy] no icon for #%d in %s: the pop-up draws a cup\n", s_cur.tid, s_cur.trp.c_str());
+    const int pct = posd_ui_scale(false, ch);   // 100 unless PORT_UI_SCALE is set
+    if (!ptp::render(p, ptp::panel_height(ch, pct == 100 ? 0 : pct), 0, s_pop)) s_pop = ptp::Image();
+}
 
 // Hints (r2pf_hint) have their own panel: they show at once instead of queueing behind toasts.
 std::mutex s_hint_mtx;
@@ -208,27 +261,28 @@ void paint_toast(HDC dc, const RECT& rc, const Toast& t)
     FillRect(dc, &rc, bg); DeleteObject(bg);
     const COLORREF bc = badge_color(t.badge);
     HBRUSH bar = CreateSolidBrush(bc);
-    RECT strip{ 0, 0, 4, rc.bottom }; FillRect(dc, &strip, bar);
+    auto U = [](int px) { return pcx_ui_px(px, s_ui_pct); };
+    RECT strip{ 0, 0, U(4), rc.bottom }; FillRect(dc, &strip, bar);
     // badge: a filled circle with the grade letter
     HGDIOBJ ob = SelectObject(dc, bar);
     HPEN pen = CreatePen(PS_SOLID, 1, bc); HGDIOBJ op = SelectObject(dc, pen);
     const int cy = rc.bottom / 2;
-    Ellipse(dc, 16, cy - 20, 56, cy + 20);
+    Ellipse(dc, U(16), cy - U(20), U(56), cy + U(20));
     SelectObject(dc, op); DeleteObject(pen);
     SelectObject(dc, ob); DeleteObject(bar);
     SetBkMode(dc, TRANSPARENT);
     HGDIOBJ of = SelectObject(dc, s_font_badge);
     SetTextColor(dc, RGB(20, 22, 28));
     wchar_t letter[2] = { (wchar_t)(t.badge ? t.badge : L'i'), 0 };
-    RECT br{ 16, cy - 20, 56, cy + 20 };
+    RECT br{ U(16), cy - U(20), U(56), cy + U(20) };
     DrawTextW(dc, letter, 1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(dc, s_font_b);
     SetTextColor(dc, RGB(235, 235, 240));
-    RECT t1{ 68, 10, rc.right - 10, 32 };
+    RECT t1{ U(68), U(10), rc.right - U(10), U(32) };
     DrawTextW(dc, t.title.c_str(), -1, &t1, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     SelectObject(dc, s_font);
     SetTextColor(dc, RGB(175, 180, 190));
-    RECT t2{ 68, 34, rc.right - 10, rc.bottom - 6 };
+    RECT t2{ U(68), U(34), rc.right - U(10), rc.bottom - U(6) };
     DrawTextW(dc, t.text.c_str(), -1, &t2, DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
     SelectObject(dc, of);
 }
@@ -311,12 +365,20 @@ void ui_thread()
 {
     QueryPerformanceFrequency(&s_qpf);
     while (!g_kbm_hwnd) Sleep(250);
-    s_font = CreateFontW(-15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
-    s_font_b = CreateFontW(-17, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    s_font_badge = CreateFontW(-22, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    {
+        int gw = 0, gh = 0;
+        posd_client_size(game_hwnd(), &gw, &gh);
+        if (gh < 1) gh = GetSystemMetrics(SM_CYSCREEN);
+        s_ui_pct = posd_ui_scale(true, gh);   // fixed at start: the fonts and panel sizes below
+        TW = pcx_ui_px(360, s_ui_pct); TH = pcx_ui_px(72, s_ui_pct);
+    }
+    s_font = CreateFontW(-pcx_ui_px(15, s_ui_pct), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
+    s_font_b = CreateFontW(-pcx_ui_px(17, s_ui_pct), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    s_font_badge = CreateFontW(-pcx_ui_px(22, s_ui_pct), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     s_ov = make_layer(L"R2PortPerfOverlay", ov_proc);
     s_sw = make_layer(L"R2PortStatus", status_proc);
     s_tw = make_layer(L"R2PortToast", toast_proc);
+    s_pw = ptp::ulw_create(L"R2PortTrophy");
     s_hw = make_layer(L"R2PortHint", hint_proc);
     const char* pos = getenv("R2_OVERLAY_POS");
     const bool right = pos && (pos[1] == 'r' || pos[1] == 'R'), bottom = pos && (pos[0] == 'b' || pos[0] == 'B');
@@ -330,7 +392,7 @@ void ui_thread()
         const bool osd = posd_on() != 0;
         if (osd != osd_was) {
             osd_was = osd;
-            if (osd) { hide(s_ov); hide(s_sw); hide(s_tw); hide(s_hw); }
+            if (osd) { hide(s_ov); hide(s_sw); hide(s_tw); hide(s_hw); hide(s_pw); }
             else for (int s : { POSD_PERF, POSD_STATUS, POSD_TOAST, POSD_HINT }) r2rsx_osd_hide(s);
         }
         RECT cs{};
@@ -349,8 +411,12 @@ void ui_thread()
             const ULONGLONG before = GetTickCount64();
             static ULONGLONG painted = 0;
             static int osd_cw = 0, osd_ch = 0;
-            const bool repaint = before - painted >= 500;
-            if (repaint) { update_overlay_text(true); ov_measure(); painted = before; }
+            static ULONGLONG text_t = 0;
+            const bool repaint = before - painted >= (s_graph ? 100u : 500u);   // the graph scrolls at 10 Hz
+            if (repaint) {
+                if (before - text_t >= 500) { update_overlay_text(true); text_t = before; }
+                ov_measure(); painted = before;
+            }
             const int x = right ? cw - s_ov_w - 8 : 8, y = bottom ? ch - s_ov_h - 8 : 8;
             if (osd) {
                 if (repaint || cw != osd_cw || ch != osd_ch || !r2rsx_osd_visible(POSD_PERF)) {
@@ -388,17 +454,39 @@ void ui_thread()
             else hide(s_sw);
         }
 
-        // toasts: 5 s each, the last 0.6 s fading out; queued while the game is in the background
+        // toasts: 5 s each, the last 0.6 s fading out; trophy pop-ups ptp::LIFE_MS, sliding in from the
+        // window edge; queued while the game is in the background
         const ULONGLONG now = GetTickCount64();
         bool fading = false;
         if (s_tw) {
-            if (s_cur_on && now - s_cur_t0 > 5000) { s_cur_on = false; hide(s_tw); r2rsx_osd_hide(POSD_TOAST); }
+            const ULONGLONG life = s_cur.trophy && !s_pop.empty() ? ptp::LIFE_MS : 5000;
+            if (s_cur_on && now - s_cur_t0 > life) { s_cur_on = false; hide(s_tw); hide(s_pw); r2rsx_osd_hide(POSD_TOAST); }
             bool fresh = false;
             if (!s_cur_on && vis) {
-                std::lock_guard<std::mutex> lk(s_toast_mtx);
-                if (!s_toasts.empty()) { s_cur = s_toasts.front(); s_toasts.pop_front(); s_cur_on = true; s_cur_t0 = now; fresh = true; InvalidateRect(s_tw, nullptr, TRUE); }
+                {
+                    std::lock_guard<std::mutex> lk(s_toast_mtx);
+                    if (!s_toasts.empty()) { s_cur = s_toasts.front(); s_toasts.pop_front(); s_cur_on = true; s_cur_t0 = now; fresh = true; }
+                }
+                if (fresh) {
+                    s_pop = ptp::Image();
+                    if (s_cur.trophy) render_trophy(ch);   // outside the lock: reads the icon from TROPHY.TRP
+                    InvalidateRect(s_tw, nullptr, TRUE);
+                }
             }
-            if (s_cur_on && vis) {
+            const ULONGLONG cur_life = s_cur.trophy && !s_pop.empty() ? ptp::LIFE_MS : 5000;
+            if (s_cur_on && vis && !s_pop.empty()) {
+                const ULONGLONG age = now - s_cur_t0;
+                int dx = 0;
+                const float fa = ptp::anim(age, cur_life, s_pop.h, &dx);
+                fading = age < ptp::IN_MS || age + ptp::OUT_MS > cur_life;
+                const int m = ptp::margin(s_pop.h);
+                const int x = right ? m - dx : cw - s_pop.w - m + dx, y = m;   // opposite corner to the overlay
+                if (osd) {
+                    if (fresh || !r2rsx_osd_visible(POSD_TOAST)) r2rsx_osd_layer(POSD_TOAST, s_pop.px.data(), s_pop.w, s_pop.h, x, y, cw, ch, fa);
+                    else posd_move(POSD_TOAST, x, y, cw, ch, fa);
+                } else if (fresh || !IsWindowVisible(s_pw)) ptp::ulw_show(s_pw, s_pop, cs.left + x, cs.top + y, fa);
+                else ptp::ulw_move(s_pw, cs.left + x, cs.top + y, fa);
+            } else if (s_cur_on && vis) {
                 const ULONGLONG age = now - s_cur_t0;
                 const int a = fade_alpha(age, 5000);
                 fading = age < 200 || age > 4400;
@@ -413,7 +501,7 @@ void ui_thread()
                     SetLayeredWindowAttributes(s_tw, 0, (BYTE)std::max(a, 0), LWA_ALPHA);
                     place(s_tw, cs.left + x, cs.top + y, TW, TH);
                 }
-            } else if (!vis && s_cur_on) { s_cur_t0 += now - s_prev_now; hide(s_tw); r2rsx_osd_hide(POSD_TOAST); }   // paused in the background
+            } else if (!vis && s_cur_on) { s_cur_t0 += now - s_prev_now; hide(s_tw); hide(s_pw); r2rsx_osd_hide(POSD_TOAST); }   // paused in the background
             s_prev_now = now;
         }
 
@@ -450,7 +538,7 @@ void ui_thread()
         }
 
         if (osd) r2rsx_osd_refresh();   // re-asks for a present if the game is parked (pause menus)
-        Sleep(osd && fading ? 16 : st_on ? 50 : s_overlay || s_cur_on || s_hint_on ? 33 : 100);
+        Sleep((osd || !s_pop.empty()) && fading ? 16 : st_on ? 50 : s_overlay || s_cur_on || s_hint_on ? 33 : 100);
     }
 }
 
@@ -466,6 +554,8 @@ struct PcFeatInit {
         const char* e = getenv("R2_OVERLAY");
         if (e && *e == '0') s_overlay_allowed = 0;
         else if (e && *e == '1') s_overlay = 1;
+        const char* g = getenv("PORT_OVERLAY_GRAPH");
+        s_graph = !(g && *g == '0');
         start_thread();
     }
 } s_init;
@@ -482,6 +572,7 @@ extern "C" void r2pf_frame_tick(void)
         if (ms < 1000.0) {
             std::lock_guard<std::mutex> lk(s_ft_mtx);
             s_ft_sum += ms; s_ft_n++; if (ms > s_ft_max) s_ft_max = ms;
+            pcx_ft_push(&s_ft_ring, (float)ms);
         }
     }
     last = now;
@@ -489,6 +580,7 @@ extern "C" void r2pf_frame_tick(void)
 
 extern "C" int r2pf_overlay_get(void) { return s_overlay; }
 extern "C" void r2pf_overlay_set(int on) { if (s_overlay_allowed) s_overlay = on ? 1 : 0; }
+extern "C" void r2pf_overlay_graph_set(int on) { s_graph = on ? 1 : 0; }
 
 // Start-up status panel: "Compiling shaders 120 / 1500" (UTF-8). A trailing "N / M" also drives the
 // progress bar; an optional second line after '\n' replaces the subtitle. NULL or "" hides the panel
@@ -521,6 +613,17 @@ extern "C" void r2pf_toast(const char* title, const char* text, char badge)
 {
     std::lock_guard<std::mutex> lk(s_toast_mtx);
     if (s_toasts.size() < 32) s_toasts.push_back({ widen(title), widen(text), badge });
+}
+
+// A PS3-style trophy pop-up (port_trophy_popup.h), queued with the toasts: line1 ("You have earned a
+// trophy."), the trophy's name (UTF-8) and grade 'P' 'G' 'S' 'B'; the icon is TROPnnn.PNG of trophy_id
+// from the TROPHY.TRP at trp (NULL / unreadable: a cup in the grade's colour).
+extern "C" void r2pf_trophy(const char* line1, const char* name, char grade, const char* trp, int trophy_id)
+{
+    Toast t{ widen(line1), widen(name), grade };
+    t.trophy = true; t.trp = trp ? trp : ""; t.tid = trophy_id;
+    std::lock_guard<std::mutex> lk(s_toast_mtx);
+    if (s_toasts.size() < 32) s_toasts.push_back(std::move(t));
 }
 
 // A hint at the game window's lower corner for `ms` (at least 1 s), shown at once in its own panel

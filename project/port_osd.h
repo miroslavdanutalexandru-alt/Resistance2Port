@@ -8,7 +8,9 @@
 #endif
 #include <windows.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include "ps3emu/port_pc_extras.h"
 
 extern "C" {
 int  r2rsx_osd_wanted(void);
@@ -29,7 +31,7 @@ enum {
     POSD_HINT = 3,     // time-critical hints, e.g. the cutscene skip (pcfeat r2pf_hint)
     POSD_XMENU = 4,    // More PC Options, photo-mode note, controller pause (pcextra)
     POSD_XHAIR = 5,    // crosshair (pcextra)
-    POSD_PCMENU = 6,   // PC menu, quit prompt, screenshot toast, F10 hint (pcport)
+    POSD_PCMENU = 6,   // PC menu, quit prompt, screenshot toast (pcport)
 };
 
 // Swapchain OSD in use right now (PORT_OSD not "layered", the RPCS3 renderer, a first present done).
@@ -102,6 +104,34 @@ struct PosdCanvas {
 inline void posd_move(int slot, int x, int y, int ref_w, int ref_h, float alpha)
 {
     r2rsx_osd_layer(slot, NULL, 0, 0, x, y, ref_w, ref_h, alpha);
+}
+
+// PORT_UI_SCALE=auto|75..200 (launcher, F9 "UI scale"): the PC menus and overlays. Panels sized from
+// the window already follow the resolution, so auto = 100% for them; fixed-pixel panels (F3
+// overlay, toasts) grow with the output height in auto (ps3emu/port_pc_extras.h).
+inline volatile int g_posd_ui_scale = -1;   // -1 unread, 0 auto, else percent
+inline void posd_ui_scale_set(const char* v) { g_posd_ui_scale = pcx_ui_scale_parse(v); }
+inline int posd_ui_scale(bool fixed_px, int out_h)
+{
+    if (g_posd_ui_scale < 0) posd_ui_scale_set(getenv("PORT_UI_SCALE"));
+    const int s = g_posd_ui_scale;
+    return s > 0 ? s : fixed_px ? pcx_ui_scale_pct(0, out_h) : 100;
+}
+// Scale a panel about its centre (keep_top: about its top edge), kept inside the client area.
+inline void posd_ui_scale_rect(int* x, int* y, int* w, int* h, int cw, int ch, bool keep_top = false)
+{
+    const int s = posd_ui_scale(false, ch);
+    if (s == 100) return;
+    int w2 = pcx_ui_px(*w, s), h2 = pcx_ui_px(*h, s);
+    if (w2 > cw) w2 = cw;
+    if (h2 > ch) h2 = ch;
+    *x -= (w2 - *w) / 2;
+    if (!keep_top) *y -= (h2 - *h) / 2;
+    if (*x < 0) *x = 0;
+    if (*y < 0) *y = 0;
+    if (*x + w2 > cw) *x = cw - w2;
+    if (*y + h2 > ch) *y = ch - h2;
+    *w = w2; *h = h2;
 }
 
 // Screenshots: hide every OSD layer and wait (bounded) until a frame without them was presented.

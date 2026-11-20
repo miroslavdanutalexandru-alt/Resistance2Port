@@ -64,6 +64,14 @@ static void* late_sink(void* u) { (void)u; usleep(200 * 1000); s_sink(s_late.fd,
 static void start_late_sink(void) { pthread_t t; pthread_create(&t, NULL, late_sink, NULL); pthread_detach(t); }
 #endif
 
+static int test_resolve_hook(const char* name, uint32_t* ip_out)
+{
+    static const uint8_t ip[4] = { 192, 0, 2, 7 };
+    if (strcmp(name, "redirect.test")) return 0;
+    memcpy(ip_out, ip, 4);
+    return 1;
+}
+
 static unsigned int bump_alloc(unsigned int size, unsigned int align)
 {
     static unsigned int top = 0x80000;
@@ -207,6 +215,12 @@ int main(void)
     uint32_t h = (uint32_t)call("gethostbyname", STR, 0, 0, 0, 0, 0);
     assert(h && vm_read32(h + 12) == 4);
     assert(vm_read32(vm_read32(vm_read32(h + 16))) == LOOP);   /* *h_addr_list[0] */
+    /* PORT_ONLINE redirection: the hook's address wins over the system resolver. */
+    g_net_resolve_hook = test_resolve_hook;
+    strcpy((char*)vm_base + STR, "redirect.test");
+    h = (uint32_t)call("gethostbyname", STR, 0, 0, 0, 0, 0);
+    assert(h && vm_read32(vm_read32(vm_read32(h + 16))) == 0xC0000207u);   /* 192.0.2.7 */
+    g_net_resolve_hook = NULL;
 
     /* P2P: the title binds its own IP and port 3658 with vport 1000; the host
      * socket lands on this instance's P2P port on every interface, so a peer
