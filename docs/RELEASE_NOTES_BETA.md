@@ -1,12 +1,20 @@
 # Resistance 2 PC port: community beta release notes
 
-**Version:** 0.3.0-beta (GitHub pre-release). **Release date:** 2026-11-20.
+**Version:** 0.3.0-beta.1 (GitHub pre-release). **Release date:** 2026-11-21.
 
 A native PC port of *Resistance 2* (PS3) built by static recompilation: the game's PowerPC and SPU code is translated to C/C++ and compiled for Windows. Graphics go through RPCS3's Vulkan renderer, built into the game as a library.
 
 > **No game files and no prebuilt game are included.** This release is the source code plus Setup. You need your own legally dumped copy of the game (see *Install*); Setup builds the game on your PC from that copy.
 
 This is a **beta**. The campaign has been played through the opening Iceland levels on one PC (Ryzen 5 5600X, GeForce RTX 5070, Windows 11). Later levels are untested. Please report what you find (see *Reporting problems*).
+
+## 0.3.0-beta.1 (hotfix)
+
+Setup fix only; the game itself is unchanged from 0.3.0.
+
+- **Updating over a 0.2.x install no longer fails** with `'Emu/RSX/port_texdiag.h' file not found` while building the RSX core (Resistance2Port #17, Resistance3Port #24). Setup kept the RPCS3 source folder from 0.2.x (`ps3recomp\third_party\rpcs3`) and never applied 0.3.0's patch to it. It now detects a source patched by an older version and patches it again automatically (the old changes are kept in git's stash there; a copy that is not a git checkout is downloaded again). `build.bat` also checks the patch before building.
+
+If you installed 0.3.0 fresh and it built, you don't need this update.
 
 ## 0.3.0-beta
 
