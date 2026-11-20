@@ -67,6 +67,14 @@ if "%PGOMODE%"=="use" if %CLANGMAJ% LSS 22 (
 )
 
 echo Building the RPCS3 RSX core...
+rem An update keeps ps3recomp\third_party\rpcs3: when it lacks a file this version's patch adds (it was patched by an
+rem older version, R2 issue #17), re-apply the patch first. Setup.bat does this before every build anyway.
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\fetch_rpcs3.ps1" -CheckFiles
+if errorlevel 1 (
+  echo Re-applying the port's RPCS3 patch...
+  "%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\fetch_rpcs3.ps1"
+  if errorlevel 1 (echo Could not update the RPCS3 source - see logs\fetch_rpcs3.log, then run Setup.bat again. & goto fail)
+)
 rem RSX code generation (output-identical: /fp:precise, no FMA contraction): AVX2 + ThinLTO + /GS-.
 rem The exe already needs AVX2 (lifted code); set PORT_RSX_ARCH=generic / PORT_RSX_LTO=0 for the old build.
 if not defined PORT_RSX_ARCH set "PORT_RSX_ARCH=AVX2"

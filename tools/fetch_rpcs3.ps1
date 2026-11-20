@@ -24,6 +24,7 @@ param(
     [switch]$NoArchive,           # never fall back to GitHub's source archives
     [string]$Patch = '',          # default: the one ps3recomp\patches\*-rpcs3.patch
     [string]$Manifest = (Join-Path $PSScriptRoot '..\tools_cache\installed_by_setup.txt'),
+    [switch]$CheckFiles,          # only check that every file the patch adds is there (build.bat); exit 1 if not
     [switch]$Library
 )
 $ErrorActionPreference = 'Stop'
@@ -330,6 +331,63 @@ function Add-PortPatch([string]$Work, [string]$Mode, [string]$Patch) {
     Set-Stamp $Work 'patch' $hash
     return $true
 }
+function Get-MissingPatchFiles([string]$Dir, [string]$Patch) {
+    @(Get-PatchNewFiles $Patch | Where-Object { -not (Test-Path -LiteralPath (Join-Path $Dir ($_ -replace '/', '\'))) })
+}
+# A source that is already there may have been patched by an older version of the port: an update and a new release
+# unpacked over an old one keep ps3recomp\third_party\rpcs3 (R2 issue #17, R3 #24: port_texdiag.h missing after
+# updating 0.2.x to 0.3.0). Re-applies this version's patch when it is not the one applied. Returns 'current',
+# 'repatched' or 'redownload' (it cannot be repaired in place: no git repository of the pinned commit).
+function Update-PatchedSource([string]$Dest, [string]$Patch) {
+    $hash = (Get-FileHash -LiteralPath $Patch -Algorithm SHA256).Hash
+    $missing = Get-MissingPatchFiles $Dest $Patch
+    if ((Test-Stamp $Dest 'patch' $hash) -and -not $missing.Count) { Write-Host "   RPCS3 source already present."; return 'current' }
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw "git was not found. Install Git (winget install Git.Git) and run Setup again." }
+    Write-FetchLog "   ---- fetch_rpcs3 $(Get-Date -Format s): checking the RPCS3 source in $Dest" -Quiet
+    # Only $Dest's own repository (or none) is used, never the port folder's when the port is a git checkout.
+    $ceiling = $env:GIT_CEILING_DIRECTORIES
+    $env:GIT_CEILING_DIRECTORIES = Split-Path $Dest
+    try {
+        if (-not $missing.Count -and (Test-GitOk @('-C', $Dest, 'apply', '-R', '--check', '--whitespace=nowarn', $Patch))) {
+            Set-Stamp $Dest 'patch' $hash   # this patch is applied (a source from before the stamp was kept)
+            Write-Host "   RPCS3 source already present."
+            return 'current'
+        }
+        Write-FetchLog "   The RPCS3 source was patched by another version of the port. Applying this version's patch..."
+        $head = ''
+        if (Test-Path -LiteralPath (Join-Path $Dest '.git')) { $head = "$((Invoke-GitRaw @('-C', $Dest, 'rev-parse', '-q', '--verify', 'HEAD')).Lines)".Trim() }
+        if ($head -ne $script:Commit) {
+            Write-FetchLog "   It is not a git checkout of RPCS3 $($script:Commit.Substring(0,7)), so it can't be reset in place."
+            return 'redownload'
+        }
+        # Reset the files the port's patches change (not 3rdparty\, the libraries), keeping any change in git's stash
+        # there instead of deleting it. Untracked files go too: an older patch may have added files this one doesn't.
+        $before = "$((Invoke-GitRaw @('-C', $Dest, 'rev-parse', '-q', '--verify', 'refs/stash')).Lines)".Trim()
+        Invoke-Git -C $Dest -c user.name=PortSetup -c user.email=port-setup@localhost -c apply.whitespace=nowarn stash push -q --include-untracked `
+            -m "port setup: RPCS3 source before re-applying the port's patch $(Get-Date -Format s)" -- . ':(exclude)3rdparty'
+        $after = "$((Invoke-GitRaw @('-C', $Dest, 'rev-parse', '-q', '--verify', 'refs/stash')).Lines)".Trim()
+        $stashed = $after -and $after -ne $before
+        if ($stashed) {
+            Write-FetchLog "   The old changes were saved in git's stash there (git -C `"$Dest`" stash list)."
+        }
+        $ok = Add-PortPatch $Dest 'git' $Patch
+        $missing = Get-MissingPatchFiles $Dest $Patch
+        if (-not $ok -or $missing.Count) {
+            if ($missing.Count) { Write-FetchLog "   Still missing after patching: $($missing -join ', ')" }
+            # downloading again would delete the stash with the folder
+            if ($stashed) { throw "The port's patch did not apply to the reset RPCS3 source. Delete the folder $Dest and run Setup again." }
+            return 'redownload'
+        }
+        Write-FetchLog "   RPCS3 $($script:Commit.Substring(0,7)) re-patched for this version of the port."
+        return 'repatched'
+    } finally { $env:GIT_CEILING_DIRECTORIES = $ceiling }
+}
+function Resolve-PortPatch {
+    if ($script:Patch) { return $script:Patch }
+    $patches = @(Get-ChildItem -Path (Join-Path $PSScriptRoot '..\ps3recomp\patches') -Filter '*-rpcs3.patch' -File)
+    if ($patches.Count -ne 1) { throw "Expected exactly one ps3recomp\patches\*-rpcs3.patch, found $($patches.Count)." }
+    $patches[0].FullName
+}
 
 # --- why it failed --------------------------------------------------------------------------------------------
 function Get-FetchFailureHint([string]$Text) {
@@ -365,13 +423,13 @@ function Invoke-FetchRpcs3 {
         $script:LogFile = [IO.Path]::GetFullPath($script:LogFile)
         try { New-Item -ItemType Directory -Force -Path (Split-Path $script:LogFile) | Out-Null } catch { $script:LogFile = '' }
     }
-    if (Test-Path -LiteralPath (Join-Path $Dest $script:MarkerRel)) { Write-Host "   RPCS3 source already present."; return }
-    $Patch = $script:Patch
-    if (-not $Patch) {
-        $patches = @(Get-ChildItem -Path (Join-Path $PSScriptRoot '..\ps3recomp\patches') -Filter '*-rpcs3.patch' -File)
-        if ($patches.Count -ne 1) { throw "Expected exactly one ps3recomp\patches\*-rpcs3.patch, found $($patches.Count)." }
-        $Patch = $patches[0].FullName
+    if (Test-Path -LiteralPath (Join-Path $Dest $script:MarkerRel)) {
+        $Patch = Resolve-PortPatch
+        if ((Update-PatchedSource $Dest $Patch) -ne 'redownload') { return }
+        Write-FetchLog "   Downloading the RPCS3 source again..."
+        Clear-Dir $Dest
     }
+    $Patch = Resolve-PortPatch
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw "git was not found. Install Git (winget install Git.Git) and run Setup again." }
     Write-FetchLog "   ---- fetch_rpcs3 $(Get-Date -Format s) into $Dest" -Quiet
     Write-FetchLog "   $((Invoke-GitRaw @('--version')).Lines -join ' ')" -Quiet
@@ -407,6 +465,7 @@ function Invoke-FetchRpcs3 {
         & robocopy $Work $Dest /E /XD .git .port_fetch /XF .git /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
         if ($LASTEXITCODE -ge 8) { throw "Could not copy the source from $Work to $Dest (robocopy exit code $LASTEXITCODE)." }
         $global:LASTEXITCODE = 0
+        Set-Stamp $Dest 'patch' (Get-FileHash -LiteralPath $Patch -Algorithm SHA256).Hash   # .port_fetch is not copied
         Clear-Dir $Work
     }
     Clear-Dir $DlDir
@@ -416,6 +475,15 @@ function Invoke-FetchRpcs3 {
 }
 
 if ($Library) { return }
+if ($CheckFiles) {
+    # build.bat: a source patched by an older version lacks files this version's code includes (R2 #17, R3 #24)
+    $d = [IO.Path]::GetFullPath($Dest)
+    $missing = @(Get-MissingPatchFiles $d (Resolve-PortPatch))
+    if (-not $missing.Count) { exit 0 }
+    Write-Host "   The RPCS3 source in $d is missing $($missing.Count) file(s) the port's patch adds ($($missing[0]) ...):"
+    Write-Host "   it was patched by an older version of the port."
+    exit 1
+}
 try { Invoke-FetchRpcs3; exit 0 }
 catch {
     Write-FetchLog "   FAILED: $($_.Exception.Message)"

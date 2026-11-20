@@ -42,6 +42,16 @@ $pc = Join-Path $Root 'patchwork'; G clone -q $up $pc | Out-Null
 [IO.File]::WriteAllText((Join-Path $pc 'rpcs3\Emu\core.cpp'), "int core = 2;`n")
 New-Item -ItemType Directory -Force (Join-Path $pc 'rpcs3\Emu\RSX\VK') | Out-Null
 [IO.File]::WriteAllText((Join-Path $pc 'rpcs3\Emu\RSX\VK\Marker.cpp'), "int marker;`n")
+# an older version's patch (R2 #17): another change, a file the new one dropped, without the new one's new header
+G -C $pc add -A | Out-Null
+[IO.File]::WriteAllText((Join-Path $pc 'rpcs3\Emu\core.cpp'), "int core = 3;`n")
+[IO.File]::WriteAllText((Join-Path $pc 'rpcs3\Emu\RSX\VK\Stale.cpp'), "int stale;`n")
+G -C $pc add -A | Out-Null
+$oldPatch = Join-Path $Root 'test-rpcs3-old.patch'
+[IO.File]::WriteAllText($oldPatch, ((G -C $pc diff --cached --no-color) -join "`n") + "`n")
+G -C $pc rm -q --cached rpcs3/Emu/RSX/VK/Stale.cpp | Out-Null; Remove-Item (Join-Path $pc 'rpcs3\Emu\RSX\VK\Stale.cpp')
+[IO.File]::WriteAllText((Join-Path $pc 'rpcs3\Emu\core.cpp'), "int core = 2;`n")
+[IO.File]::WriteAllText((Join-Path $pc 'rpcs3\Emu\RSX\port_new.h'), "int added_later;`n")
 G -C $pc add -A | Out-Null
 $patch = Join-Path $Root 'test-rpcs3.patch'
 [IO.File]::WriteAllText($patch, ((G -C $pc diff --cached --no-color) -join "`n") + "`n")
@@ -102,7 +112,7 @@ function Get-DriveFacts { param($Path)
 }
 $Dest = Join-Path $Root 'dest'
 function Test-Complete([string]$D) {
-    (Test-Path (Join-Path $D 'rpcs3\Emu\RSX\VK\Marker.cpp')) -and ((Get-Content (Join-Path $D 'rpcs3\Emu\core.cpp')) -eq 'int core = 2;') -and
+    (Test-Path (Join-Path $D 'rpcs3\Emu\RSX\VK\Marker.cpp')) -and (Test-Path (Join-Path $D 'rpcs3\Emu\RSX\port_new.h')) -and ((Get-Content (Join-Path $D 'rpcs3\Emu\core.cpp')) -eq 'int core = 2;') -and
     (Test-Path (Join-Path $D '3rdparty\s1\s1\one.h')) -and (Test-Path (Join-Path $D '3rdparty\s2\two.h')) -and (Test-Path (Join-Path $D '3rdparty\ex\ex.h'))
 }
 function Run-Fetch {
@@ -166,6 +176,40 @@ Remove-Item (Join-Path $Dest '.port_fetch\patch.ok') -Force
 Check (Run-Fetch) 'patch already applied: recognised'
 Check (Test-Complete $Dest) 'still complete'
 
+Write-Host 'fetch_rpcs3: R2 #17 - update over a source patched by an older version'
+function Set-OldPatched([string]$D) {   # as 0.2.x left it: no stamps, the older patch applied
+    Remove-Item (Join-Path $D '.port_fetch') -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path (Join-Path $D '.git')) { G -C $D checkout -q -f HEAD -- rpcs3 | Out-Null }
+    else { [IO.File]::WriteAllText((Join-Path $D 'rpcs3\Emu\core.cpp'), "int core = 1;`n") }
+    Remove-Item (Join-Path $D 'rpcs3\Emu\RSX\port_new.h'), (Join-Path $D 'rpcs3\Emu\RSX\VK\Marker.cpp') -Force -ErrorAction SilentlyContinue
+    $ErrorActionPreference = 'Continue'; $env:GIT_CEILING_DIRECTORIES = Split-Path $D
+    & git -C $D -c core.autocrlf=false apply $oldPatch 2>&1 | Out-Null
+    $env:GIT_CEILING_DIRECTORIES = $null
+}
+function Get-CheckFilesExit([string]$D) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Port 'tools\fetch_rpcs3.ps1') -CheckFiles -Dest $D -Patch $patch | Out-Null
+    $LASTEXITCODE
+}
+Reset-Run
+Set-OldPatched $Dest
+Check (Test-Path (Join-Path $Dest 'rpcs3\Emu\RSX\VK\Stale.cpp')) 'older patch applied (test setup)'
+Check ((Get-CheckFilesExit $Dest) -eq 1) 'build.bat check (-CheckFiles): missing file found'
+Check (Run-Fetch) 'finishes'
+Check (Test-Complete $Dest) "re-patched with this version's patch"
+Check (-not (Test-Path (Join-Path $Dest 'rpcs3\Emu\RSX\VK\Stale.cpp'))) "the older patch's file is gone"
+Check (@(G -C $Dest stash list).Count -eq 1) "the old changes are kept in git's stash"
+Check (Test-Path (Join-Path $Dest '3rdparty\ex\ex.h')) 'libraries kept'
+Check ((Count-Calls 'fetch -q|submodule update|^clone') -eq 0) 'nothing downloaded'
+Check ((Get-CheckFilesExit $Dest) -eq 0) 'build.bat check (-CheckFiles): complete'
+Reset-Run
+Check (Run-Fetch) 'next run finishes'
+Check (-not $script:GitCalls.Count) 'next run: stamp recognised, no git'
+Reset-Run
+Remove-Item (Join-Path $Dest '.port_fetch\patch.ok') -Force
+Check (Run-Fetch) 'current source without a stamp finishes'
+Check ((Count-Calls '^-C .* stash') -eq 0) 'current source without a stamp: not reset'
+Check (Test-Stamp $Dest 'patch' (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash) 'current source without a stamp: stamped'
+
 Write-Host 'fetch_rpcs3: dubious ownership'
 Reset-Run; Clear-All
 $script:Rules = @(@{ Match = 'remote add'; Times = 1; Used = 0
@@ -182,6 +226,20 @@ Check (Test-Complete $Dest) 'complete in the port folder'
 Check (-not (Test-Path (Join-Path $Dest '.git'))) 'copied without .git'
 Check (-not @(Get-ChildItem (Join-Path $Root 'stage') -ErrorAction SilentlyContinue).Count) 'local work folder removed'
 Check ((Get-Content (Join-Path $Root 'fetch.log') -Raw) -match 'exFAT drive') 'message names the drive type'
+Reset-Run
+Check (Run-Fetch) 'exFAT: next run finishes'
+Check (-not $script:GitCalls.Count) 'exFAT: next run: stamp recognised, no git'
+Reset-Run
+Remove-Item (Join-Path $Dest '.port_fetch') -Recurse -Force
+Check (Run-Fetch) 'exFAT: current source without a stamp finishes'
+Check ((Count-Calls 'fetch -q') -eq 0) 'exFAT: current source without a stamp: not downloaded again'
+Check (Test-Path (Join-Path $Dest '.port_fetch\patch.ok')) 'exFAT: current source without a stamp: stamped'
+Reset-Run
+Set-OldPatched $Dest
+Check (Run-Fetch) 'exFAT: older patch (no git repository there): finishes'
+Check ((Count-Calls 'fetch -q --depth 1') -ge 1) 'exFAT: older patch: downloaded again'
+Check (Test-Complete $Dest) 'exFAT: older patch: complete'
+Check (-not (Test-Path (Join-Path $Dest 'rpcs3\Emu\RSX\VK\Stale.cpp'))) "exFAT: the older patch's file is gone"
 $script:FakeDrive = $null
 
 Write-Host 'fetch_rpcs3: drive and hint checks'
