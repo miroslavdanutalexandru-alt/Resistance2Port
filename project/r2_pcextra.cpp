@@ -75,7 +75,7 @@ extern volatile unsigned long long g_r2_look_ms;             /* stubs.cpp: on-fo
 extern uint8_t* vm_base;
 void r2pf_toast(const char* title, const char* text, char badge);
 void r2pf_hint(const char* title, const char* text, unsigned ms);
-extern volatile int g_r2_cheat_god, g_r2_cheat_ammo;         /* r2_cheats.cpp */
+int r2_cheat_toggle(int which);                              /* r2_cheats.cpp: new state, -1 = not allowed */
 int r2pf_overlay_get(void);
 void r2pf_overlay_set(int on);
 void r2rsx_prof_enable(int on);
@@ -1258,6 +1258,40 @@ extern "C" uint64_t r2x_movie_seen(uint64_t seen)
 }
 static int s_want_pause = 0;
 extern "C" int r2x_want_pause(void) { return s_want_pause; }
+/* controls.txt binds this key to something (a game action, or a port key such as mouse_release_key):
+ * then Ctrl+<key> would press that too, so the cheat key is not used. */
+static bool cheat_key_bound(const char* key)
+{
+    std::vector<std::string> lines;
+    read_lines("controls.txt", lines);
+    for (std::string l : lines) {
+        const size_t h = l.find('#'); if (h != std::string::npos) l = l.substr(0, h);
+        const size_t eq = l.find('='); if (eq == std::string::npos) continue;
+        char k[64] = {}, v[64] = {};
+        if (sscanf(l.substr(0, eq).c_str(), " %63s", k) != 1) continue;
+        sscanf(l.substr(eq + 1).c_str(), " %63s", v);
+        const size_t kl = strlen(k);
+        if (!_stricmp(k, key) || (kl > 4 && !_stricmp(k + kl - 4, "_key") && !_stricmp(v, key))) return true;
+    }
+    return false;
+}
+/* Ctrl+F1 God mode, Ctrl+F2 Infinite ammo (r2_cheats.cpp) */
+static void cheat_key(int which, const char* key)
+{
+    const char* name = which ? "Infinite ammo" : "God mode";
+    char t[128];
+    if (cheat_key_bound(key)) {
+        snprintf(t, sizeof t, "Ctrl+%s does nothing: %s is bound in controls.txt", key, key);
+        r2pf_hint("Cheat", t, 3500);
+        LOG("cheat: Ctrl+%s ignored, %s is bound in controls.txt", key, key);
+        return;
+    }
+    const int on = r2_cheat_toggle(which);
+    if (on < 0) { r2pf_hint("Cheat", "Cheats are off in a benchmark run", 2500); return; }
+    snprintf(t, sizeof t, "%s %s (trophies off until you restart the game)", name, on ? "ON" : "OFF");
+    r2pf_hint("Cheat", t, 3500);
+    LOG("cheat: %s %s", name, on ? "on" : "off");
+}
 extern "C" void r2x_ui_tick(void* hwnd_, int focused, int other_prompt)
 {
     HWND hwnd = (HWND)hwnd_;
@@ -1271,21 +1305,14 @@ extern "C" void r2x_ui_tick(void* hwnd_, int focused, int other_prompt)
     { static int was = 0; const int d = focused && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
       if (d && !was && !s_open && !other_prompt && !s_photo_on) r2x_open_menu();
       was = d; }
-    /* cheats (r2_cheats.cpp): Ctrl+F1 God mode, Ctrl+F2 Infinite ammo */
+    /* cheats: not in photo mode, the port's menus or another prompt (r2_cheats.cpp refuses in a benchmark run) */
     { const int ctrl = focused && (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
       static int was1 = 0, was2 = 0;
       const int d1 = ctrl && (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
       const int d2 = ctrl && (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
-      if (d1 && !was1 && !s_open) {
-          g_r2_cheat_god = !g_r2_cheat_god;
-          r2pf_hint("Cheat", g_r2_cheat_god ? "God mode ON" : "God mode OFF", 2500);
-          LOG("cheat: god mode %s", g_r2_cheat_god ? "on" : "off");
-      }
-      if (d2 && !was2 && !s_open) {
-          g_r2_cheat_ammo = !g_r2_cheat_ammo;
-          r2pf_hint("Cheat", g_r2_cheat_ammo ? "Infinite ammo ON" : "Infinite ammo OFF", 2500);
-          LOG("cheat: infinite ammo %s", g_r2_cheat_ammo ? "on" : "off");
-      }
+      const int ok = !s_open && !s_release && !other_prompt && !s_photo_on;
+      if (d1 && !was1 && ok) cheat_key(0, "F1");
+      if (d2 && !was2 && ok) cheat_key(1, "F2");
       was1 = d1; was2 = d2; }
     if (s_open) menu_tick(focused);
     else if (s_release) {                        /* hold the game's input until the closing key is let go */

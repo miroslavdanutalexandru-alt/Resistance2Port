@@ -17,6 +17,10 @@
  *                            alone; kind 1 also holds the clip (+0x316 / +0x31A).
  *
  *   R2_CHEAT_GOD=1 / R2_CHEAT_AMMO=1 turn them on at start. Both are off by default.
+ *   Once either has been on, trophy unlocks are not recorded until the game is restarted
+ *   (g_trophy_unlocks_blocked, sceNpTrophy.c). In an R2_BENCH run both stay off. The keys
+ *   are ignored in photo mode and the port's menus, and while F1 / F2 is bound to a game
+ *   action in controls.txt (r2_pcextra.cpp).
  *
  * Runs on the game's main thread at the top of the frame limiter func_00635D28
  * (hook in tools/hooks/r2.json), i.e. between frames. The guest calls run on a
@@ -32,9 +36,36 @@
 #endif
 
 extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
+extern "C" volatile int g_trophy_unlocks_blocked;   /* sceNpTrophy.c */
 
 extern "C" volatile int g_r2_cheat_god = 0;
 extern "C" volatile int g_r2_cheat_ammo = 0;
+
+/* R2_BENCH runs stay comparable: no cheats at all (env vars and keys are ignored). */
+static int cheats_allowed(void)
+{
+    static int bench = -1;
+    if (bench < 0) { const char* b = getenv("R2_BENCH"); bench = (b && *b && atoi(b) != 0) ? 1 : 0; }
+    return !bench;
+}
+/* Once a cheat has been on, trophies stay off until the game is restarted. */
+static void block_trophies(void)
+{
+    if (g_trophy_unlocks_blocked) return;
+    g_trophy_unlocks_blocked = 1;
+    fprintf(stderr, "[cheat] trophies are off until the game is restarted\n");
+}
+/* UI thread (r2_pcextra.cpp key toggles): 0 = God mode, 1 = Infinite ammo. Returns the new
+ * state, or -1 when cheats are not allowed (benchmark run). */
+extern "C" int r2_cheat_toggle(int which)
+{
+    if (!cheats_allowed()) return -1;
+    volatile int& v = which ? g_r2_cheat_ammo : g_r2_cheat_god;
+    const int on = !v;
+    if (on) block_trophies();
+    v = on;
+    return on;
+}
 
 static const uint64_t R2_TOC = 0x00DED008ULL;
 
@@ -156,13 +187,20 @@ extern "C" void r2_cheats_frame(ppu_context* ctx)
     static int init = 0;
     if (!init) {
         init = 1;
-        const char* e = getenv("R2_CHEAT_GOD");  if (e && *e && *e != '0') g_r2_cheat_god = 1;
-        e = getenv("R2_CHEAT_AMMO");             if (e && *e && *e != '0') g_r2_cheat_ammo = 1;
-        if (g_r2_cheat_god || g_r2_cheat_ammo)
-            fprintf(stderr, "[cheat] at start: god %d, ammo %d\n", g_r2_cheat_god, g_r2_cheat_ammo);
+        if (cheats_allowed()) {
+            const char* e = getenv("R2_CHEAT_GOD");  if (e && *e && *e != '0') g_r2_cheat_god = 1;
+            e = getenv("R2_CHEAT_AMMO");             if (e && *e && *e != '0') g_r2_cheat_ammo = 1;
+            if (g_r2_cheat_god || g_r2_cheat_ammo) {
+                fprintf(stderr, "[cheat] at start: god %d, ammo %d\n", g_r2_cheat_god, g_r2_cheat_ammo);
+                block_trophies();
+            }
+        } else if (getenv("R2_CHEAT_GOD") || getenv("R2_CHEAT_AMMO"))
+            fprintf(stderr, "[cheat] benchmark run: cheats are off\n");
     }
+    if (!cheats_allowed()) return;
     static int ammo_was = 0, god_was = 0;
     const int god = g_r2_cheat_god, ammo = g_r2_cheat_ammo;
+    if (god || ammo) block_trophies();
     if (ammo && !ammo_was) { s_nhwm = 0; s_ndiag = 0; s_gdiag = 0; s_diag = 1; }   /* fresh start every time it is turned on */
     ammo_was = ammo;
     const int god_off = god_was && !god;   /* turned off this frame: give back the invulnerability bits */
