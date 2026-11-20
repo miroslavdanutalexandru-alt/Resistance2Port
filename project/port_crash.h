@@ -758,7 +758,8 @@ static void exception_section(const Request& r, char* line, size_t linen)
 /* Shader preload breadcrumb (GitHub issue #10; written by the renderer, VKR2Preload.cpp):
  * <port>\logs\preload_inflight.txt holds one "tid <thread> <pipeline file>" line per
  * preload thread while it links that pipeline. The faulting thread's line becomes
- * "preload faulting: <file>": the next start quarantines that pipeline. No heap. */
+ * "preload faulting: <file>": the next start quarantines that pipeline. Pipelines built outside the preload
+ * (render / compiler / upscaler threads, SDK contexts) show an "rt:<what>" label: "pipeline faulting: rt:...". No heap. */
 static void preload_section(const Request& r)
 {
     static char buf[64 * 128 + 1];
@@ -782,11 +783,12 @@ static void preload_section(const Request& r)
                 size_t n = strlen(key);
                 while (n && (key[n - 1] == ' ' || key[n - 1] == '\r')) key[--n] = 0;
                 if (n) {
-                    if (!header) { out("\n==== shader preload in flight ====\n"); header = 1; }
+                    if (!header) { out("\n==== shader preload / pipeline creation in flight ====\n"); header = 1; }
                     out("thread %lu: %s\n", tid, key);
                     if (r.kind == KIND_CRASH && tid == (unsigned long)r.tid) {
                         s_tee_on = 1;
-                        out("preload faulting: %s\n", key);
+                        /* "rt:<what>": built outside the preload (issue #23); not a cache entry, never quarantined */
+                        out(strncmp(key, "rt:", 3) ? "preload faulting: %s\n" : "pipeline faulting: %s\n", key);
                         s_tee_on = 0;
                     }
                 }

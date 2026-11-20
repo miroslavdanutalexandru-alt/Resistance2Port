@@ -562,6 +562,7 @@ static void dbg_prof_frame_threads(unsigned sec)
  * One NtQuerySystemInformation call per sample plus a cached handle per
  * thread: no cost to the game threads. */
 #include "ps3_waitstat.h"
+#include "port_perfverdict.h"
 #include <intrin.h>   /* __rdtsc */
 extern "C" const char* ppu_name_by_host_tid(unsigned long tid);
 struct thr_spi_thread {             /* SYSTEM_THREAD_INFORMATION, x64 */
@@ -572,6 +573,7 @@ static_assert(sizeof(thr_spi_thread) == 0x50, "SYSTEM_THREAD_INFORMATION layout"
 struct thr_row { DWORD tid; unsigned long long cyc, kt, ut; ULONG cs; };
 struct thr_snap {
     unsigned long long tsc, qpc; int n;
+    unsigned flips, flip_mode;      /* guest flips so far, flip mode (2 = VSYNC: movies) */
     thr_row r[512];
     ps3_waitstat ws[PS3_WAITSTAT_MAX];
 };
@@ -641,6 +643,8 @@ static int thr_take(thr_snap* s)
     }
     LARGE_INTEGER q; QueryPerformanceCounter(&q);
     s->qpc = (unsigned long long)q.QuadPart; s->tsc = __rdtsc();
+    s->flips = cellGcm_flip_request_count();
+    s->flip_mode = (unsigned)cellGcm_get_flip_mode();
     memcpy(s->ws, (const void*)g_ps3_waitstat, sizeof s->ws);
     ReleaseSRWLockExclusive(&s_thr_lock);
     return s->n;
@@ -716,11 +720,42 @@ static void thr_report(const thr_snap& a, const thr_snap& b, int maxn, int table
     std::sort(rows, rows + n, [](const R& p, const R& q) { return p.busy > q.busy; });
     char ln[8192]; int p = 0;
     SYSTEM_INFO si; GetSystemInfo(&si);
+    /* R2 #15: guest fps of the window, and a [perf] verdict when it is slow (port_perfverdict.h) */
+    static const bool pv_on = [] { const char* e = getenv("PORT_PERF_VERDICT"); return !(e && *e == '0'); }();
+    double pv_fps = -1.0;
+    if (!table && pv_on) {
+        static port_pv::State pv_st = {};
+        port_pv::Window w = {};
+        w.secs = secs;
+        w.flips = b.flips - a.flips;
+        w.movie = b.flip_mode == 2;
+        w.ncpu = (int)si.dwNumberOfProcessors;
+        w.total_busy = total;
+        const DWORD rsx_tid = (DWORD)rsx_render_host_tid();
+        DWORD lanes[8];
+        for (unsigned k = 0; k < 8; k++) lanes[k] = (DWORD)spurs_lane_host_tid(k);
+        for (int i = 0; i < n; i++) {
+            const R& r = rows[i];
+            if (!r.tid) continue;
+            double busy = r.busy;   /* minus QPC busy-waits (sys_timer_usleep < 1 ms): a spinning frame limiter is not load */
+            if (r.ws >= 0 && a.ws[r.ws].tid == b.ws[r.ws].tid)
+                busy -= (double)(b.ws[r.ws].short_qpc - a.ws[r.ws].short_qpc) * 100.0 / (secs * qf);
+            if (busy < 0) busy = 0;
+            if (r.tid == s_dbg_main_tid) w.main_busy = busy;
+            else if (r.tid == rsx_tid) w.rsx_busy = busy;
+            else for (unsigned k = 0; k < 8; k++) if (r.tid == lanes[k] && busy > w.spurs_max) w.spurs_max = busy;
+        }
+        char vl[512];
+        port_pv::classify(&pv_st, w, &pv_fps, vl, sizeof vl);
+        if (vl[0]) out(vl);
+    }
     if (table)
         p = snprintf(ln, sizeof ln, "[thrcpu] %.1f s, %d threads, %.2f of %lu logical CPUs busy\n"
                      "  %-26s %6s %5s %5s %8s | %5s %5s %7s %5s %5s %6s\n", secs, n, total / 100.0,
                      (unsigned long)si.dwNumberOfProcessors, "thread", "busy%", "usr%", "krn%", "cs/s",
                      "spin%", "slp%", "yld/s", "lwm%", "lwc%", "early");
+    else if (pv_fps >= 0.0)
+        p = snprintf(ln, sizeof ln, "[thrcpu] %.1fs %.0f fps %.2f cpus:", secs, pv_fps, total / 100.0);
     else
         p = snprintf(ln, sizeof ln, "[thrcpu] %.1fs %.2f cpus:", secs, total / 100.0);
     for (int i = 0; i < n && i < maxn; i++) {

@@ -10264,7 +10264,7 @@ index 439cd37..323befd 100644
  
  	if (m_prog.ctrl & RSX_SHADER_CONTROL_DISABLE_EARLY_Z)
 diff --git a/rpcs3/Emu/RSX/VK/VKGSRender.cpp b/rpcs3/Emu/RSX/VK/VKGSRender.cpp
-index b101a27..5a189f6 100644
+index b101a27..743c968 100644
 --- a/rpcs3/Emu/RSX/VK/VKGSRender.cpp
 +++ b/rpcs3/Emu/RSX/VK/VKGSRender.cpp
 @@ -21,10 +21,26 @@
@@ -10618,7 +10618,7 @@ index b101a27..5a189f6 100644
  	// Now we properly initialize the pipe compiler as per the user's configuration
  	if (!g_cfg.video.shader_compiler_threads_count)
  	{
-@@ -1305,14 +1491,275 @@ void VKGSRender::on_init()
+@@ -1305,14 +1491,273 @@ void VKGSRender::on_init()
  
  	// If we survived init - loading shaders, etc, then we can re-enable protection.
  	vk::arm_device_loss_protection();
@@ -10830,13 +10830,11 @@ index b101a27..5a189f6 100644
 +		{
 +			m_shaders_cache->r2_keep_entry = nullptr;
 +		}
-+		// R2PORT (shader precompile): workers for the blocking boot load/compile. All logical cores but one by
-+		// default; 2 on <= 8 threads or PORT_CPU_PROFILE=low, where the game's own boot threads (audio, streaming,
-+		// SPURS) were starved by hw-1 compilers on a 4c/8t CPU. R2_PRELOAD_BOOT_THREADS=N overrides.
-+		const char* cpu_prof = std::getenv("PORT_CPU_PROFILE");
-+		const bool low_cpu = hw <= 8 || (cpu_prof && !std::strcmp(cpu_prof, "low"));
-+		const u32 workers = static_cast<u32>(std::clamp<long>(::r2pipe::env_int("R2_PRELOAD_BOOT_THREADS",
-+			low_cpu ? std::min(2u, hw) : std::max(1u, hw - 1)), 1, 64));
++		// R2PORT (shader precompile): workers for the blocking boot load/compile (r2pipe::preload_boot_workers). All
++		// logical cores but one by default; 2 on <= 8 threads or PORT_CPU_PROFILE=low, where the game's own boot threads
++		// (audio, streaming, SPURS) were starved by hw-1 compilers on a 4c/8t CPU; 2 on AMD (issue #10/#23,
++		// PORT_PRELOAD_BOOT_AMD=0 keeps the default). R2_PRELOAD_BOOT_THREADS=N / PORT_PRELOAD_BOOT_THREADS=N override.
++		const u32 workers = ::r2pipe::preload_boot_workers(hw, r2_props.vendorID, ::r2pipe::cpu_profile_low());
 +		m_shaders_cache->r2_preload_workers = workers;
 +		dlg.background = bg;
 +		// R2PORT (PORT_SHADER_PRELOAD_BUDGET=<seconds>, old name R2_PRELOAD_BOOT_BUDGET, default 0 = no limit; the
@@ -10895,7 +10893,7 @@ index b101a27..5a189f6 100644
  			? std::make_unique<rsx::shader_loading_dialog_native>(RSX(m_ctx))
  			: std::make_unique<rsx::shader_loading_dialog>();
  		m_shader_interpreter.preload(dlg.get());
-@@ -1321,7 +1768,7 @@ void VKGSRender::preload_shaders()
+@@ -1321,7 +1766,7 @@ void VKGSRender::preload_shaders()
  
  	if (g_cfg.video.shadermode != shader_mode::interpreter_only)
  	{
@@ -10904,7 +10902,7 @@ index b101a27..5a189f6 100644
  		{
  			m_frame->hide();
  			m_shaders_cache->load(nullptr);
-@@ -1334,6 +1781,7 @@ void VKGSRender::preload_shaders()
+@@ -1334,6 +1779,7 @@ void VKGSRender::preload_shaders()
  			// TODO: Handle window resize messages during loading on GPUs without OUT_OF_DATE_KHR support
  			m_shaders_cache->load(&dlg);
  		}
@@ -10912,7 +10910,7 @@ index b101a27..5a189f6 100644
  	}
  }
  
-@@ -1350,6 +1798,13 @@ std::unique_ptr<rsx::context_resources> VKGSRender::create_context_resources(rsx
+@@ -1350,6 +1796,13 @@ std::unique_ptr<rsx::context_resources> VKGSRender::create_context_resources(rsx
  	resources->texture_cache.set_context(ctx);
  	resources->texture_cache.initialize(*m_device, m_device->get_graphics_queue(), m_texture_upload_buffer_ring_info);
  
@@ -10926,7 +10924,7 @@ index b101a27..5a189f6 100644
  	return resources;
  }
  
-@@ -1414,6 +1869,7 @@ void VKGSRender::on_unbind_context(rsx::context* ctx)
+@@ -1414,6 +1867,7 @@ void VKGSRender::on_unbind_context(rsx::context* ctx)
  
  void VKGSRender::on_shutdown()
  {
@@ -10934,7 +10932,7 @@ index b101a27..5a189f6 100644
  	// Flush DMA queue
  	while (!g_fxo->get<rsx::dma_manager>().sync())
  	{
-@@ -1421,6 +1877,8 @@ void VKGSRender::on_shutdown()
+@@ -1421,6 +1875,8 @@ void VKGSRender::on_shutdown()
  	}
  
  	destroy_frame_context();
@@ -10943,7 +10941,7 @@ index b101a27..5a189f6 100644
  	vk::destroy_pipe_compiler(); // Ensure no pending shaders being compiled
  }
  
-@@ -1430,6 +1888,8 @@ void VKGSRender::clear()
+@@ -1430,6 +1886,8 @@ void VKGSRender::clear()
  	const auto& info = m_ctx->draw_state.clear;
  	const auto mask = info.mask;
  
@@ -10952,7 +10950,7 @@ index b101a27..5a189f6 100644
  	set_scissor();
  
  	constexpr u32 stencil_clear = 0;
-@@ -1456,6 +1916,15 @@ void VKGSRender::clear()
+@@ -1456,6 +1914,15 @@ void VKGSRender::clear()
  
  	if (auto ds = std::get<1>(res()->surface_cache.m_bound_depth_stencil); ds && (mask & RSX_GCM_CLEAR_DEPTH_STENCIL_MASK))
  	{
@@ -10968,7 +10966,7 @@ index b101a27..5a189f6 100644
  		if (mask & RSX_GCM_CLEAR_DEPTH_BIT)
  		{
  			f32 depth_clear = info.depth_value;
-@@ -1513,7 +1982,7 @@ void VKGSRender::clear()
+@@ -1513,7 +1980,7 @@ void VKGSRender::clear()
  			else
  			{
  				// Barrier required before any writes
@@ -10977,7 +10975,7 @@ index b101a27..5a189f6 100644
  			}
  		}
  	}
-@@ -1598,10 +2067,35 @@ void VKGSRender::clear()
+@@ -1598,10 +2065,35 @@ void VKGSRender::clear()
  		begin_render_pass();
  		vkCmdClearAttachments(*m_current_command_buffer, ::size32(clear_descriptors), clear_descriptors.data(), 1, &region);
  	}
@@ -11013,7 +11011,7 @@ index b101a27..5a189f6 100644
  	close_and_submit_command_buffer();
  
  	if (hard_sync)
-@@ -1643,6 +2137,9 @@ void VKGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
+@@ -1643,6 +2135,9 @@ void VKGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
  	}
  
  	m_current_command_buffer->begin();
@@ -11023,7 +11021,7 @@ index b101a27..5a189f6 100644
  }
  
  std::pair<volatile vk::host_data_t*, VkBuffer> VKGSRender::map_host_object_data() const
-@@ -1686,6 +2183,7 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
+@@ -1686,6 +2181,7 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
  	if (host_ctx->has_unflushed_texture_loads())
  	{
  		vkCmdUpdateBuffer(*m_current_command_buffer, mapping.second->value, mapping.first, 4, &write_data);
@@ -11031,7 +11029,7 @@ index b101a27..5a189f6 100644
  		flush_command_queue();
  	}
  	else
-@@ -1758,6 +2256,7 @@ void VKGSRender::on_sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync
+@@ -1758,6 +2254,7 @@ void VKGSRender::on_sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync
  		if ((now - m_last_cond_render_eval_hint) > 50)
  		{
  			// Schedule a sync on the next loop iteration
@@ -11039,7 +11037,7 @@ index b101a27..5a189f6 100644
  			m_flush_requests.post(false);
  			m_flush_requests.remove_one();
  		}
-@@ -1779,7 +2278,9 @@ void VKGSRender::on_sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync
+@@ -1779,7 +2276,9 @@ void VKGSRender::on_sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync
  
  		// Unavoidable hard sync coming up, flush immediately
  		// This heavyweight hint should be used with caution
@@ -11049,7 +11047,7 @@ index b101a27..5a189f6 100644
  		flush_command_queue();
  
  		if (m_flush_requests.pending())
-@@ -1794,6 +2295,48 @@ void VKGSRender::on_sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync
+@@ -1794,6 +2293,48 @@ void VKGSRender::on_sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync
  
  bool VKGSRender::on_local_task(rsx::FIFO::state state)
  {
@@ -11098,7 +11096,7 @@ index b101a27..5a189f6 100644
  	if (m_queue_status & flush_queue_state::deadlock)
  	{
  		// Clear offloader deadlock
-@@ -1813,6 +2356,8 @@ bool VKGSRender::on_local_task(rsx::FIFO::state state)
+@@ -1813,6 +2354,8 @@ bool VKGSRender::on_local_task(rsx::FIFO::state state)
  	{
  		if (m_flush_queue_mutex.try_lock())
  		{
@@ -11107,7 +11105,7 @@ index b101a27..5a189f6 100644
  			// TODO: Determine if a hard sync is necessary
  			// Pipeline barriers later may do a better job synchronizing than wholly stalling the pipeline
  			flush_command_queue();
-@@ -1834,6 +2379,8 @@ bool VKGSRender::on_local_task(rsx::FIFO::state state)
+@@ -1834,6 +2377,8 @@ bool VKGSRender::on_local_task(rsx::FIFO::state state)
  			}
  			m_ctx->graphics_state.clear(rsx::pipeline_state::framebuffer_reads_dirty);
  		}
@@ -11116,7 +11114,7 @@ index b101a27..5a189f6 100644
  	}
  
  	return true;
-@@ -1935,7 +2482,7 @@ bool VKGSRender::load_program()
+@@ -1935,7 +2480,7 @@ bool VKGSRender::load_program()
  	{
  		vk::enter_uninterruptible();
  
@@ -11125,7 +11123,7 @@ index b101a27..5a189f6 100644
  		{
  			m_ctx->stats.program_cache_lookups_total += 2;
  			if (m_ctx->program.cache_hint.has_fragment_program())
-@@ -1953,12 +2500,75 @@ bool VKGSRender::load_program()
+@@ -1953,12 +2498,75 @@ bool VKGSRender::load_program()
  		const bool allow_async = shadermode != shader_mode::recompiler &&
  			!(fragment_program.ctrl & RSX_SHADER_CONTROL_EMULATE_DEPTH_RANGE);
  
@@ -11207,7 +11205,7 @@ index b101a27..5a189f6 100644
  
  		vk::leave_uninterruptible();
  
-@@ -2042,21 +2652,58 @@ void VKGSRender::load_program_env()
+@@ -2042,21 +2650,58 @@ void VKGSRender::load_program_env()
  
  	const bool update_transform_constants = m_stale_constants.test(rsx::draw_state_t::group::transform_constants);
  	const bool update_fragment_constants = m_stale_constants.test(rsx::draw_state_t::group::fragment_constants);
@@ -11269,7 +11267,7 @@ index b101a27..5a189f6 100644
  
  		m_vertex_env_ring_info.unmap();
  		m_vertex_env_dynamic_offset = mem;
-@@ -2067,6 +2714,7 @@ void VKGSRender::load_program_env()
+@@ -2067,6 +2712,7 @@ void VKGSRender::load_program_env()
  
  	if (update_instancing_data)
  	{
@@ -11277,7 +11275,7 @@ index b101a27..5a189f6 100644
  		// Combines transform load + instancing lookup table
  		const auto alignment = m_device->gpu().get_limits().minStorageBufferOffsetAlignment;
  		usz indirection_table_offset = 0;
-@@ -2093,6 +2741,22 @@ void VKGSRender::load_program_env()
+@@ -2093,6 +2739,22 @@ void VKGSRender::load_program_env()
  	}
  	else if (update_transform_constants)
  	{
@@ -11300,7 +11298,7 @@ index b101a27..5a189f6 100644
  		// Transform constants
  		usz mem_offset = 0;
  		auto alloc_storage = [&](usz size) -> std::pair<void*, usz>
-@@ -2102,15 +2766,44 @@ void VKGSRender::load_program_env()
+@@ -2102,15 +2764,44 @@ void VKGSRender::load_program_env()
  		};
  
  		auto io_buf = rsx::io_buffer(alloc_storage);
@@ -11346,7 +11344,7 @@ index b101a27..5a189f6 100644
  		}
  	}
  
-@@ -2119,6 +2812,7 @@ void VKGSRender::load_program_env()
+@@ -2119,6 +2810,7 @@ void VKGSRender::load_program_env()
  		// Fragment constants
  		if (fragment_constants_size)
  		{
@@ -11354,7 +11352,7 @@ index b101a27..5a189f6 100644
  			m_fragment_constants_dynamic_offset = m_fragment_constants_allocator->alloc_bytes(fragment_constants_size);
  			auto buf = m_fragment_constants_ring_info.map(m_fragment_constants_dynamic_offset, fragment_constants_size);
  
-@@ -2134,10 +2828,23 @@ void VKGSRender::load_program_env()
+@@ -2134,10 +2826,23 @@ void VKGSRender::load_program_env()
  
  	if (update_fragment_env)
  	{
@@ -11379,7 +11377,7 @@ index b101a27..5a189f6 100644
  		m_fragment_env_ring_info.unmap();
  
  		m_fragment_env_buffer_info = m_fragment_env_ring_info.window<32>(m_fragment_env_dynamic_offset, 32, gpu_limits.maxUniformBufferRange);
-@@ -2146,10 +2853,12 @@ void VKGSRender::load_program_env()
+@@ -2146,10 +2851,12 @@ void VKGSRender::load_program_env()
  
  	if (update_fragment_texture_env)
  	{
@@ -11392,7 +11390,7 @@ index b101a27..5a189f6 100644
  		m_fragment_texture_params_ring_info.unmap();
  
  		m_fragment_texture_params_buffer_info = m_fragment_texture_params_ring_info.window<768>(m_texture_parameters_dynamic_offset, 768, gpu_limits.maxUniformBufferRange);
-@@ -2198,6 +2907,7 @@ void VKGSRender::load_program_env()
+@@ -2198,6 +2905,7 @@ void VKGSRender::load_program_env()
  		}
  	}
  
@@ -11400,7 +11398,7 @@ index b101a27..5a189f6 100644
  	m_program->bind_uniform(m_vertex_env_buffer_info, vk::glsl::binding_set_index_vertex, m_vs_binding_table->context_buffer_location);
  	m_program->bind_uniform(m_vertex_layout_stream_info, vk::glsl::binding_set_index_vertex, m_vs_binding_table->vertex_buffers_location + 2);
  	m_program->bind_uniform(m_fragment_env_buffer_info, vk::glsl::binding_set_index_fragment, m_fs_binding_table->context_buffer_location);
-@@ -2420,6 +3130,7 @@ void VKGSRender::patch_transform_constants(rsx::context* /*ctx*/, u32 index, u32
+@@ -2420,6 +3128,7 @@ void VKGSRender::patch_transform_constants(rsx::context* /*ctx*/, u32 index, u32
  void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore wait_semaphore, VkSemaphore signal_semaphore, VkPipelineStageFlags pipeline_stage_flags)
  {
  	ensure(!m_queue_status.test_and_set(flush_queue_state::flushing));
@@ -11408,7 +11406,7 @@ index b101a27..5a189f6 100644
  
  	// Host MM sync before executing anything on the GPU
  	rsx::mm_flush();
-@@ -2484,8 +3195,13 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore
+@@ -2484,8 +3193,13 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore
  		m_host_dma_ctrl->host_ctx()->on_label_release();
  	}
  
@@ -11422,7 +11420,7 @@ index b101a27..5a189f6 100644
  
  	// Supporting concurrent access vastly simplifies this logic.
  	// Instead of doing CB slice injection, we can just chain these together logically with the async stream going first
-@@ -2518,7 +3234,14 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore
+@@ -2518,7 +3232,14 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore
  		primary_submit_info.queue_signal(signal_semaphore);
  	}
  
@@ -11437,7 +11435,7 @@ index b101a27..5a189f6 100644
  
  	m_queue_status.clear(flush_queue_state::flushing);
  }
-@@ -2533,9 +3256,45 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2533,9 +3254,45 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  	if (m_draw_fbo && layout.ignore_change)
  	{
  		// Nothing has changed, we're still using the same framebuffer
@@ -11483,7 +11481,7 @@ index b101a27..5a189f6 100644
  	res()->surface_cache.prepare_render_target(*m_current_command_buffer,
  		m_ctx->fb.layout.color_format, m_ctx->fb.layout.depth_format,
  		m_ctx->fb.layout.width, m_ctx->fb.layout.height,
-@@ -2544,18 +3303,68 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2544,18 +3301,68 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  		m_ctx->fb.layout.actual_color_pitch, m_ctx->fb.layout.actual_zeta_pitch,
  		RSX(m_ctx)->resolution_scaling_config);
  
@@ -11556,7 +11554,7 @@ index b101a27..5a189f6 100644
  		}
  
  		m_ctx->fb.surface_info[i].address = m_ctx->fb.surface_info[i].pitch = 0;
-@@ -2573,6 +3382,7 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2573,6 +3380,7 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  			const utils::address_range32 surface_range = m_ctx->fb.depth_surface_info.get_memory_range();
  			res()->texture_cache.set_memory_read_flags(surface_range, rsx::memory_read_flags::flush_once);
  			res()->texture_cache.flush_if_cache_miss_likely(*m_current_command_buffer, surface_range);
@@ -11564,7 +11562,7 @@ index b101a27..5a189f6 100644
  		}
  
  		m_ctx->fb.depth_surface_info.address = m_ctx->fb.depth_surface_info.pitch = 0;
-@@ -2583,6 +3393,11 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2583,6 +3391,11 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  		m_ctx->fb.depth_surface_info.samples = samples;
  	}
  
@@ -11576,7 +11574,7 @@ index b101a27..5a189f6 100644
  	// Bind created rtts as current fbo...
  	const auto draw_buffers = rsx::utility::get_rtt_indexes(m_ctx->fb.layout.target);
  	m_draw_buffers.clear();
-@@ -2618,11 +3433,29 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2618,11 +3431,29 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  	// Before messing with memory properties, flush command queue if there are dma transfers queued up
  	if (m_current_command_buffer->flags & vk::command_buffer::cb_has_dma_transfer)
  	{
@@ -11606,7 +11604,7 @@ index b101a27..5a189f6 100644
  		for (auto& surface : res()->surface_cache.superseded_surfaces)
  		{
  			res()->texture_cache.discard_framebuffer_memory_region(*m_current_command_buffer, surface->get_memory_range());
-@@ -2630,13 +3463,14 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2630,13 +3461,14 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  
  		res()->surface_cache.superseded_surfaces.clear();
  	}
@@ -11622,7 +11620,7 @@ index b101a27..5a189f6 100644
  
  			if (lock &&
  #ifdef TEXTURE_CACHE_DEBUG
-@@ -2666,13 +3500,14 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2666,13 +3498,14 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  
  		res()->surface_cache.orphaned_surfaces.clear();
  	}
@@ -11638,7 +11636,7 @@ index b101a27..5a189f6 100644
  		{
  			res()->texture_cache.lock_memory_region(
  				*m_current_command_buffer, res()->surface_cache.m_bound_render_targets[index].second, surface_range, true,
-@@ -2684,6 +3519,7 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2684,6 +3517,7 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  			res()->texture_cache.commit_framebuffer_memory_region(*m_current_command_buffer, surface_range);
  		}
  	}
@@ -11646,7 +11644,7 @@ index b101a27..5a189f6 100644
  
  	if (m_ctx->fb.depth_surface_info.address && m_ctx->fb.depth_surface_info.pitch)
  	{
-@@ -2701,6 +3537,16 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2701,6 +3535,16 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  		}
  	}
  
@@ -11663,7 +11661,7 @@ index b101a27..5a189f6 100644
  	std::vector<u8> input_attachments{};
  	if ((m_ctx->program.fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING) &&
  		!m_ctx->draw_state.dirty.test(rsx::draw_state_t::group::fragment_program))
-@@ -2737,6 +3583,7 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2737,6 +3581,7 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  	m_draw_fbo->add_ref();
  
  	set_viewport();
@@ -11671,7 +11669,7 @@ index b101a27..5a189f6 100644
  	return true;
  }
  
-@@ -2758,20 +3605,39 @@ bool VKGSRender::on_renderctl(u32 request_code, void* args)
+@@ -2758,20 +3603,39 @@ bool VKGSRender::on_renderctl(u32 request_code, void* args)
  
  bool VKGSRender::scaled_image_from_memory(const rsx::blit_src_info& src, const rsx::blit_dst_info& dst, bool interpolate)
  {
@@ -11711,7 +11709,7 @@ index b101a27..5a189f6 100644
  	return false;
  }
  
-@@ -2826,21 +3692,67 @@ bool VKGSRender::check_occlusion_query_status(rsx::reports::occlusion_query_info
+@@ -2826,21 +3690,67 @@ bool VKGSRender::check_occlusion_query_status(rsx::reports::occlusion_query_info
  	if (data.is_current(m_current_command_buffer))
  		return false;
  
@@ -11779,7 +11777,7 @@ index b101a27..5a189f6 100644
  			flush_command_queue();
  
  			if (m_flush_requests.pending())
-@@ -2852,7 +3764,35 @@ void VKGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info*
+@@ -2852,7 +3762,35 @@ void VKGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info*
  			busy_wait();
  		}
  
@@ -12029,10 +12027,10 @@ index 2a00549..fd6a450 100644
  		std::vector<vk::image_view*> views;
  		views.reserve(2);
 diff --git a/rpcs3/Emu/RSX/VK/VKPipelineCompiler.cpp b/rpcs3/Emu/RSX/VK/VKPipelineCompiler.cpp
-index 90e24e0..59d4cc0 100644
+index 90e24e0..277c84d 100644
 --- a/rpcs3/Emu/RSX/VK/VKPipelineCompiler.cpp
 +++ b/rpcs3/Emu/RSX/VK/VKPipelineCompiler.cpp
-@@ -1,14 +1,460 @@
+@@ -1,14 +1,461 @@
  #include "stdafx.h"
  #include "VKPipelineCompiler.h"
 +#include "VKHelpers.h"
@@ -12337,11 +12335,12 @@ index 90e24e0..59d4cc0 100644
 +		{
 +			struct args_t { VkDevice dev; VkPipelineCache cache; const VkGraphicsPipelineCreateInfo* info; VkPipeline* out; } args{ dev, cache, info, out };
 +			long res = VK_SUCCESS;
++			const char* stage = (info->flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) ? "rt:gpl_part" : "rt:gpl_link";
 +			if (!r2preload::driver_call([](void* p) -> long
 +			{
 +				auto* a = static_cast<args_t*>(p);
 +				return static_cast<long>(vkCreateGraphicsPipelines(a->dev, a->cache, 1, a->info, nullptr, a->out));
-+			}, &args, &res, true))
++			}, &args, &res, true, stage))
 +			{
 +				*out = VK_NULL_HANDLE;
 +				return VK_ERROR_UNKNOWN;
@@ -12493,7 +12492,7 @@ index 90e24e0..59d4cc0 100644
  	// Global list of worker threads
  	std::unique_ptr<named_thread_group<pipe_compiler>> g_pipe_compilers;
  	int g_num_pipe_compilers = 0;
-@@ -40,26 +486,67 @@ namespace vk
+@@ -40,26 +487,67 @@ namespace vk
  		{
  			for (auto&& job : m_work_queue.pop_all())
  			{
@@ -12572,7 +12571,7 @@ index 90e24e0..59d4cc0 100644
  	}
  
  	std::unique_ptr<glsl::program> pipe_compiler::int_compile_compute_pipe(
-@@ -80,6 +567,10 @@ namespace vk
+@@ -80,6 +568,10 @@ namespace vk
  	{
  		auto program = std::make_unique<glsl::program>(*m_device, create_info, vs_inputs, fs_inputs);
  		program->link(m_pipeline_cache, flags & SEPARATE_SHADER_OBJECTS);
@@ -12583,7 +12582,7 @@ index 90e24e0..59d4cc0 100644
  		return program;
  	}
  
-@@ -90,109 +581,11 @@ namespace vk
+@@ -90,109 +582,11 @@ namespace vk
  		const std::vector<glsl::program_input>& fs_inputs,
  		op_flags flags)
  	{
@@ -12698,7 +12697,7 @@ index 90e24e0..59d4cc0 100644
  		return int_compile_graphics_pipe(info, vs_inputs, fs_inputs, flags);
  	}
  
-@@ -213,9 +606,11 @@ namespace vk
+@@ -213,9 +607,11 @@ namespace vk
  	{
  		if (flags & COMPILE_INLINE)
  		{
@@ -12710,7 +12709,7 @@ index 90e24e0..59d4cc0 100644
  		m_work_queue.push(create_info, cs_inputs, flags, callback);
  		return {};
  	}
-@@ -228,6 +623,7 @@ namespace vk
+@@ -228,6 +624,7 @@ namespace vk
  	{
  		// It is very inefficient to defer this as all pointers need to be saved
  		ensure(flags & COMPILE_INLINE, "Asynchronous compilation is not allowed for raw graphics pipeline input");
@@ -12718,7 +12717,7 @@ index 90e24e0..59d4cc0 100644
  		return int_compile_graphics_pipe(create_info, vs_inputs, fs_inputs, flags);
  	}
  
-@@ -240,11 +636,48 @@ namespace vk
+@@ -240,11 +637,48 @@ namespace vk
  		const std::vector<glsl::program_input>& fs_inputs)
  	{
  		VkShaderModule modules[] = { vs, fs };
@@ -12767,7 +12766,7 @@ index 90e24e0..59d4cc0 100644
  		m_work_queue.push(create_info, modules, vs_inputs, fs_inputs, flags, callback);
  		return {};
  	}
-@@ -257,15 +690,217 @@ namespace vk
+@@ -257,15 +691,217 @@ namespace vk
  	{
  		if (flags & COMPILE_INLINE)
  		{
@@ -12985,7 +12984,7 @@ index 90e24e0..59d4cc0 100644
  		if (num_worker_threads <= 0)
  		{
  			// Select a conservative but modern default for async pipeline compilation.
-@@ -305,6 +940,12 @@ namespace vk
+@@ -305,6 +941,12 @@ namespace vk
  		return num_worker_threads;
  	}
  
@@ -12998,7 +12997,7 @@ index 90e24e0..59d4cc0 100644
  	void initialize_pipe_compiler(int num_worker_threads, VkPipelineCache pipe_cache)
  	{
  		num_worker_threads = decay_num_worker_threads(num_worker_threads);
-@@ -316,15 +957,48 @@ namespace vk
+@@ -316,15 +958,48 @@ namespace vk
  		if (!pipe_cache)
  		{
  			VkPipelineCacheCreateInfo drv_cache_info{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
@@ -13049,7 +13048,7 @@ index 90e24e0..59d4cc0 100644
  		g_num_pipe_compilers = num_worker_threads;
  
  		// Initialize the workers. At least one inline compiler shall exist (doesn't actually run)
-@@ -353,15 +1027,105 @@ namespace vk
+@@ -353,15 +1028,105 @@ namespace vk
  
  	void destroy_pipe_compiler()
  	{
@@ -13584,7 +13583,7 @@ index 2bfead6..670b03b 100644
  		}
  	};
 diff --git a/rpcs3/Emu/RSX/VK/VKProgramPipeline.cpp b/rpcs3/Emu/RSX/VK/VKProgramPipeline.cpp
-index 8687a68..b0a6886 100644
+index 8687a68..703eec8 100644
 --- a/rpcs3/Emu/RSX/VK/VKProgramPipeline.cpp
 +++ b/rpcs3/Emu/RSX/VK/VKProgramPipeline.cpp
 @@ -5,8 +5,11 @@
@@ -13621,7 +13620,7 @@ index 8687a68..b0a6886 100644
  
  			if (m_pipeline_layout)
  			{
-@@ -209,6 +218,76 @@ namespace vk
+@@ -209,6 +218,79 @@ namespace vk
  			auto p_compute_info = !p_graphics_info ? std::get_if<VkComputePipelineCreateInfo>(&m_info) : nullptr;
  			const bool is_graphics_pipe = p_graphics_info != nullptr;
  
@@ -13637,11 +13636,14 @@ index 8687a68..b0a6886 100644
 +					// the game's pipelines (guard_scope); a driver fault skips this pipeline
 +					struct args_t { VkDevice dev; VkPipelineCache cache; const VkGraphicsPipelineCreateInfo* info; VkPipeline* out; } args{ m_device, pipeline_cache, &create_info, &pipeline };
 +					long res = VK_SUCCESS;
++					static constexpr const char* gfx_stage[] = { "rt:gfx", "rt:gfx_s1", "rt:gfx_s2", "rt:gfx_s4", "rt:gfx_s8" };
++					const u32 samples = create_info.pMultisampleState ? static_cast<u32>(create_info.pMultisampleState->rasterizationSamples) : 0;
++					const char* stage = gfx_stage[samples == 1 ? 1 : samples == 2 ? 2 : samples == 4 ? 3 : samples == 8 ? 4 : 0];
 +					const bool ok = r2preload::driver_call([](void* p) -> long
 +					{
 +						auto* a = static_cast<args_t*>(p);
 +						return static_cast<long>(vkCreateGraphicsPipelines(a->dev, a->cache, 1, a->info, nullptr, a->out));
-+					}, &args, &res, r2preload::guard_active());
++					}, &args, &res, r2preload::guard_active(), stage);
 +					if (!ok)
 +					{
 +						return *this; // not linked, no pipeline: compile() returns no program
@@ -13660,7 +13662,7 @@ index 8687a68..b0a6886 100644
 +				{
 +					auto* a = static_cast<args_t*>(p);
 +					return static_cast<long>(vkCreateComputePipelines(a->dev, a->cache, 1, a->info, nullptr, a->out));
-+				}, &args, &res, r2preload::guard_active());
++				}, &args, &res, r2preload::guard_active(), "rt:compute");
 +				if (!ok)
 +				{
 +					return *this;
@@ -13698,7 +13700,7 @@ index 8687a68..b0a6886 100644
  			if (!is_graphics_pipe) [[ likely ]]
  			{
  				// We only support compute and graphics, so disable this for compute
-@@ -264,23 +343,9 @@ namespace vk
+@@ -264,23 +346,9 @@ namespace vk
  				}
  			}
  
@@ -13723,7 +13725,7 @@ index 8687a68..b0a6886 100644
  			return *this;
  		}
  
-@@ -365,14 +430,16 @@ namespace vk
+@@ -365,14 +433,16 @@ namespace vk
  			rsx::simple_array<VkPushConstantRange> push_constants{};
  			rsx::simple_array<VkDescriptorSetLayout> set_layouts{};
  
@@ -13742,7 +13744,7 @@ index 8687a68..b0a6886 100644
  				set_layouts.push_back(set.m_descriptor_set_layout);
  
  				for (const auto& input : set.m_inputs[input_type_push_constant])
-@@ -389,17 +456,32 @@ namespace vk
+@@ -389,17 +459,32 @@ namespace vk
  			VkPipelineLayoutCreateInfo create_info
  			{
  				.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -13776,7 +13778,7 @@ index 8687a68..b0a6886 100644
  			VkDescriptorSet bind_sets[binding_set_index_max_enum];
  			unsigned count = 0;
  
-@@ -413,7 +495,7 @@ namespace vk
+@@ -413,7 +498,7 @@ namespace vk
  				bind_sets[count++] = set.commit();   // Commit variable changes and return handle to the new set
  			}
  
@@ -13785,7 +13787,7 @@ index 8687a68..b0a6886 100644
  			cmd.bind_descriptor_sets({ bind_sets, count }, bind_point, m_pipeline_layout);
  			return *this;
  		}
-@@ -622,7 +704,223 @@ namespace vk
+@@ -622,7 +707,223 @@ namespace vk
  			return m_descriptor_set.value();
  		}
  
@@ -14010,7 +14012,7 @@ index 8687a68..b0a6886 100644
  		{
  			ensure(m_descriptor_set_layout == VK_NULL_HANDLE);
  
-@@ -692,7 +990,9 @@ namespace vk
+@@ -692,7 +993,9 @@ namespace vk
  				m_descriptor_types[i] = descriptor_type_map[i];
  			}
  
@@ -16085,10 +16087,10 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..9cb80de
+index 0000000..e1e2a62
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
-@@ -0,0 +1,2801 @@
+@@ -0,0 +1,2808 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation, two backends:
 +//  * NVIDIA DLSS Frame Generation through Streamline (manual hooking): sl.interposer.dll is loaded at run time
@@ -16110,6 +16112,7 @@ index 0000000..9cb80de
 +#include "VKResourceManager.h"
 +#include "VKR2Upscaler.h"
 +#include "VKR2PcExtras.h"
++#include "Emu/RSX/port_r2preload.h" // R2PORT: r2preload::stage_scope (issue #10/#23)
 +#include "vkutils/sampler.h"
 +#include "Emu/RSX/rsx_methods.h"
 +#include "Emu/RSX/NV47/HW/context_accessors.define.h"
@@ -17707,6 +17710,12 @@ index 0000000..9cb80de
 +		fg_ensure(f.ui, out_fmt, W, H, out_usage);
 +		fg_ensure(f.count, VK_FORMAT_R32_UINT, 1, 1, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 +		f.out_fmt = out_fmt;
++		if (hdr10 && f.sc_format != out_fmt)
++		{
++			static bool logged = false; // R3 #13: the typed UI / HUD-less formats are told to DLSS-G / FSR3, so differing orders are fine
++			if (!logged) fglog("HDR: swapchain format %d, UI / HUD-less format %d", static_cast<int>(f.sc_format), static_cast<int>(out_fmt));
++			logged = true;
++		}
 +
 +		const bool split = fgcfg().hud && f.hud && f.hud_rt == src && !f.unsure && f.hud_draws &&
 +			f.hud->info.format == src->info.format && f.hud->width() == src->width() && f.hud->height() == src->height();
@@ -18402,7 +18411,7 @@ index 0000000..9cb80de
 +				d.presentQueue = { x.present_q, x.pfam, nullptr };
 +				d.imageAcquireQueue = { x.acquire_q, x.afam, nullptr };
 +				fx_lock lk;
-+				const ffxReturnCode_t rc = x.create(&x.sc_ctx, &d.header, nullptr);
++				const ffxReturnCode_t rc = [&] { const r2preload::stage_scope r2_stage("rt:ffx_fg_swapchain"); return x.create(&x.sc_ctx, &d.header, nullptr); }(); // R2PORT: issue #10/#23
 +				ffxQueryDescSwapchainReplacementFunctionsVK q{};
 +				q.header.type = FFX_API_QUERY_DESC_TYPE_FGSWAPCHAIN_FUNCTIONS_VK;
 +				const bool ok = rc == FFX_API_RETURN_OK && s != VK_NULL_HANDLE && x.query(&x.sc_ctx, &q.header) == FFX_API_RETURN_OK &&
@@ -18518,7 +18527,7 @@ index 0000000..9cb80de
 +			ffxReturnCode_t rc;
 +			{
 +				fx_lock lk;
-+				rc = x.create(&x.fg_ctx, &cd.header, nullptr);
++				rc = [&] { const r2preload::stage_scope r2_stage("rt:ffx_fg_ctx"); return x.create(&x.fg_ctx, &cd.header, nullptr); }(); // R2PORT: issue #10/#23
 +			}
 +			if (rc != FFX_API_RETURN_OK || !x.fg_ctx)
 +			{
@@ -21816,10 +21825,10 @@ index 0000000..65ed71b
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Hdr.cpp b/rpcs3/Emu/RSX/VK/VKR2Hdr.cpp
 new file mode 100644
-index 0000000..37635a7
+index 0000000..aecb001
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Hdr.cpp
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,216 @@
 +// R2PORT PC extras (not upstream RPCS3): HDR output settings, Windows HDR detection, SDR -> HDR present code.
 +//
 +// Inverse tone mapping (same curve as R1's port_hdr.h, the C reference; keep them in step):
@@ -21982,6 +21991,16 @@ index 0000000..37635a7
 +	float sat() { return levels().sat; }
 +	const char* peak_source() { return levels().src; }
 +
++	bool sanitize()
++	{
++		static const bool on = []
++		{
++			const char* e = henv("HDR_SANITIZE");
++			return !(e && (!std::strcmp(e, "0") || !_stricmp(e, "off")));
++		}();
++		return on;
++	}
++
 +	const char* glsl()
 +	{
 +		return R"(
@@ -22028,10 +22047,10 @@ index 0000000..37635a7
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Hdr.h b/rpcs3/Emu/RSX/VK/VKR2Hdr.h
 new file mode 100644
-index 0000000..2e561b0
+index 0000000..36ca558
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Hdr.h
-@@ -0,0 +1,29 @@
+@@ -0,0 +1,33 @@
 +// R2PORT PC extras: HDR output settings, Windows HDR detection and the SDR -> HDR present code
 +// (VKR2PcExtras.cpp does the Vulkan side and calls these). Nothing here runs unless HDR is asked for.
 +#pragma once
@@ -22056,6 +22075,10 @@ index 0000000..2e561b0
 +	float peak();
 +	float sat();
 +	const char* peak_source(); // "setting", "display" or "default"
++
++	// R3 #13: NaN colour channels are zeroed before the HDR encode (as the 8-bit SDR swapchain write does), so one bad
++	// channel cannot spread through the BT.2020 matrix. *_HDR_SANITIZE=0 turns it off. Cached.
++	bool sanitize();
 +
 +	// GLSL for the present pass: vec3 r2pc_hdr(vec3 c, vec2 frag_xy, int mode, float paper, float peak, float sat),
 +	// c = the final SDR colour (0..1, gamma), mode 1 = HDR10 (PQ), 2 = scRGB.
@@ -23391,10 +23414,10 @@ index 0000000..268ccb4
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2PcExtras.cpp b/rpcs3/Emu/RSX/VK/VKR2PcExtras.cpp
 new file mode 100644
-index 0000000..9193bce
+index 0000000..873ed81
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2PcExtras.cpp
-@@ -0,0 +1,533 @@
+@@ -0,0 +1,537 @@
 +// R2PORT PC extras (not upstream RPCS3): HDR output, colour-blind filter, NVIDIA Reflex.
 +//
 +//  * HDR (R2_HDR=0 / auto / 1 HDR10 / scrgb, R2_HDR_PAPER nits, R2_HDR_PEAK nits, R2_HDR_SAT 0..2;
@@ -23710,6 +23733,9 @@ index 0000000..9193bce
 +		const auto scrgb = [&] { return find({ VK_FORMAT_R16G16B16A16_SFLOAT }, VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT); };
 +		if (want == 2) g_pc_hdr_active = scrgb() ? 2 : hdr10() ? 1 : 0;
 +		else g_pc_hdr_active = hdr10() ? 1 : scrgb() ? 2 : 0;
++		for (const auto& sf : formats) // R3 #13: what the display offers, for HDR colour reports
++			if (sf.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
++				std::fprintf(stderr, "[pcx-vk] HDR: surface offers format %d colour space %d\n", static_cast<int>(sf.format), static_cast<int>(sf.colorSpace));
 +		if (g_pc_hdr_active)
 +			std::fprintf(stderr, "[pcx-vk] HDR output%s: %s swapchain (format %d), paper white %.0f nits, peak %.0f nits (%s), saturation %.2f\n",
 +				r2hdr::is_auto() ? " (auto)" : "", g_pc_hdr_active == 1 ? "HDR10 / PQ" : "scRGB", static_cast<int>(format),
@@ -23870,7 +23896,7 @@ index 0000000..9193bce
 +	{
 +		static const std::string funcs = std::string(R"(
 +// R2PORT PC extras: colour-blind filter and SDR -> HDR (PQ / scRGB). Parameters ride in
-+// right_anaglyph_matrix when stereo is off: [0] = (hdr mode, cvd mode, saturation), [1] = (paper nits, peak nits).
++// right_anaglyph_matrix when stereo is off: [0] = (hdr mode, cvd mode, saturation), [1] = (paper nits, peak nits, NaN guard).
 +// Daltonization (as ReShade's Daltonize.fx) done on linear light: the sRGB-encoded colour is decoded first and the
 +// corrected one encoded again, before any HDR encoding.
 +vec3 r2pc_cvd(vec3 cs, int m)
@@ -23896,6 +23922,7 @@ index 0000000..9193bce
 +	const int hdr = int(right_anaglyph_matrix[0].x + 0.5);
 +	const int cvd = int(right_anaglyph_matrix[0].y + 0.5);
 +	vec3 c = o.rgb;
++	if (hdr > 0 && right_anaglyph_matrix[1].z > 0.5) c = mix(c, vec3(0.0), isnan(c)); // R3 #13: *_HDR_SANITIZE
 +	if (cvd > 0) c = r2pc_cvd(c, cvd);
 +	if (hdr > 0) c = r2pc_hdr(c, gl_FragCoord.xy, hdr, right_anaglyph_matrix[1].x, right_anaglyph_matrix[1].y, right_anaglyph_matrix[0].z);
 +	return vec4(c, o.a);
@@ -23925,7 +23952,7 @@ index 0000000..9193bce
 +		col0[2] = hdr ? r2hdr::sat() : 0.f;
 +		col1[0] = hdr ? r2hdr::paper() : 203.f;
 +		col1[1] = hdr ? r2hdr::peak() : 203.f;
-+		col1[2] = 0.f;
++		col1[2] = hdr && r2hdr::sanitize() ? 1.f : 0.f; // R3 #13: NaN guard before the HDR encode
 +	}
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2PcExtras.h b/rpcs3/Emu/RSX/VK/VKR2PcExtras.h
@@ -24193,10 +24220,10 @@ index 0000000..41cee9c
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Preload.cpp b/rpcs3/Emu/RSX/VK/VKR2Preload.cpp
 new file mode 100644
-index 0000000..be1e3b2
+index 0000000..221e595
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Preload.cpp
-@@ -0,0 +1,371 @@
+@@ -0,0 +1,427 @@
 +// R2PORT (GitHub issue #10): breadcrumb, quarantine and SEH guard of the shader preload (see port_r2preload.h).
 +
 +#include "Emu/RSX/port_r2preload.h"
@@ -24243,6 +24270,12 @@ index 0000000..be1e3b2
 +		thread_local int t_slot = -1;
 +		thread_local bool t_guard = false;
 +		thread_local const std::string* t_name = nullptr;
++		thread_local const char* t_stage = nullptr; // stage_scope / driver_call label ("rt:<what>")
++		thread_local bool t_serial_held = false;    // a stage_scope of this thread holds g_driver_lock
++
++		std::once_flag g_env_once;
++		std::once_flag g_crumb_once;
++		std::string g_last_inflight; // the last run's breadcrumb file, read before it is recreated
 +
 +		void log_line(const char* fmt, const std::string& a, const std::string& b = {})
 +		{
@@ -24346,6 +24379,7 @@ index 0000000..be1e3b2
 +			if (!g_slots) return;
 +			if (t_slot < 0)
 +			{
++				if (!key) return; // nothing to clear
 +				const unsigned s = g_next_slot++;
 +				if (s >= ::r2pipe::inflight_slots) return;
 +				t_slot = static_cast<int>(s);
@@ -24357,16 +24391,47 @@ index 0000000..be1e3b2
 +#endif
 +			::r2pipe::inflight_format(g_slots + static_cast<size_t>(t_slot) * ::r2pipe::inflight_slot_bytes, tid, key);
 +		}
++
++		void read_env()
++		{
++			std::call_once(g_env_once, []
++			{
++				g_use_quarantine = ::r2pipe::env_int("PORT_PRELOAD_QUARANTINE", 1) != 0;
++				g_use_breadcrumb = ::r2pipe::env_int("PORT_PRELOAD_BREADCRUMB", 1) != 0;
++				g_use_seh = ::r2pipe::env_int("PORT_PRELOAD_SEH", 1) != 0;
++			});
++		}
++
++		// Keeps the last run's breadcrumb (init() matches it against the crash report), then maps a fresh one
++		void ensure_breadcrumb()
++		{
++			read_env();
++#ifdef _WIN32
++			std::call_once(g_crumb_once, []
++			{
++				if (!g_use_breadcrumb) return;
++				const std::string logs = logs_dir();
++				CreateDirectoryA(logs.c_str(), nullptr);
++				const std::string path = logs + "\\preload_inflight.txt";
++				g_last_inflight = read_file(path, 64 * 1024);
++				map_breadcrumb(path);
++			});
++#endif
++		}
++
++		// The breadcrumb shows the preload entry (link_scope) when there is one, else the innermost stage label
++		void stage_set(const char* stage)
++		{
++			t_stage = stage;
++			if (g_use_breadcrumb && !t_name) set_slot(stage);
++		}
 +	}
 +
 +	void init(const std::string& cache_root)
 +	{
++		ensure_breadcrumb();
 +		std::call_once(g_init, [&]
 +		{
-+			g_use_quarantine = ::r2pipe::env_int("PORT_PRELOAD_QUARANTINE", 1) != 0;
-+			g_use_breadcrumb = ::r2pipe::env_int("PORT_PRELOAD_BREADCRUMB", 1) != 0;
-+			g_use_seh = ::r2pipe::env_int("PORT_PRELOAD_SEH", 1) != 0;
-+
 +			if (g_use_quarantine && !cache_root.empty())
 +			{
 +				g_quarantine_path = cache_root + "preload_quarantine.txt";
@@ -24383,28 +24448,21 @@ index 0000000..be1e3b2
 +			}
 +
 +#ifdef _WIN32
-+			if (g_use_breadcrumb)
++			// The last run died while a preload thread linked the pipeline its crash report names
++			if (g_use_breadcrumb && g_use_quarantine)
 +			{
-+				const std::string logs = logs_dir();
-+				CreateDirectoryA(logs.c_str(), nullptr);
-+				const std::string path = logs + "\\preload_inflight.txt";
-+
-+				// The last run died while a preload thread linked the pipeline its crash report names
-+				if (g_use_quarantine)
++				const auto inflight = ::r2pipe::inflight_parse(g_last_inflight);
++				if (!inflight.empty())
 +				{
-+					const auto inflight = ::r2pipe::inflight_parse(read_file(path, 64 * 1024));
-+					if (!inflight.empty())
-+					{
-+						const std::string report = newest_crash_report(logs);
-+						const std::string key = report.empty() ? std::string() : ::r2pipe::crash_preload_key(read_file(report, 4u << 20));
-+						const bool match = !key.empty() && std::any_of(inflight.begin(), inflight.end(),
-+							[&](const ::r2pipe::inflight_entry& e) { return e.key == key; });
-+						if (match) add_quarantine(key, "the last run crashed while a preload thread linked it");
-+					}
++					const std::string report = newest_crash_report(logs_dir());
++					const std::string key = report.empty() ? std::string() : ::r2pipe::crash_preload_key(read_file(report, 4u << 20));
++					const bool match = !key.empty() && !::r2pipe::inflight_is_stage(key) && std::any_of(inflight.begin(), inflight.end(),
++						[&](const ::r2pipe::inflight_entry& e) { return e.key == key; });
++					if (match) add_quarantine(key, "the last run crashed while a preload thread linked it");
 +				}
-+
-+				map_breadcrumb(path);
 +			}
++			g_last_inflight.clear();
++			g_last_inflight.shrink_to_fit();
 +#endif
 +			const unsigned n = quarantine_count();
 +			if (n) log_line("[r2rsx] shader preload: %s quarantined pipeline(s) skipped%s\n", std::to_string(n));
@@ -24433,9 +24491,9 @@ index 0000000..be1e3b2
 +
 +	link_scope::~link_scope()
 +	{
-+		if (g_use_breadcrumb) set_slot(nullptr);
 +		t_guard = false;
 +		t_name = nullptr;
++		if (g_use_breadcrumb) set_slot(t_stage);
 +	}
 +
 +	guard_scope::guard_scope() : prev(t_guard)
@@ -24450,7 +24508,7 @@ index 0000000..be1e3b2
 +
 +	void configure(uint32_t vendor_id)
 +	{
-+		g_use_seh = ::r2pipe::env_int("PORT_PRELOAD_SEH", 1) != 0;
++		ensure_breadcrumb();
 +		g_serial = ::r2pipe::pipe_serialize(vendor_id);
 +		if (g_serial)
 +		{
@@ -24548,7 +24606,7 @@ index 0000000..be1e3b2
 +		std::snprintf(what, sizeof(what), "exception 0x%08lX at %s (address 0x%llX) on %s thread %lu",
 +			static_cast<unsigned long>(fi.code), where, static_cast<unsigned long long>(fi.fault_address),
 +			t_name ? "preload" : "pipeline compiler", static_cast<unsigned long>(GetCurrentThreadId()));
-+		const std::string name = t_name ? *t_name : std::string("a pipeline for the current draw");
++		const std::string name = t_name ? *t_name : std::string(t_stage ? t_stage : "a pipeline for the current draw");
 +		log_line("[r2rsx] shader preload: the driver faulted while linking %s: %s; pipeline skipped, preload stopped "
 +			"(PORT_PRELOAD_SEH=0 disables this guard)\n", name, what);
 +		if (t_name && !t_name->empty()) add_quarantine(name, "the driver faulted while a preload thread linked it");
@@ -24559,21 +24617,46 @@ index 0000000..be1e3b2
 +#endif
 +	}
 +
-+	bool driver_call(long (*fn)(void*), void* ctx, long* result, bool guard)
++	bool driver_call(long (*fn)(void*), void* ctx, long* result, bool guard, const char* stage)
 +	{
 +		std::unique_lock<std::mutex> lock(g_driver_lock, std::defer_lock);
-+		if (g_serial) lock.lock();
-+		if (guard && g_use_seh) return guarded_call(fn, ctx, result);
-+		*result = fn(ctx);
-+		return true;
++		if (g_serial && !t_serial_held) lock.lock();
++		const char* const prev = t_stage;
++		if (stage) stage_set(stage);
++		bool ok = true;
++		if (guard && g_use_seh) ok = guarded_call(fn, ctx, result);
++		else *result = fn(ctx);
++		if (stage) stage_set(prev);
++		return ok;
++	}
++
++	stage_scope::stage_scope(const char* stage) : prev_stage(t_stage), locked(false)
++	{
++		read_env();
++		if (g_serial && !t_serial_held && ::r2pipe::env_int("PORT_PIPE_SERIAL_SDK", 1) != 0)
++		{
++			g_driver_lock.lock();
++			t_serial_held = locked = true;
++		}
++		stage_set(stage);
++	}
++
++	stage_scope::~stage_scope()
++	{
++		stage_set(prev_stage);
++		if (locked)
++		{
++			t_serial_held = false;
++			g_driver_lock.unlock();
++		}
 +	}
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..fd85ee5
+index 0000000..171a09c
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,11998 @@
+@@ -0,0 +1,12017 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -24591,6 +24674,7 @@ index 0000000..fd85ee5
 +#include "VKR2Upscaler.h"
 +#include "VKR2XeSS.h"
 +#include "VKR2FrameGen.h" // R2PORT frame generation
++#include "Emu/RSX/port_r2preload.h" // R2PORT: r2preload::driver_call (issue #10/#23)
 +#include "VKR2DeformLogic.h" // R2PORT: RSX_DLSS_OBJMV_DEFORM capture policy (unit-tested in project\tests\fg_logic_test.cpp)
 +#include "VKR2DlssQuality.h" // PORT_DLSS_BIAS_MASK / PORT_DLSS_RESET_* helpers (unit-tested in scratch\dlss_quality)
 +#include "../../../../../../../project/port_native_summary.h" // R2PORT: on/off switch words of the promoted defaults
@@ -24644,6 +24728,24 @@ index 0000000..fd85ee5
 +extern bool g_r2_trace_now;
 +
 +namespace vk { bool r2_vprun_fast_active(); } // VKDraw.cpp (RSX_VPRUN_FAST)
++
++// R2PORT (issue #10/#23): the object motion pipelines built on their worker threads go through r2preload::driver_call:
++// serialised with the game's pipelines on AMD (PORT_PIPE_SERIAL), SEH-guarded, named in the crash breadcrumb
++static VkPipeline r2_ups_create_pipe(VkDevice dev, const VkGraphicsPipelineCreateInfo& info, const char* stage)
++{
++	VkPipeline pipe = VK_NULL_HANDLE;
++	struct args_t { VkDevice dev; const VkGraphicsPipelineCreateInfo* info; VkPipeline* out; } args{ dev, &info, &pipe };
++	long res = VK_SUCCESS;
++	if (!r2preload::driver_call([](void* p) -> long
++	{
++		auto* a = static_cast<args_t*>(p);
++		return static_cast<long>(vkCreateGraphicsPipelines(a->dev, VK_NULL_HANDLE, 1, a->info, nullptr, a->out));
++	}, &args, &res, true, stage) || res != VK_SUCCESS)
++	{
++		return VK_NULL_HANDLE;
++	}
++	return pipe;
++}
 +
 +namespace
 +{
@@ -32454,7 +32556,7 @@ index 0000000..fd85ee5
 +				else if (old_rtx) preset = 5; // NVSDK_NGX_DLSS_Hint_Render_Preset_E (CNN)
 +			}
 +			preset = r2mvd_preset(preset); // RSX_MV_DUMP variant j: M
-+			if (g_dlss.create(ccmd, rw, rh, ow, oh, (st.inverted ? 1 : 0) | (half ? 2 : 0), preset) == 1)
++			if ([&] { const r2preload::stage_scope r2_stage("rt:dlss_create"); return g_dlss.create(ccmd, rw, rh, ow, oh, (st.inverted ? 1 : 0) | (half ? 2 : 0), preset); }() == 1) // R2PORT: issue #10/#23
 +			{
 +				st.backend = 2;
 +				r2log("%s active at %ux%u -> %ux%u (%s depth, %s)", ow > rw ? "DLSS" : "DLAA", rw, rh, ow, oh, st.inverted ? "inverted" : "standard", half ? "FP16" : "8-bit");
@@ -32502,7 +32604,7 @@ index 0000000..fd85ee5
 +		cd.maxRenderSize = { rw, rh };
 +		cd.maxUpscaleSize = { ow, oh };
 +		cd.fpMessage = ffx_message;
-+		const ffxReturnCode_t rc = g_ffx.create(&g_ffx.ctx, &cd.header, nullptr);
++		const ffxReturnCode_t rc = [&] { const r2preload::stage_scope r2_stage("rt:ffx_upscale_ctx"); return g_ffx.create(&g_ffx.ctx, &cd.header, nullptr); }(); // R2PORT: issue #10/#23
 +		if (rc == FFX_API_RETURN_OK)
 +		{
 +			st.backend = 1;
@@ -32748,7 +32850,7 @@ index 0000000..fd85ee5
 +			info.renderPass = j.rp;
 +			info.basePipelineIndex = -1;
 +			VkPipeline pipe = VK_NULL_HANDLE;
-+			if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &info, nullptr, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
++			pipe = r2_ups_create_pipe(dev, info, "rt:objmv_onepass");
 +			return pipe;
 +		}
 +
@@ -32829,7 +32931,7 @@ index 0000000..fd85ee5
 +			info.renderPass = j.rp;
 +			info.basePipelineIndex = -1;
 +			VkPipeline pipe = VK_NULL_HANDLE;
-+			if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &info, nullptr, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
++			pipe = r2_ups_create_pipe(dev, info, "rt:objmv_replay");
 +			return pipe;
 +		}
 +
@@ -35743,7 +35845,7 @@ index 0000000..fd85ee5
 +			info.renderPass = j.rp;
 +			info.basePipelineIndex = -1;
 +			VkPipeline pipe = VK_NULL_HANDLE;
-+			if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &info, nullptr, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
++			pipe = r2_ups_create_pipe(dev, info, "rt:objmv_pipe");
 +			return pipe;
 +		}
 +
@@ -36654,14 +36756,15 @@ index 0000000..86d44c7
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2XeSS.cpp b/rpcs3/Emu/RSX/VK/VKR2XeSS.cpp
 new file mode 100644
-index 0000000..bd4b459
+index 0000000..c4ab056
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2XeSS.cpp
-@@ -0,0 +1,574 @@
+@@ -0,0 +1,575 @@
 +// R2PORT: port addition (not upstream RPCS3). Intel XeSS backend of the VKR2Upscaler; see VKR2XeSS.h.
 +
 +#include "stdafx.h"
 +#include "VKR2XeSS.h"
++#include "Emu/RSX/port_r2preload.h" // R2PORT: r2preload::stage_scope (issue #10/#23)
 +
 +#include <cstdarg>
 +#include <cstdio>
@@ -37136,7 +37239,7 @@ index 0000000..bd4b459
 +		// low-res motion vectors (render size, the default) + depth; colour as the scene stores it
 +		ip.initFlags = ((flags & 1) ? XESS_INIT_FLAG_INVERTED_DEPTH : 0u) |
 +			((flags & 2) ? XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE : XESS_INIT_FLAG_LDR_INPUT_COLOR);
-+		const xess_result_t r = g_x.init(g_s.ctx, &ip);
++		const xess_result_t r = [&] { const r2preload::stage_scope r2_stage("rt:xess_init"); return g_x.init(g_s.ctx, &ip); }(); // R2PORT: issue #10/#23
 +		if (r != XESS_RESULT_SUCCESS)
 +		{
 +			release();
@@ -46515,7 +46618,7 @@ index a301db6..37df2f9 100644
  
  	public:
 diff --git a/rpcs3/Emu/RSX/VK/vkutils/instance.cpp b/rpcs3/Emu/RSX/VK/vkutils/instance.cpp
-index e59c249..1ac41ac 100644
+index e59c249..dacc6e1 100644
 --- a/rpcs3/Emu/RSX/VK/vkutils/instance.cpp
 +++ b/rpcs3/Emu/RSX/VK/vkutils/instance.cpp
 @@ -1,5 +1,8 @@
@@ -46554,10 +46657,19 @@ index e59c249..1ac41ac 100644
  		{
  			if (result == VK_ERROR_LAYER_NOT_PRESENT)
  			{
-@@ -396,6 +401,7 @@ namespace vk
+@@ -396,6 +401,16 @@ namespace vk
  		}
  
  		color_space = surfFormats[0].colorSpace;
++		// R2PORT: the colour space listed with the chosen format (surfFormats[0] may be an HDR pair on some drivers)
++		for (const auto& surface_format : surfFormats)
++		{
++			if (surface_format.format == format && surface_format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
++			{
++				color_space = surface_format.colorSpace;
++				break;
++			}
++		}
 +		vk::r2pc_pick_surface_format(surfFormats, format, color_space); // R2PORT PC extras: HDR swapchain (opt-in)
  
  		return new swapchain_WSI(dev, present_queue_idx, graphics_queue_idx, transfer_queue_idx, format, m_surface, color_space, !surface_config.supports_automatic_wm_reports);
@@ -48277,10 +48389,10 @@ index 0000000..22322ca
 +}
 diff --git a/rpcs3/Emu/RSX/port_r2pipe.h b/rpcs3/Emu/RSX/port_r2pipe.h
 new file mode 100644
-index 0000000..bf974ff
+index 0000000..3de0950
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/port_r2pipe.h
-@@ -0,0 +1,380 @@
+@@ -0,0 +1,406 @@
 +#pragma once
 +
 +// R2PORT pipeline-stutter work (pure logic, unit tested offline in scratch\enginetest via
@@ -48577,6 +48689,26 @@ index 0000000..bf974ff
 +		return static_cast<uint32_t>(std::clamp<long>(n, 1, 16));
 +	}
 +
++	// PORT_CPU_PROFILE=low (launcher: low-end CPU)
++	inline bool cpu_profile_low()
++	{
++		const char* v = std::getenv("PORT_CPU_PROFILE");
++		return v && std::strcmp(v, "low") == 0;
++	}
++
++	// Blocking boot preload workers (cache read, SPIR-V, link): PORT_PRELOAD_BOOT_THREADS, else R2_PRELOAD_BOOT_THREADS,
++	// else 2 on AMD (issue #10/#23: the RX 6000 driver crashed late in an all-cores boot compile; its links are
++	// serialised anyway, PORT_PRELOAD_BOOT_AMD=0 keeps all cores), 2 on <= 8 logical cores or PORT_CPU_PROFILE=low
++	// (the game's own boot threads were starved on a 4c/8t CPU), else all logical cores but one. [1, 64].
++	inline uint32_t preload_boot_workers(uint32_t hw, uint32_t vendor_id, bool low_cpu)
++	{
++		hw = std::max<uint32_t>(hw, 1);
++		const bool amd = vendor_id == 0x1002 && env_int("PORT_PRELOAD_BOOT_AMD", 1) != 0;
++		const long def = (amd || low_cpu || hw <= 8) ? static_cast<long>(std::min<uint32_t>(2, hw)) : static_cast<long>(hw - 1);
++		const long n = env_int("PORT_PRELOAD_BOOT_THREADS", env_int("R2_PRELOAD_BOOT_THREADS", def));
++		return static_cast<uint32_t>(std::clamp<long>(n, 1, 64));
++	}
++
 +	// Breadcrumb file (logs\preload_inflight.txt, memory-mapped so it survives a crash): one fixed-size line per
 +	// preload thread, "tid <thread id> <pipeline file name>" while that thread links the pipeline, blank otherwise.
 +	// The crash reporter (port_crash.h) names the faulting thread's entry as "preload faulting: <name>".
@@ -48618,6 +48750,12 @@ index 0000000..bf974ff
 +			if (!key.empty()) out.push_back({ tid, std::move(key) });
 +		}
 +		return out;
++	}
++
++	// A breadcrumb stage label ("rt:<what>": a pipeline built outside the preload), not a cache entry: never quarantined
++	inline bool inflight_is_stage(const std::string& key)
++	{
++		return key.compare(0, 3, "rt:") == 0;
 +	}
 +
 +	// The pipeline a crash report names as linked by the faulting thread ("preload faulting: <name>"), else empty.
@@ -48663,10 +48801,10 @@ index 0000000..bf974ff
 +}
 diff --git a/rpcs3/Emu/RSX/port_r2preload.h b/rpcs3/Emu/RSX/port_r2preload.h
 new file mode 100644
-index 0000000..20ca5c5
+index 0000000..ecb2dba
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/port_r2preload.h
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,80 @@
 +#pragma once
 +
 +// R2PORT (GitHub issue #10): crash safety of the start-up / background shader preload (VK/VKR2Preload.cpp).
@@ -48679,7 +48817,11 @@ index 0000000..20ca5c5
 +//    background preload, the Fossilize replay and the game's own pipelines built during play (render thread and
 +//    compiler threads) is caught, logged and the pipeline skipped (the draw that needs it is skipped); the preload
 +//    and the replay then stop for the session;
-+//  - AMD serialisation (PORT_PIPE_SERIAL, default on AMD): those pipeline creations run one at a time.
++//  - AMD serialisation (PORT_PIPE_SERIAL, default on AMD): those pipeline creations run one at a time, and so do
++//    the upscaler / frame generation SDK context creations (stage_scope);
++//  - stage breadcrumb (issue #23): pipelines built outside the preload (render / compiler threads, upscaler, SDK
++//    contexts) write an "rt:<what>" label to the same file; the crash report names it ("pipeline faulting: ...").
++//    The breadcrumb file is mapped at renderer start-up (configure), also when there is no shader cache yet.
 +
 +#include <cstdint>
 +#include <string>
@@ -48725,8 +48867,23 @@ index 0000000..20ca5c5
 +	bool guarded_call(long (*fn)(void*), void* ctx, long* result);
 +
 +	// A vkCreate*Pipelines call: serialised when serialized(), SEH-guarded when guard (and PORT_PRELOAD_SEH on).
++	// stage: "rt:<what>" label (no spaces) the breadcrumb shows while the call runs outside a preload link_scope
++	// (render / compiler / upscaler threads), so a crash report names the pipeline kind being built.
 +	// False when it faulted (see guarded_call).
-+	bool driver_call(long (*fn)(void*), void* ctx, long* result, bool guard);
++	bool driver_call(long (*fn)(void*), void* ctx, long* result, bool guard, const char* stage = nullptr);
++
++	// RAII (issue #10/#23): a driver call that builds pipelines internally (upscaler / frame generation SDK context
++	// creation). Serialised with the pipeline creations when serialized() (PORT_PIPE_SERIAL_SDK=0: not serialised);
++	// the breadcrumb names <stage> ("rt:<what>", no spaces) while it runs. driver_call inside it does not re-lock.
++	struct stage_scope
++	{
++		explicit stage_scope(const char* stage);
++		~stage_scope();
++		stage_scope(const stage_scope&) = delete;
++		stage_scope& operator=(const stage_scope&) = delete;
++		const char* prev_stage;
++		bool locked;
++	};
 +}
 diff --git a/rpcs3/Emu/RSX/port_rbattr.h b/rpcs3/Emu/RSX/port_rbattr.h
 new file mode 100644

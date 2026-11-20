@@ -22,6 +22,8 @@ int main()
 	CHECK(r2hdr::peak() == 80.f, "peak >= paper %f", r2hdr::peak());
 	CHECK(!std::strcmp(r2hdr::peak_source(), "setting"), "peak source %s", r2hdr::peak_source());
 	CHECK(r2hdr::sat() == 2.f, "sat clamp / prefix order %f", r2hdr::sat());
+	_putenv_s("R3_HDR_SANITIZE", "off");
+	CHECK(!r2hdr::sanitize(), "R3_HDR_SANITIZE=off turns the NaN guard off");
 	const int d = r2hdr::display_hdr();
 	CHECK(d >= -1 && d <= 1, "display state %d", d);
 	CHECK(r2hdr::allowed() == (d == 1), "auto needs Windows HDR on (display %d, allowed %d)", d, r2hdr::allowed());

@@ -175,6 +175,29 @@ static void test_preload_safety()
 	_putenv("PORT_PRELOAD_THREADS=");
 	_putenv("R2_PRELOAD_THREADS=");
 
+	_putenv("PORT_PRELOAD_BOOT_THREADS=");
+	_putenv("R2_PRELOAD_BOOT_THREADS=");
+	_putenv("PORT_PRELOAD_BOOT_AMD=");
+	CHECK(r2pipe::preload_boot_workers(16, 0x10DE, false) == 15);
+	CHECK(r2pipe::preload_boot_workers(16, 0x1002, false) == 2);
+	CHECK(r2pipe::preload_boot_workers(16, 0x10DE, true) == 2);
+	CHECK(r2pipe::preload_boot_workers(8, 0x10DE, false) == 2);
+	CHECK(r2pipe::preload_boot_workers(1, 0x1002, false) == 1);
+	CHECK(r2pipe::preload_boot_workers(0, 0x10DE, false) == 1);
+	_putenv("PORT_PRELOAD_BOOT_AMD=0");
+	CHECK(r2pipe::preload_boot_workers(16, 0x1002, false) == 15);
+	_putenv("R2_PRELOAD_BOOT_THREADS=6");
+	CHECK(r2pipe::preload_boot_workers(16, 0x1002, false) == 6);
+	_putenv("PORT_PRELOAD_BOOT_THREADS=99");
+	CHECK(r2pipe::preload_boot_workers(16, 0x1002, false) == 64);
+	_putenv("PORT_PRELOAD_BOOT_THREADS=");
+	_putenv("R2_PRELOAD_BOOT_THREADS=");
+	_putenv("PORT_PRELOAD_BOOT_AMD=");
+
+	CHECK(r2pipe::inflight_is_stage("rt:gfx_s2"));
+	CHECK(!r2pipe::inflight_is_stage("AAAA+BBBB.bin"));
+	CHECK(!r2pipe::inflight_is_stage("rt"));
+
 	std::string file(r2pipe::inflight_slots * r2pipe::inflight_slot_bytes, 'x');
 	for (size_t i = 0; i < r2pipe::inflight_slots; ++i)
 		r2pipe::inflight_format(&file[i * r2pipe::inflight_slot_bytes], 0, nullptr);
