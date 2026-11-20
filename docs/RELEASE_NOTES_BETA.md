@@ -8,6 +8,11 @@ A native PC port of *Resistance 2* (PS3) built by static recompilation: the game
 
 This is a **beta**. The campaign has been played through the opening Iceland levels on one PC (Ryzen 5 5600X, GeForce RTX 5070, Windows 11). Later levels are untested. Please report what you find (see *Reporting problems*).
 
+## 0.3.1-beta (unreleased)
+
+### New
+- **Cheats (single player, off by default)**, contributed by @Jishnuraj07 (PR #14): **Ctrl+F1** toggles *God mode*, **Ctrl+F2** toggles *Infinite ammo* (`R2_CHEAT_GOD=1` / `R2_CHEAT_AMMO=1` turn them on at start). Once a cheat has been on, trophies are not unlocked until you restart the game. The keys do nothing in photo mode, in the port's menus or while F1 / F2 is bound in `controls.txt`, and cheats stay off in benchmark runs. Co-op is untested.
+
 ## 0.3.0-beta
 
 The first update focused on performance and stability. Every option below is in the launcher or `settings.bat`; the names in brackets are the variables (useful for bug reports). Run Setup again after updating so the game code is regenerated.
