@@ -194,6 +194,13 @@ static void test_preload_safety()
 	_putenv("R2_PRELOAD_BOOT_THREADS=");
 	_putenv("PORT_PRELOAD_BOOT_AMD=");
 
+	_putenv("PORT_PRELOAD_FAULT_RELINK=");
+	CHECK(r2pipe::preload_fault_relink(true));
+	CHECK(!r2pipe::preload_fault_relink(false));
+	_putenv("PORT_PRELOAD_FAULT_RELINK=0");
+	CHECK(!r2pipe::preload_fault_relink(true));
+	_putenv("PORT_PRELOAD_FAULT_RELINK=");
+
 	CHECK(r2pipe::inflight_is_stage("rt:gfx_s2"));
 	CHECK(!r2pipe::inflight_is_stage("AAAA+BBBB.bin"));
 	CHECK(!r2pipe::inflight_is_stage("rt"));
