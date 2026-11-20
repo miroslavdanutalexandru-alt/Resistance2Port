@@ -14464,15 +14464,15 @@ index 0000000..dd8284d
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2DeformLogic.h b/rpcs3/Emu/RSX/VK/VKR2DeformLogic.h
 new file mode 100644
-index 0000000..36e0148
+index 0000000..17d403a
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2DeformLogic.h
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,119 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// RSX_DLSS_OBJMV_DEFORM capture policy, without any graphics API (VKR2Upscaler.cpp om2 record path).
 +// A draw whose vertex data the CPU / SPU rewrote since its paired previous-frame draw gets real per-vertex motion
 +// only when that previous draw kept a GPU copy of its vertex stream. Also r2vp_most_common (RSX_AA_CAMERA_EXACT's
-+// shared view-projection pick). Byte-identical in R2 and R3.
++// shared view-projection pick) and r2om_pair_nearest (instance re-pairing). Byte-identical in R2 and R3.
 +// Unit test: project/tests/fg_logic_test.cpp.
 +#pragma once
 +
@@ -14559,6 +14559,33 @@ index 0000000..36e0148
 +		a = b;
 +	}
 +	return have;
++}
++
++// RSX_DLSS_OBJMV_PAIR_NEAREST: a matched draw paired by its occurrence ordinal whose constants changed may be another
++// instance of the same draw (instances culled or re-sorted, portal churn at doorways: R2 1120 foliage paired with the
++// next instance's bone palette, motion of hundreds of pixels). Tries ordinals ord -+ 1 .. ord -+ window (nearest first,
++// the lower one first) against the ordinal pair's distance d0; dist(k, bound) is the distance of the previous-frame
++// occurrence k (< 0: none / not comparable), any value >= bound once it reaches bound. Returns the ordinal of the
++// closest candidate under ratio * d0 (an exact one, distance 0, ends the search) and its distance, or -1: keep the pair.
++template <typename Dist>
++inline int64_t r2om_pair_nearest(uint32_t ord, uint32_t window, double d0, double ratio, Dist&& dist, double* out_d = nullptr)
++{
++	int64_t best = -1;
++	double bd = d0 * ratio;
++	for (uint32_t s = 1; s <= window && bd > 0; ++s)
++		for (int side = 0; side < 2 && bd > 0; ++side)
++		{
++			if (side == 0 && s > ord) continue;
++			const uint32_t k = side == 0 ? ord - s : ord + s;
++			const double d = dist(k, bd);
++			if (d >= 0 && d < bd)
++			{
++				bd = d;
++				best = k;
++			}
++		}
++	if (out_d && best >= 0) *out_d = bd;
++	return best;
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2DepthBias.h b/rpcs3/Emu/RSX/VK/VKR2DepthBias.h
 new file mode 100644
@@ -24543,10 +24570,10 @@ index 0000000..be1e3b2
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..107f0bd
+index 0000000..fd85ee5
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,11872 @@
+@@ -0,0 +1,11998 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -25059,6 +25086,16 @@ index 0000000..107f0bd
 +		u32 mv_conf_lag = 4;
 +		// RSX_DLSS_OBJMV_NONAFFINE (default 1; 0 = old): see om_classify (wind-swayed foliage got camera motion only)
 +		bool om_nonaffine = true;
++		// RSX_DLSS_OBJMV_PAIR_NEAREST (default 16; 0 = off): a matched skinned or non-affine draw whose constants changed
++		// since its ordinal pair is re-paired with the closest previous occurrence of the same draw within +-n ordinals
++		// (r2om_pair_nearest: R2 1120 foliage drawn as instances of one mesh paired with the neighbouring instance's bone
++		// palette after the draw order shifted, motion of hundreds of pixels). An identical occurrence makes it static.
++		u32 om_pair_near = 16;
++		// RSX_AA_OBJMV_DEFER_SPEC (default 1; 0 = off): a command buffer closing with deferred draws (RSX_AA_OBJMV_DEFER)
++		// copies their constants to spare history slots; the late starts among them keep the copy, so they have their own
++		// velocity next frame. RSX_AA_OBJMV_DEFER_HIST alone only covered the flip's command buffer (R2 1120 19:06 run.log:
++		// 1340 of 16572 late starts had a history next frame).
++		bool om_late_spec = true;
 +		// RSX_AA_STATIC_SNAP (default 1; 0 = off): a camera reprojection T that moves no point of a 3x3 screen grid at
 +		// far / mid / near depth by more than RSX_AA_STATIC_SNAP_PX render pixels (default 0.01) becomes exactly the
 +		// identity, so a still camera gives exactly zero camera motion (VP_prev * VP_cur^-1 and the screen matrices left
@@ -25354,6 +25391,8 @@ index 0000000..107f0bd
 +		r.conf_cut = port_native_parse_bool(std::getenv("RSX_AA_CONF_CUT"), 0) != 0;
 +		if (const char* e = std::getenv("RSX_AA_CUT_PARALLAX_GAP"); e && *e) r.cut_par_gap = static_cast<u32>(std::clamp(std::atoi(e), 0, 3600));
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_NONAFFINE")) r.om_nonaffine = std::atoi(e) != 0;
++		if (const char* e = std::getenv("RSX_DLSS_OBJMV_PAIR_NEAREST"); e && *e) r.om_pair_near = static_cast<u32>(std::clamp(std::atoi(e), 0, 64));
++		if (const char* e = std::getenv("RSX_AA_OBJMV_DEFER_SPEC"); e && *e) r.om_late_spec = *e != '0';
 +		if (const char* e = std::getenv("RSX_AA_STATIC_SNAP"); e && *e) r.static_snap = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_AA_STATIC_SNAP_PX"); e && *e) r.static_snap_px = std::clamp(static_cast<float>(std::atof(e)), 0.f, 1.f);
 +		if (const char* e = std::getenv("RSX_AA_FRAME_S_VOTE"); e && *e) r.frame_s_vote = std::atoi(e) != 0;
@@ -27500,6 +27539,7 @@ index 0000000..107f0bd
 +		u64 kbase = 0;       // key without the occurrence ordinal (RSX_DLSS_OBJMV_REPAIR)
 +		u64 lkey = 0;        // RSX_AA_MATCH_LOOSE: key without buffer addresses (0: none)
 +		u64 lkbase = 0;      // ... without the occurrence ordinal
++		u32 occ = 0;         // the occurrence ordinal of key (RSX_DLSS_OBJMV_PAIR_NEAREST)
 +		bool loose = false;  // paired with the previous frame by lkey
 +		const vp_info* prog = nullptr;
 +		u32 branch_bits = 0;
@@ -27822,6 +27862,7 @@ index 0000000..107f0bd
 +		u32 om_loose = 0, om_loose_bad = 0; // classifier: loose pairs, loose pairs rejected (implausible motion)
 +		u32 om_nw_n = 0;              // RSX_DLSS_OBJMV_NOWRITE: matched non-depth-writing draws given their own velocity
 +		u32 om_nonaffine = 0;          // RSX_DLSS_OBJMV_NONAFFINE: matched draws without a matrix whose constants changed (moving)
++		u32 om_pn_checked = 0, om_pn_repaired = 0, om_pn_static = 0; // RSX_DLSS_OBJMV_PAIR_NEAREST
 +		u32 vote_fail_logged = 0;
 +		// RSX_AA_CAMERA_EXACT (since the last fps line, except ex_proven)
 +		bool ex_proven = false;        // a moving exact camera was confirmed by the matched static draws at least once
@@ -28828,6 +28869,31 @@ index 0000000..107f0bd
 +		const u32* loose = nullptr;
 +	};
 +
++	// RSX_DLSS_OBJMV_PAIR_NEAREST (om_classify, exact-key pairs whose constants changed): re-pairs e with the closest
++	// previous occurrence of its draw (r2om_pair_nearest, under half the ordinal pair's distance d0). True: identical
++	// constants, static (camera motion); false: own motion, e.prev possibly re-paired.
++	template <typename Dist>
++	bool om_pair_nearest(mvp_entry& e, Dist&& dist, double d0)
++	{
++		auto& st = g_r2;
++		if (!r2cfg().om_pair_near || !e.kbase || e.loose) return false;
++		st.om_pn_checked++;
++		double bd = 0;
++		const s64 k = r2om_pair_nearest(e.occ, r2cfg().om_pair_near, d0, 0.5, [&](u32 o, double bound) -> double
++		{
++			const u32* qq = st.om_prev.find(mix64(e.kbase, o), false);
++			return qq && *qq < st.prev_F.e.size() ? dist(st.prev_F.e[*qq], bound) : -1.0;
++		}, &bd);
++		if (k < 0) return false;
++		const u32* qq = st.om_prev.find(mix64(e.kbase, static_cast<u32>(k)), false);
++		if (!qq) return false;
++		e.prev = *qq;
++		st.om_pn_repaired++;
++		if (bd != 0) return false;
++		st.om_pn_static++;
++		return true;
++	}
++
 +	// RSX_DLSS_OBJMV: classify a depth-writing scene draw right after its capture. Draws that may need their own
 +	// motion (or the bias mask) get om_want flags; r2aa_objmv_after_draw redraws them into the ID target.
 +	void om_classify(u32 i, const om_finds* hint = nullptr)
@@ -28959,6 +29025,21 @@ index 0000000..107f0bd
 +			for (const u16 c : e.prog->pal)
 +				if (std::memcmp(a + c * 4, b + c * 4, 4 * sizeof(float)) != 0)
 +				{
++					// RSX_DLSS_OBJMV_PAIR_NEAREST: the palette of another instance (the draw order shifted)?
++					const auto pal_dist = [&](const mvp_entry& q, double bound) -> double
++					{
++						const float* qb = st.prev_F.consts.data() + q.const_off;
++						double d = 0;
++						for (const u16 k : e.prog->pal)
++						{
++							for (u32 j = 0; j < 4; ++j) d += std::fabs(static_cast<double>(a[k * 4 + j]) - qb[k * 4 + j]);
++							if (d >= bound) break;
++						}
++						return d;
++					};
++					if (om_pair_nearest(e, [&](const mvp_entry& q, double bound) -> double
++						{ return q.prog == e.prog ? pal_dist(q, bound) : -1.0; }, pal_dist(p, HUGE_VAL)))
++						return;
 +					e.om |= om_skin;
 +					return;
 +				}
@@ -28975,6 +29056,25 @@ index 0000000..107f0bd
 +				const float* b = st.prev_F.consts.data() + p.const_off;
 +				if (std::memcmp(a, b, e.prog->reads.size() * 4 * sizeof(float)) != 0)
 +				{
++					// RSX_DLSS_OBJMV_PAIR_NEAREST: another instance's constants (the draw order shifted)? The camera rows
++					// (when known) are left out: the same for every previous-frame candidate.
++					const auto& rd = e.prog->reads;
++					const u32 row0 = e.prog->vprow >= 0 && e.prog->vp_ok == 1 ? static_cast<u32>(e.prog->vprow) : ~0u;
++					const auto c_dist = [&](const mvp_entry& q, double bound) -> double
++					{
++						if (q.prog != e.prog || q.branch_bits != e.branch_bits) return -1.0;
++						const float* qb = st.prev_F.consts.data() + q.const_off;
++						double d = 0;
++						for (usz k = 0; k < rd.size(); ++k)
++						{
++							if (rd[k] >= row0 && rd[k] < row0 + 4) continue;
++							for (u32 j = 0; j < 4; ++j) d += std::fabs(static_cast<double>(a[k * 4 + j]) - qb[k * 4 + j]);
++							if (d >= bound) break;
++						}
++						return d;
++					};
++					if (om_pair_nearest(e, c_dist, p.branch_bits == e.branch_bits ? c_dist(p, HUGE_VAL) : HUGE_VAL))
++						return;
 +					e.om |= om_rigid;
 +					st.om_nonaffine++;
 +				}
@@ -29130,6 +29230,9 @@ index 0000000..107f0bd
 +		std::vector<late_t> late;
 +		VkBuffer late_src = VK_NULL_HANDLE;
 +		u32 t_late_hist = 0;
++		// RSX_AA_OBJMV_DEFER_SPEC: (cur_F entry, history slot) copied at a command buffer end before its classification
++		std::vector<std::pair<u32, u32>> lspec;
++		u32 t_late_spec = 0, t_late_promo = 0;
 +		VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
 +		VkDescriptorPool pool = VK_NULL_HANDLE;
 +		VkDescriptorSet set = VK_NULL_HANDLE; // written once, never updated
@@ -29746,6 +29849,17 @@ index 0000000..107f0bd
 +		auto& o = g_om2;
 +		auto& st = g_r2;
 +		u32 n = 0;
++		// RSX_AA_OBJMV_DEFER_SPEC: the late starts among the draws copied at a command buffer end keep their slot
++		for (const auto& [ent, slot] : o.lspec)
++		{
++			if (ent >= st.cur_F.e.size()) continue;
++			auto& e = st.cur_F.e[ent];
++			if (!(e.om & (om_skin | om_rigid)) || e.om_hslot) continue;
++			e.om_hslot = static_cast<u16>(slot + 1);
++			o.t_late_promo++;
++			o.t_late_hist++;
++		}
++		o.lspec.clear();
 +		if (o.late.empty()) return 0;
 +		const bool to_h = !st.aa_done;
 +		if (to_h && !o.hsrc && o.hcopy.empty()) o.hsrc = o.late_src;
@@ -29808,6 +29922,7 @@ index 0000000..107f0bd
 +		o.hsrc = VK_NULL_HANDLE;
 +		o.late.clear();
 +		o.late_src = VK_NULL_HANDLE;
++		o.lspec.clear();
 +		o.dcopy.clear();
 +		o.dsrc = VK_NULL_HANDLE;
 +		o.dused = 0;
@@ -30157,6 +30272,7 @@ index 0000000..107f0bd
 +			key = okey;
 +			u32* occ = st.occurrences.find(key, true);
 +			const u64 kbase = occ ? key : 0;
++			const u32 ordinal = occ ? *occ : 0;
 +			key = mix64(key, occ ? (*occ)++ : 0xffffffffu);
 +			if (dm_pf && dwrite && r2cfg().objmv) st.om_prev.prefetch(key);
 +			if (pd_t0) pd_k = r2prof::now_ns();
@@ -30190,6 +30306,7 @@ index 0000000..107f0bd
 +				mvp_entry e;
 +				e.key = key;
 +				e.kbase = kbase;
++				e.occ = ordinal;
 +				e.lkey = lkey;
 +				e.lkbase = lkbase;
 +				e.prog = pi;
@@ -31639,6 +31756,11 @@ index 0000000..107f0bd
 +				o.dg_carry = o.dm_noprev = o.dm_key = o.dm_hist = o.dm_nocap = 0;
 +				o.dm_np_unp = o.dm_np_first = o.dm_np_aged = o.dm_at = o.dg_new = o.dg_new_bytes = o.dm_id = 0;
 +				st.om_loose = st.om_loose_bad = st.om_nonaffine = 0;
++				if (r2cfg().om_pair_near)
++					r2log("objmv pairing by nearest constants (RSX_DLSS_OBJMV_PAIR_NEAREST=%u): %u changed skinned / non-affine pairs checked, %u re-paired with another occurrence (%u identical: static); late-start copies at command buffer ends %u, kept %u (RSX_AA_OBJMV_DEFER_SPEC=%d)",
++						r2cfg().om_pair_near, st.om_pn_checked, st.om_pn_repaired, st.om_pn_static, o.t_late_spec, o.t_late_promo, r2cfg().om_late_spec ? 1 : 0);
++				st.om_pn_checked = st.om_pn_repaired = st.om_pn_static = 0;
++				o.t_late_spec = o.t_late_promo = 0;
 +				if (r2cfg().om_nowrite) r2log("objmv nowrite (RSX_DLSS_OBJMV_NOWRITE=%d): %u non-depth-writing scene draws given their own velocity (onepass)", r2cfg().om_nowrite, st.om_nw_n);
 +				st.om_nw_n = 0;
 +				o.t_cpu_ns = 0;
@@ -33155,6 +33277,36 @@ index 0000000..107f0bd
 +	}
 +}
 +
++namespace
++{
++	// RSX_AA_OBJMV_DEFER_SPEC: the closing command buffer's deferred draws (their ring data is recycled after it), not
++	// classified yet, get their constants copied with its history copies (om2_flush_history); om_defer_late_hist keeps
++	// the slots of the late starts among them. A quarter of the slots stays for the draws still to come.
++	void om_late_spec(vk::command_buffer_chunk& cmd)
++	{
++		auto& o = g_om2;
++		if (!r2cfg().om_late_spec || o.late.empty() || o.cb != &cmd || o.cb_reset != cmd.reset_id || !o.sbuf) return;
++		if (!o.hsrc && o.hcopy.empty()) o.hsrc = o.late_src;
++		if (o.late_src == o.hsrc)
++		{
++			for (const auto& l : o.late)
++			{
++				if (o.hn + o.cap / 4 >= o.cap) break;
++				const u32 slot = o.hn++;
++				VkBufferCopy bc{};
++				bc.srcOffset = l.src;
++				bc.dstOffset = static_cast<VkDeviceSize>(o.cap) * 16 * (1 + static_cast<VkDeviceSize>(o.hpar) * 468) + static_cast<VkDeviceSize>(slot) * 468 * 16;
++				bc.size = l.size;
++				o.hcopy.push_back(bc);
++				o.lspec.emplace_back(l.entry, slot);
++				o.t_late_spec++;
++			}
++		}
++		o.late.clear();
++		o.late_src = VK_NULL_HANDLE;
++	}
++}
++
 +// RSX_DLSS_OBJMV=1, close_and_submit_command_buffer (outside a render pass, before the buffer ends): RPCS3 submits
 +// several command buffers per frame (occlusion queries, readbacks, heap syncs). The draws and history copies recorded
 +// in this buffer used to be dropped (descriptor sets may be recycled after it): replay them now (om2_replay segment,
@@ -33163,9 +33315,10 @@ index 0000000..107f0bd
 +{
 +	om_lane_join("r2aa_objmv_segment"); // RSX_RECORD_DEFER
 +	auto& o = g_om2;
-+	if (r2cfg().objmv != 1 || o.failed || (o.recs.empty() && o.hcopy.empty())) return;
++	if (r2cfg().objmv != 1 || o.failed || (o.recs.empty() && o.hcopy.empty() && o.late.empty())) return;
 +	auto* cmd = m_current_command_buffer;
 +	if (!cmd || o.cb != cmd || o.cb_reset != cmd->reset_id) return;
++	om_late_spec(*cmd); // RSX_AA_OBJMV_DEFER_SPEC
 +	om_cpu_scope om_t;
 +	auto* ds = g_r2.ds_ptr;
 +	auto& sc = res()->surface_cache;

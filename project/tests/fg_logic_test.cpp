@@ -371,6 +371,31 @@ static void test_vp_pick()
 	std::printf("r2vp_most_common, 3000 draws: %.1f us (linear table %.1f us)\n",
 		std::chrono::duration<double, std::micro>(t2 - t1).count() / reps, std::chrono::duration<double, std::micro>(t1 - t0).count() / reps);
 }
+// RSX_DLSS_OBJMV_PAIR_NEAREST: instance re-pairing
+static void test_pair_nearest()
+{
+	const double NaN = std::nan("");
+	// previous-frame occurrence distances to the current draw (index = ordinal; < 0 missing)
+	auto run = [](std::vector<double> d, uint32_t ord, uint32_t win, double d0, double* od = nullptr, int* calls = nullptr) {
+		return r2om_pair_nearest(ord, win, d0, 0.5, [&](uint32_t k, double) { if (calls) ++*calls; return k < d.size() ? d[k] : -1.0; }, od);
+	};
+	double od = -1;
+	CHECK(run({ 9, 5, 10, 2, 7 }, 2, 4, 10, &od) == 3 && od == 2); // the closest, not the first under the bound
+	CHECK(run({ 9, 6, 10, 7, 8 }, 2, 4, 10) == -1);                  // nothing under half d0: keep the ordinal pair
+	CHECK(run({ 9, 3, 10, 3, 8 }, 2, 4, 10) == 1);                   // tie: the lower ordinal (tried first)
+	int calls = 0;
+	CHECK(run({ 9, 0, 10, 0, 1 }, 2, 4, 10, &od, &calls) == 1 && od == 0 && calls == 1); // exact: stops
+	CHECK(run({ -1, -1, 10, -1, 4 }, 2, 4, 10) == 4);                // missing occurrences skipped
+	CHECK(run({ 10, 1 }, 0, 4, 10) == 1);                            // ordinal 0: no underflow to 2^32-1
+	CHECK(run({ 1, 10, 1 }, 1, 0, 10) == -1);                        // window 0
+	CHECK(run({ 1, 10 }, 1, 4, 0) == -1);                            // the pair is identical (d0 0): nothing to do
+	CHECK(run({ 1, 10 }, 1, 4, NaN) == -1);                          // NaN-safe
+	CHECK(run({ NaN, 10, 1 }, 1, 4, 10) == 2);                       // a NaN candidate is never chosen
+	CHECK(run({ 1, 10 }, 1, 4, HUGE_VAL) == 0);                      // incomparable pair: any candidate
+	CHECK(run({ 0, 0, 0, 0, 0, 0, 0 }, 3, 2, 10, &od) == 2 && od == 0);
+	calls = 0;
+	CHECK(run(std::vector<double>(40, 9.0), 20, 16, 10, nullptr, &calls) == -1 && calls == 32);
+}
 #endif
 
 int main()
@@ -383,6 +408,7 @@ int main()
 #ifndef PFG_R1
 	test_deform();
 	test_vp_pick();
+	test_pair_nearest();
 #endif
 	std::printf("fg_logic_test: %d checks, %d failed\n", g_checks, g_fail);
 	return g_fail ? 1 : 0;
