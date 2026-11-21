@@ -175,7 +175,9 @@ if(WIN32)
             advapi32 setupapi shell32 hid mincore dinput8 cfgmgr32)
         message(STATUS "  SDL3:         vendored (gamepad backend enabled)")
     else()
-        message(STATUS "  SDL3:         not found (controllers: XInput only)")
+        message(WARNING "SDL3 not found (${PS3RECOMP_SDL3_DIR}/lib/SDL3-static.lib): "
+                        "controllers are XInput only, so a DualSense / DualShock 4 / Switch pad works only "
+                        "through Steam Input or DS4Windows")
     endif()
 else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
@@ -246,6 +248,13 @@ if(PS3RECOMP_FFMPEG_RUNTIME)
         message(FATAL_ERROR "FFmpeg headers not found. Debian/Ubuntu: "
             "libavcodec-dev, Fedora: ffmpeg-free-devel, MSYS2: mingw-w64-x86_64-ffmpeg "
             "-- or pass -DPS3RECOMP_FFMPEG_INCLUDE_DIR=<dir containing libavcodec/avcodec.h>")
+    endif()
+    # a path cut short at a space (an unquoted -D on the command line) otherwise only fails much later,
+    # at compile time, as "'libavcodec/avcodec.h' file not found"
+    if(NOT EXISTS "${PS3RECOMP_FFMPEG_INCLUDE_DIR}/libavcodec/avcodec.h")
+        message(FATAL_ERROR "PS3RECOMP_FFMPEG_INCLUDE_DIR=\"${PS3RECOMP_FFMPEG_INCLUDE_DIR}\" has no "
+            "libavcodec/avcodec.h. If the folder name has spaces, quote it: "
+            "-DPS3RECOMP_FFMPEG_INCLUDE_DIR=\"<dir>\"")
     endif()
     target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_FFMPEG_INCLUDE_DIR}")
     target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_FFMPEG_RUNTIME)
@@ -373,20 +382,26 @@ endif()
 # ---------------------------------------------------------------------------
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(ps3recomp_runtime PRIVATE
-        -Wall -Wextra -Wno-unused-parameter
         -fno-strict-aliasing
         # No spontaneous fused multiply-add. MSVC never contracts, and x86-64
         # without -mfma has nothing to contract into, so every validated
         # result came from separate multiplies and adds; arm64 has FMA in
         # the base ISA and Clang fuses by default there. A PPC fmadd is
         # spelt as one where the lifter means one.
-        -ffp-contract=off
+        $<IF:$<STREQUAL:${CMAKE_C_COMPILER_FRONTEND_VARIANT},MSVC>,/clang:-ffp-contract=off,-ffp-contract=off>
         # Explicit, because the per-config defaults cannot be trusted: this
         # tree's caches carry CMAKE_C_FLAGS_RELEASE="" and CMAKE_CXX_FLAGS_RELEASE="",
         # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime
         # was unoptimised without a word. Duplicating a default -O2 is harmless.
         $<$<CONFIG:Release,RelWithDebInfo>:-O2>
     )
+    # clang-cl reads -Wall as /Wall (= -Weverything): hundreds of MB of warnings
+    # on a first build (issue R2#11). /W3 is its usual level.
+    if(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        target_compile_options(ps3recomp_runtime PRIVATE /W3)
+    else()
+        target_compile_options(ps3recomp_runtime PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
     # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the
     # hottest SPU op in lifted audio code. Probed rather than assumed: recent
     # Apple clang rejects the flag outright for arm64 ("unsupported option

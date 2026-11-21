@@ -88,6 +88,9 @@ uint8_t* vm_sudo_base = nullptr;
 /* RSX page-protection fault handler: guest address, 1 = write. Returns 1 if handled. */
 int (*g_vm_access_violation_hook)(uint32_t guest_addr, int is_write) = nullptr;
 extern "C" void spu_jobtime_av(long long qpc_ticks);   /* spu_drain.c */
+extern "C" int spu_jobtime_cur_img(void);              /* spu_drain.c: [av-who] */
+extern "C" uint32_t g_sjt_link_b;                      /* spu_drain.c: WWS job-call return pc ([spu-jobs]) */
+extern "C" int spu_sched_effective(void);              /* spu_channels.c: PORT_SPU_SCHED, [native] line */
 /* Unclaimed protection fault on a guarded page: the RSX page-guard registry
  * re-applies (or drops) the page's protection itself (rsx_page_guard_reconcile;
  * set by the engine). Returns 1 when the access can be retried. */
@@ -116,11 +119,18 @@ double   r2_display_refresh_hz(void);
 int      cellGcm_take_flip_pending(void);
 void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
 unsigned cellGcm_flip_request_count(void);
+extern "C" volatile int g_r2pc_paused;   /* the port's pause (PC menu, quit prompt, pad loss): osd_repost */
 }
 
 /* CPU detection, PORT_CPU_PROFILE and thread placement (runs first in main). */
 #include "cpu_profile.inc"
+extern "C" int ps3_host_core_scarce(void);   /* sys_ppu_thread.c, PORT_CORE_SCARCE */
+#include "port_cpucheck.h"  /* AVX2 (x86-64-v3) build: clear error on older CPUs */
 #include "r2_crash.inc"
+#include "port_native_summary.h"
+#include "port_mem.h"         /* PORT_LARGE_PAGES: reported unavailable here, see main() */
+extern "C" uint32_t r2nj_effective_mask(void);   /* r2_native_jobs.c */
+extern "C" int r2nj_kernel_active(int k);
 #include "r2_autoconfig.h"
 
 /* ---------------------------------------------------------------------------
@@ -215,6 +225,7 @@ static int s_rsx_vk = 0;
 
 #if defined(PS3RECOMP_RSX_VULKAN)
 #include "../ps3recomp/libs/video/rsx_vulkan_backend.h"
+#include "../ps3recomp/libs/video/rsx_featcov.h"   /* rsx_featcov_dump at exit */
 extern "C" int r2_native_aa_register(void);   /* r2_native_aa.cpp: RSX_FSR=2 DLAA, 3 FSR 3.1, 1 FSR1 */
 /* R2_RSX=vulkan (or native): ps3recomp's register-file draw engine driving
  * the Vulkan backend, presenting into the null backend's window. */
@@ -224,6 +235,46 @@ static int rsx_vk_wanted(void)
     return e && (!_stricmp(e, "vulkan") || !_stricmp(e, "native"));
 }
 #endif
+
+#include "../ps3recomp/libs/video/rsx_d3d12_engine.h"
+extern "C" int r2_native_aa_register_d3d12(void);   /* r2_native_aa.cpp: RSX_FSR 1 FSR1, 2 DLAA, 3 FSR 3.1, 4 XeSS */
+/* R2_RSX=d3d12: "Direct3D 12 (experimental)" -- the same register-file draw engine
+ * driving the D3D12 backend (rsx_d3d12_engine.c), presenting into the null
+ * backend's window. Offered on its own, not behind the native-Vulkan hide. */ int s_rsx_d3e = 0; int rsx_d3e_wanted(void)
+{
+    const char* e = getenv("R2_RSX");
+    return e && !_stricmp(e, "d3d12");
+}
+
+/* The native Vulkan renderer is hidden from the launcher for now (still built:
+ * the draw engine is shared). An old settings.bat with R2_RSX=vulkan/native
+ * runs the RPCS3 renderer instead (once per start, logged), and the native
+ * renderer's RSX_FSR=3 (FSR 3.1) becomes the RPCS3 renderer's 1. Dev
+ * override: R2_RENDERER_FORCE_NATIVE=1 keeps it. Runs before anything reads
+ * R2_RSX (rsx_vk_wanted, r2rsx_enabled, r2_pcport). */
+static void r2_renderer_migrate(void)
+{
+    const char* e = getenv("R2_RSX");
+    /* Without a usable D3D12 device the Direct3D 12 (experimental) choice falls back to the RPCS3 renderer
+     * here, before anything reads R2_RSX. */
+    if (e && !_stricmp(e, "d3d12")) {
+        if (!rsx_d3d12_engine_probe()) {
+            fprintf(stderr, "[renderer] R2_RSX=d3d12: Direct3D 12 failed its start-up probe (device, shaders, swap chain); using the RPCS3 renderer\n");
+            rsx_d3d12_env_to_rpcs3();   /* also renumbers RSX_FSR */
+        }
+        return;
+    }
+    if (!e || (_stricmp(e, "vulkan") && _stricmp(e, "native"))) return;
+    const char* f = getenv("R2_RENDERER_FORCE_NATIVE");
+    if (f && *f && atoi(f) != 0) {
+        fprintf(stderr, "[renderer] R2_RSX=%s kept (R2_RENDERER_FORCE_NATIVE=%s): native Vulkan renderer, experimental\n", e, f);
+        return;
+    }
+    fprintf(stderr, "[renderer] R2_RSX=%s: the native Vulkan renderer is no longer offered, using the RPCS3 renderer "
+                    "(R2_RENDERER_FORCE_NATIVE=1 keeps it; open the launcher once to update settings.bat)\n", e);
+    _putenv_s("R2_RSX", "rpcs3");
+    if (const char* fsr = getenv("RSX_FSR"); fsr && !strcmp(fsr, "3")) _putenv_s("RSX_FSR", "1");
+}
 
 /* location 0 = RSX local memory, 1 = main memory through the IO table. */
 static const uint8_t* rsx_live_guest_ptr(void*, uint32_t location,
@@ -259,6 +310,28 @@ static int rsx_select_init(uint32_t w, uint32_t h, const char* title)
         fprintf(stderr, "[rsx] native Vulkan init FAILED -- falling back to the D3D12 backend\n");
     }
 #endif
+    if (rsx_d3e_wanted()) {
+        if (!getenv("PS3RECOMP_RSX_ENGINE")) _putenv("PS3RECOMP_RSX_ENGINE=dispatch");
+        if (rsx_null_backend_init(w, h, title) == 0) {
+            rsx_d3d12_engine_set_window(rsx_null_backend_get_hwnd());
+            r2_native_aa_register_d3d12();
+            if (rsx_d3d12_engine_init(w, h, title) == 0) {
+                s_rsx_d3e = 1;
+                rsx_null_backend_suppress_present(1);
+                fprintf(stderr, "[rsx] Direct3D 12 (experimental) renderer up\n");
+                return 0;
+            }
+        }
+        /* main() probed the device already (r2_renderer_migrate), so this is rare. The RPCS3 renderer
+         * can't be started this late (its FIFO owner is chosen at the first GCM call), so the game
+         * restarts itself with it; never the legacy backend. */
+        fprintf(stderr, "[rsx] Direct3D 12 (experimental) init FAILED -- restarting with the Compatible (RPCS3) renderer\n");
+        fflush(stderr);
+        if (rsx_d3d12_engine_relaunch_compatible()) ExitProcess(0);
+        MessageBoxA(nullptr, "Direct3D 12 (experimental) could not start on this system.\n\n"
+                             "Choose the Compatible renderer in the launcher.", "Renderer error", MB_ICONERROR);
+        ExitProcess(1);
+    }
     if (rsx_live_draw_enabled()) {
         if (rsx_null_backend_init(w, h, title) == 0 &&
             rsx_live_draw_init(rsx_null_backend_get_hwnd(), w, h, rsx_live_guest_ptr, nullptr) == 0) {
@@ -276,12 +349,13 @@ static void rsx_select_present(void)
 #if defined(PS3RECOMP_RSX_VULKAN)
     if (s_rsx_vk) { rsx_vulkan_backend_present(); return; }
 #endif
+    if (s_rsx_d3e) { rsx_d3d12_engine_present(); return; }
     if (s_rsx_live) rsx_live_draw_present(cellGcmGetCurrentDisplayBufferId());
     else rsx_backend_present();
 }
 static int rsx_select_pump(void)
 {
-    return (s_rsx_live || s_rsx_vk) ? rsx_null_backend_pump_messages() : rsx_backend_pump();
+    return (s_rsx_live || s_rsx_vk || s_rsx_d3e) ? rsx_null_backend_pump_messages() : rsx_backend_pump();
 }
 #  undef  rsx_backend_init
 #  undef  rsx_backend_present
@@ -315,6 +389,7 @@ static long long fc_us(void)
     return (long long)((double)c.QuadPart * 1e6 / (double)f.QuadPart);
 }
 
+extern "C" void r2pf_toast(const char* title, const char* text, char badge);   /* r2_pcfeat.cpp */
 static DWORD WINAPI frame_clock(LPVOID)
 {
     port_place_walker();
@@ -332,12 +407,20 @@ static DWORD WINAPI frame_clock(LPVOID)
         r2rsx_set_window(rsx_null_backend_get_hwnd(), WINDOW_WIDTH, WINDOW_HEIGHT);
         fprintf(stderr, "[rsx] RPCS3 RSX core (Vulkan) -- window open\n");
         while (rsx_null_backend_pump_messages() == 0) Sleep(4);
+        rsx_featcov_dump("exit");
         ExitProcess(0);
     }
 
     int rsx_ok = (rsx_backend_init(WINDOW_WIDTH, WINDOW_HEIGHT, title) == 0);
     fprintf(stderr, "[rsx] %s backend init %s\n", RSX_BACKEND_NAME,
             rsx_ok ? "OK -- window open" : "FAILED");
+    {   /* frame generation only exists in the RPCS3 renderer: tell the user instead of silently ignoring it */
+        const char* fg = getenv("R2_DLSS_FG");
+        if (fg && *fg && strcmp(fg, "0") != 0) {
+            fprintf(stderr, "[fg] frame generation off: R2_DLSS_FG=%s needs the rpcs3 renderer (R2_RSX=rpcs3, launcher Renderer \"RPCS3\")\n", fg);
+            r2pf_toast("Frame generation is off", "It needs the RPCS3 renderer (launcher: Renderer).", '!');
+        }
+    }
 
     unsigned  last_flip = 0;
     long long next_tick = fc_us();
@@ -515,9 +598,19 @@ static DWORD WINAPI frame_clock(LPVOID)
             }
 
             if (rsx_backend_pump() != 0) {
-                rsx_ok = 0;              /* window closed */
-                continue;
+                /* window closed (Alt+F4 / X): end the game as the RPCS3 renderer does
+                 * (frame_clock above); only clearing rsx_ok left it running headless */
+                fprintf(stderr, "[rsx] window closed -- exiting\n");
+                rsx_featcov_dump("exit");
+                fflush(stdout); fflush(stderr);
+                ExitProcess(0);
             }
+#if defined(_WIN32)
+            /* D3D12: the port UI changed but no flip came for ~33 ms (the PC menu, quit prompt or
+             * pad-loss pause park the game): present the last frame again with the new UI, as
+             * r2rsx_osd kicks the RPCS3 renderer. */
+            if (s_rsx_d3e) rsx_d3d12_engine_osd_repost(33, g_r2pc_paused != 0 || cellGcm_flip_request_count() == 0);
+#endif
             /* Present only a flip the drain has reached (s_flip_pending, taken
              * above). Presenting on a change of the flip-request counter could
              * show a buffer before the walker executed its flip, and presented
@@ -586,6 +679,70 @@ static void vm_commit_range(uint8_t* p, size_t len)
             VirtualAlloc(q, 0x1000, MEM_COMMIT, PAGE_READWRITE);
     }
 }
+/* R2_AV_WHO (default 1): who reads/writes RSX-protected guest memory when the fault
+ * hook takes >= 1 ms (a render-target readback on the faulting thread). The first
+ * 64 distinct (64 KB region, host PC) pairs are logged once as
+ *   [av-who] guest 0x.. read 4.1 ms thread 'name' spu-job 422 | func_A+0x.. < func_B+0x.. ...
+ * with the lifted PPU functions found on the host stack (nearest entry <= frame PC). */
+static bool av_who_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* v = getenv("R2_AV_WHO"); on = !(v && v[0] == '0'); }
+    return on != 0;
+}
+static int av_who_guest(uintptr_t pc, uint32_t* off)
+{
+    uintptr_t best_h = 0; uint32_t best_g = 0;
+    for (uint64_t k = 0; k < function_table_count; k++) {
+        const uintptr_t h = (uintptr_t)function_table[k].func;
+        if (h <= pc && h > best_h) { best_h = h; best_g = function_table[k].addr; }
+    }
+    if (!best_g || pc - best_h >= 0x20000) return 0;
+    *off = (uint32_t)(pc - best_h);
+    return (int)best_g;
+}
+static void av_who_note(const CONTEXT* ctx_in, uint32_t guest, int is_write, double ms)
+{
+    static volatile LONG s_n = 0;
+    static uint64_t s_keys[64];
+    if (s_n >= 64) return;
+    const uint64_t key = ((uint64_t)(guest >> 16) << 48) ^ (uint64_t)ctx_in->Rip;
+    static SRWLOCK s_lock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&s_lock);
+    bool dup = false;
+    for (LONG i = 0; i < s_n; i++) dup |= s_keys[i] == key;
+    if (dup || s_n >= 64) { ReleaseSRWLockExclusive(&s_lock); return; }
+    s_keys[s_n] = key; InterlockedIncrement(&s_n);
+    ReleaseSRWLockExclusive(&s_lock);
+
+    char chain[512]; size_t len = 0; chain[0] = 0;
+    CONTEXT c = *ctx_in;
+    int found = 0;
+    for (int d = 0; d < 32 && c.Rip && found < 6 && len < sizeof chain - 48; d++) {
+        uint32_t off = 0;
+        const uint32_t g = (uint32_t)av_who_guest((uintptr_t)c.Rip, &off);
+        if (g) len += snprintf(chain + len, sizeof chain - len, "%sfunc_%08X+0x%X", found++ ? " < " : "", g, off);
+        DWORD64 base = 0;
+        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c.Rip, &base, NULL);
+        if (!f) { c.Rip = *(DWORD64*)c.Rsp; c.Rsp += 8; continue; }
+        PVOID hd; DWORD64 ef;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, f, &c, &hd, &ef, NULL);
+    }
+    char name[64] = "?";
+    typedef HRESULT (WINAPI *gtd_t)(HANDLE, PWSTR*);
+    static gtd_t gtd = (gtd_t)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
+    PWSTR w = NULL;
+    if (gtd && SUCCEEDED(gtd(GetCurrentThread(), &w)) && w) {
+        if (w[0]) snprintf(name, sizeof name, "%ls", w);
+        LocalFree(w);
+    }
+    DWORD64 mb = 0;
+    RtlLookupFunctionEntry(ctx_in->Rip, &mb, NULL);
+    fprintf(stderr, "[av-who] guest 0x%08X %s %.2f ms thread '%s' (tid %lu) spu-job %d pc %s+0x%llX | %s\n",
+            guest, is_write ? "write" : "read", ms, name, GetCurrentThreadId(), spu_jobtime_cur_img(),
+            mb ? "img" : "?", (unsigned long long)(ctx_in->Rip - mb), found ? chain : "no lifted PPU frame");
+    fflush(stderr);
+}
 static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -610,6 +767,12 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
                 const int claimed = g_vm_access_violation_hook((uint32_t)(fault - base), is_write);
                 QueryPerformanceCounter(&avq1);
                 spu_jobtime_av(avq1.QuadPart - avq0.QuadPart);
+                if (claimed && av_who_on()) {
+                    static LARGE_INTEGER s_qf;
+                    if (!s_qf.QuadPart) QueryPerformanceFrequency(&s_qf);
+                    const double ms = (double)(avq1.QuadPart - avq0.QuadPart) * 1000.0 / (double)s_qf.QuadPart;
+                    if (ms >= 1.0) av_who_note(ep->ContextRecord, (uint32_t)(fault - base), is_write, ms);
+                }
                 if (claimed) return EXCEPTION_CONTINUE_EXECUTION;
             }
             /* Another thread may have lifted the protection while this fault was
@@ -703,6 +866,26 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
 
 #ifdef _WIN32
 #include <intrin.h>
+#include "ps3emu/port_hitch.h"   /* g_port_hitch_job_tag: [spike] / [spu-jobs] job classes */
+/* R2 perf 1115: SPU job image id -> class, from static analysis of the job images (strings in the
+ * extracted jobmods / the EBOOT wwspic ranges; see files\r2_perf_1115.md). "phys" = igPhysicsColl
+ * (rigid-body collision + simulate + post-update, jobmod 019fca988b49), "pcf" = the dynamicjoint
+ * constraint framework (ragdoll / joint builders, pcf_solver_sim / pcf_solver_ik), "limb" = zombie limb
+ * physics. water / geom / mesh from native_hot_r2.md. PORT_SPU_JOB_TAGS=0 = no tags. */
+static const char* r2_spu_job_tag(int img)
+{
+    switch (img) {
+    case 201: return "phys";
+    case 605: return "limb";
+    case 216: return "water";      /* 7db0: water normal / upblend */
+    case 209: return "ocean";      /* 4154: ocean FFT phasor */
+    case 227: return "geom";       /* dd413: geometry xform / cull */
+    case 222: return "mesh";       /* b126: triangulate (packed mesh / edge lock data) */
+    default: break;
+    }
+    if (img >= 649 && img <= 671) return "pcf";
+    return nullptr;
+}
 /* Resistance port: one [sys] line so a tester's run.log says what it ran on,
  * and a readable message instead of an illegal-instruction crash on CPUs
  * without the x86-64-v3 set (AVX2/FMA/BMI2) the lifted code is built for. */
@@ -745,13 +928,26 @@ int main(int argc, char** argv)
         printf("usage: %s <PPU ELF>\n", argv[0]);
         return 2;
     }
+    /* First, as R3: the preset writes RSX_FSR in the numbering of the renderer that will actually run. */
+    r2_renderer_migrate();
 
+    /* R2 perf 1115: [spu-jobs] / [spike] SPU job timing. R2's WWS policy module calls a job at LS 0x35D4
+     * (bisled $lr,$5 -> return pc 0x35D8); the runtime default 0x2AA0 is R3's. Image 419 (the R3 job the
+     * focus / lane boost default to) means nothing here. SPU_JOB_TIMING=0 turns the timing off. */
+    if (!getenv("SPU_WWSJOB_LINK")) _putenv_s("SPU_WWSJOB_LINK", "0x35D8");
+    if (!getenv("SPU_JOB_FOCUS")) _putenv_s("SPU_JOB_FOCUS", "0");
+    if (!getenv("SPU_JOB_BOOST")) _putenv_s("SPU_JOB_BOOST", "0");
+    { g_sjt_link_b = (uint32_t)strtoul(getenv("SPU_WWSJOB_LINK"), 0, 0) & 0x3FFFFu; }
+    { const char* e = getenv("PORT_SPU_JOB_TAGS"); if (!(e && *e == '0')) g_port_hitch_job_tag = r2_spu_job_tag; }
     /* Before anything starts: the profile sets env switches that the
      * subsystems read when they first run. R2_PRESET fills in the settings
      * that aren't set explicitly, before the profile reads them. */
     if (const char* preset = getenv("R2_PRESET"); preset && *preset)
         r2ac::apply_preset_env(preset, r2ac::Phase::startup);
     port_cpu_profile_init();
+    /* [cores]: the physical-core count (PORT_CORE_SCARCE, PORT_CORE_SCARCE_BELOW), reported at start-up
+     * as in the Fall of Man port, where it picks the RSX frame clock's idle wait. */
+    (void)ps3_host_core_scarce();
     r2_crash_init();
 
 #ifdef _WIN32
@@ -760,6 +956,9 @@ int main(int argc, char** argv)
      * inflates every shorter wait the title makes and throttles the whole
      * thing. POSIX timers are already fine-grained. */
     timeBeginPeriod(1);
+    /* Windows 11 ignores timeBeginPeriod for a process whose window is
+     * minimised or covered: the opt-out (PORT_TIMER_NOTHROTTLE) is part of the
+     * single power-throttling call in port_cpu_profile_init (cpu_profile.inc). */
     setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: do not lose prints on a kill */
 #endif
 
@@ -767,10 +966,47 @@ int main(int argc, char** argv)
 #ifdef _WIN32
     port_sys_report();
 #endif
+    {   /* defaults: r2_hot.cpp, r2_native_jobs.c, r2_native_audio.c, tiled_dma_copy_fast.hpp. edge-zlib
+         * (native_edge_zlib.c) is native-jobs kernel 1 (mask bit 1, like R3's kernel bit 0) and water-jobs
+         * are kernels 2..4: their state is the effective one from r2_native_jobs.c (R2_NATIVE_JOBS, _MASK,
+         * _WATER, PORT_NATIVE_EDGE_ZLIB, AVX2 build). If the entry's own switch is set but overridden by
+         * one of the others, the label says so (and is not looked up as a switch).
+         * Kernel bits: 0 dd413-xform4, 1 edge-zlib, 2..4 water (7db0 grad/upblend, 4154 phasor), 5 dd413-cull. */
+        const int jobs_on = r2nj_effective_mask() != 0;
+        const int zlib_on = r2nj_kernel_active(1);
+        const int water_on = r2nj_kernel_active(2) && r2nj_kernel_active(3) && r2nj_kernel_active(4);
+        auto eff_env = [](const char* env, const char* overridden, int on) {
+            const char* e = getenv(env);
+            return port_native_parse_bool(e, on) != on ? overridden : env;
+        };
+        char pcore_sw[96];
+        const int pcore_on = !port_pcore_why();
+        port_pcore_label(pcore_sw, sizeof pcore_sw, pcore_on, port_pcore_why());
+        const port_native_feature k_native[] = {
+            { "hot-ppu", "R2_HOT_NATIVE", 1 },
+            { "spu-jobs", eff_env("R2_NATIVE_JOBS", "R2_NATIVE_JOBS,overridden", jobs_on), jobs_on }, { "audio-jobs", "R2_NATIVE_AUDIO_JOB", 1 },
+            { "edge-zlib", eff_env("PORT_NATIVE_EDGE_ZLIB", "PORT_NATIVE_EDGE_ZLIB,overridden", zlib_on), zlib_on },
+            { "detile-fast", "RSX_DETILE_FAST", 1 },
+            { "water-jobs", eff_env("R2_NATIVE_JOBS_WATER", "R2_NATIVE_JOBS_WATER,overridden", water_on), water_on },
+            { "pcore-pin", pcore_sw, pcore_on },
+            { "spu-sched", "PORT_SPU_SCHED", spu_sched_effective() },
+            /* RSX_GPU_* (gpu-texdecode/gpu-blit/gpu-texstream): r2rsx_bridge.cpp apply_gpu_offload() prints its own
+             * [native] line with the effective state once the yml and the R2_* aliases are applied. */
+        };
+        port_native_summary(k_native, (int)(sizeof k_native / sizeof k_native[0]));
+    }
 
     if (!alloc_guest_vm()) {
         fprintf(stderr, "ERROR: could not allocate the guest address space\n");
         return 1;
+    }
+    {   /* PORT_LARGE_PAGES cannot be honoured in this port: the RSX texture cache write-protects guest memory
+         * in 4 KB pages (VirtualProtect) to see CPU writes to textures, which a large page cannot do, and the
+         * guest space is one pagefile section mapped twice (vm_sudo_base), which would have to be committed whole
+         * in large pages. The switch is still read so the [native] line says why it is off. */
+        port_large_pages lp = { port_large_pages_env(), 0, 0, 0, NULL };
+        if (lp.requested) lp.reason = "texture cache needs 4 KB page protection";
+        port_large_pages_summary(&lp);
     }
 
     uint32_t entry = ppu_load_elf(argv[1]);

@@ -24,6 +24,7 @@
 
 /* The unit under test, compiled straight in: it is one small file whose only
  * dependency on the rest of the runtime is spu_ch_wake, stubbed below. */
+#define SPU_COH_TEST_UNLOCK_HOOK 1   /* test_range_notify_unlock_race */
 #include "../spu_coherency.c"
 
 /* The real PPU store and store-conditional path the hook lives in. */
@@ -342,8 +343,144 @@ static void test_block_stores(void)
     CHECK(g_wakes == 0);
 }
 
-/* More live virtual contexts than physical SPUs, including persistent
- * policy contexts which are idle while another workload runs. */
+/* PORT_NOTIFY_ALL_WRITES: a write outside the PPU/SPU store paths (the RSX's
+ * labels, reports, blits and surface flushes) reports its whole range once. */
+static void test_range_notify(void)
+{
+    const uint32_t LINE_D = 0x00040400u;       /* never reserved by anyone */
+    spu_reset(&g_spu_a, 0);
+    spu_reset(&g_spu_b, 1);
+    spu_getllar(&g_spu_a, LINE_A);
+    spu_getllar(&g_spu_b, LINE_C);
+    g_wakes = 0;
+    const long long w0 = g_spu_coh_range_wakes;
+
+    TEST("a range write over one reserved line wakes only its holder");
+    spu_coh_notify_range(LINE_A + 64, 4);
+    CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
+    CHECK(g_spu_a.resv_valid == 0);
+    CHECK(g_spu_b.resv_valid == 1);
+    CHECK_EQ_U32(g_spu_b.event_status, 0);
+    CHECK(g_wakes == 1);
+    CHECK(g_spu_coh_range_wakes == w0 + 1);
+
+    TEST("a large range over unreserved lines raises nothing");
+    g_wakes = 0;
+    spu_coh_notify_range(LINE_D, 0x80000u);
+    spu_coh_notify_range(LINE_C + 128, 0x100u);
+    spu_coh_notify_range(LINE_C, 0);
+    CHECK(g_spu_b.resv_valid == 1);
+    CHECK(g_wakes == 0);
+
+    TEST("a multi-line range ending inside a reserved line wakes its holder");
+    spu_getllar(&g_spu_a, LINE_A);
+    g_wakes = 0;
+    spu_coh_notify_range(LINE_A + 8, (LINE_C + 1) - (LINE_A + 8));
+    CHECK(g_spu_a.resv_valid == 0);
+    CHECK(g_spu_b.resv_valid == 0);
+    CHECK_EQ_U32(g_spu_b.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
+    CHECK(g_wakes == 2);
+
+    TEST("a range at the top of the address space is clamped");
+    g_wakes = 0;
+    spu_coh_notify_range(0xFFFFFF80u, 0x1000u);
+    CHECK(g_wakes == 0);
+}
+
+/* The flush that calls spu_coh_notify_range can run on a thread that already
+ * holds the lock-line lock (its locked memcpy faulted on a protected surface
+ * page and the access-violation handler flushed it). The call must not wait for
+ * the lock -- a hang here is the failure -- and the wake must still happen, by
+ * the holder's unlock. */
+static void test_range_notify_reentrant(void)
+{
+    spu_reset(&g_spu_a, 0);
+    spu_reset(&g_spu_b, 1);
+    spu_getllar(&g_spu_a, LINE_A);
+    spu_getllar(&g_spu_b, LINE_C);
+    g_wakes = 0;
+    const long long d0 = g_spu_coh_range_deferred;
+
+    TEST("a range notify under the lock-line lock is queued, not waited for");
+    spu_lockline_lock();
+    spu_coh_notify_range(LINE_A, 4);
+    CHECK(g_spu_a.resv_valid == 1);            /* not applied yet */
+    CHECK(g_wakes == 0);
+    CHECK(g_spu_coh_range_deferred == d0 + 1);
+    spu_lockline_unlock();
+
+    TEST("the holder's unlock applies the queued range");
+    CHECK(g_spu_a.resv_valid == 0);
+    CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
+    CHECK(g_spu_b.resv_valid == 1);
+    CHECK(g_wakes == 1);
+
+    TEST("an unlock with nothing queued applies nothing");
+    g_wakes = 0;
+    spu_lockline_lock();
+    spu_lockline_unlock();
+    CHECK(g_spu_b.resv_valid == 1);
+    CHECK(g_wakes == 0);
+
+    TEST("more queued ranges than slots still reach every holder");
+    enum { N = 20 };
+    spu_context* c[N];
+    for (unsigned i = 0; i < N; ++i) {
+        c[i] = calloc(1, sizeof(*c[i]));
+        spu_reset(c[i], 2 + i);
+        spu_getllar(c[i], 0x00050000u + i * 0x1000u);
+    }
+    g_wakes = 0;
+    spu_lockline_lock();
+    for (unsigned i = 0; i < N; ++i)
+        spu_coh_notify_range(0x00050000u + i * 0x1000u + 16u, 8);
+    CHECK(g_wakes == 0);
+    spu_lockline_unlock();
+    unsigned lost = 0;
+    for (unsigned i = 0; i < N; ++i) lost += c[i]->resv_valid == 0;
+    CHECK(lost == N);
+    CHECK(g_wakes >= N);
+    CHECK(g_spu_b.resv_valid == 1);            /* LINE_C is below every queued range */
+    for (unsigned i = 0; i < N; ++i) { spu_coh_unregister(c[i]); free(c[i]); }
+}
+
+/* The lost-wakeup interleaving: the holder H has already checked the queue
+ * (empty) and is about to release; a notifier P finds the lock taken, queues
+ * its range and retries the lock -- still taken, H has not released yet. The
+ * hook runs P exactly there. H's post-release recheck must drain the range;
+ * without it the range waits for some unrelated later unlock. */
+static int g_hook_runs;
+static void hook_notify_in_unlock_window(void)
+{
+    if (g_hook_runs++) return;                 /* only the first unlock */
+    spu_coh_notify_range(LINE_A + 32, 4);
+}
+static void test_range_notify_unlock_race(void)
+{
+    spu_reset(&g_spu_a, 0);
+    spu_getllar(&g_spu_a, LINE_A);
+    g_wakes = 0;
+    g_hook_runs = 0;
+    const long long d0 = g_spu_coh_range_deferred;
+
+    TEST("a range queued between the holder's queue check and its release is drained by that unlock");
+    spu_lockline_lock();
+    g_coh_test_unlock_hook = hook_notify_in_unlock_window;
+    spu_lockline_unlock();
+    g_coh_test_unlock_hook = NULL;
+    CHECK(g_hook_runs >= 1);
+    CHECK(g_spu_coh_range_deferred == d0 + 1); /* it really was queued, not applied directly */
+    CHECK(g_spu_a.resv_valid == 0);
+    CHECK_EQ_U32(g_spu_a.event_status & SPU_EVENT_LR, SPU_EVENT_LR);
+    CHECK(g_wakes == 1);
+    CHECK(g_coh_pend_flag == 0);
+
+    TEST("the lock is free afterwards");
+    CHECK(spu_lockline_trylock());
+    spu_lockline_unlock();
+}
+
+/* More live virtual contexts than physical SPUs, including persistent * policy contexts which are idle while another workload runs. */
 static void test_many_contexts(void)
 {
     enum { N = 20 };
@@ -424,12 +561,20 @@ static void test_many_contexts(void)
  * ===========================================================================*/
 int main(void)
 {
+#if defined(_WIN32)
+    _putenv("PORT_NOTIFY_ALL_WRITES=1"); /* default off; the range-notify tests need it */
+#else
+    setenv("PORT_NOTIFY_ALL_WRITES", "1", 1);
+#endif
     test_bitmap();
     test_ppu_store_raises_lr();
     test_no_false_raise();
     test_all_store_widths();
     test_store_conditional();
     test_block_stores();
+    test_range_notify();
+    test_range_notify_reentrant();
+    test_range_notify_unlock_race();
     spu_coh_unregister(&g_spu_a);
     spu_coh_unregister(&g_spu_b);
     test_many_contexts();

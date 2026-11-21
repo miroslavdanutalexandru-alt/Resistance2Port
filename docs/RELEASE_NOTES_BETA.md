@@ -1,12 +1,113 @@
 # Resistance 2 PC port: community beta release notes
 
-**Version:** 0.2.3-beta (GitHub pre-release). **Release date:** _to be filled in on release_.
+**Version:** 0.3.0-beta.1 (GitHub pre-release). **Release date:** 2026-11-21.
 
 A native PC port of *Resistance 2* (PS3) built by static recompilation: the game's PowerPC and SPU code is translated to C/C++ and compiled for Windows. Graphics go through RPCS3's Vulkan renderer, built into the game as a library.
 
 > **No game files and no prebuilt game are included.** This release is the source code plus Setup. You need your own legally dumped copy of the game (see *Install*); Setup builds the game on your PC from that copy.
 
 This is a **beta**. The campaign has been played through the opening Iceland levels on one PC (Ryzen 5 5600X, GeForce RTX 5070, Windows 11). Later levels are untested. Please report what you find (see *Reporting problems*).
+
+## 0.3.0-beta.1 (hotfix)
+
+Setup fix only; the game itself is unchanged from 0.3.0.
+
+- **Updating over a 0.2.x install no longer fails** with `'Emu/RSX/port_texdiag.h' file not found` while building the RSX core (Resistance2Port #17, Resistance3Port #24). Setup kept the RPCS3 source folder from 0.2.x (`ps3recomp\third_party\rpcs3`) and never applied 0.3.0's patch to it. It now detects a source patched by an older version and patches it again automatically (the old changes are kept in git's stash there; a copy that is not a git checkout is downloaded again). `build.bat` also checks the patch before building.
+
+If you installed 0.3.0 fresh and it built, you don't need this update.
+
+## 0.3.0-beta
+
+The first update focused on performance and stability. Every option below is in the launcher or `settings.bat`; the names in brackets are the variables (useful for bug reports). Run Setup again after updating so the game code is regenerated.
+
+### Fixes
+- **Permanent freezes:** fixed a lost wake-up in the runtime's wait slots (the compiler turned a 16-byte atomic read into a plain load), which could leave game threads waiting forever.
+- **DLSS Frame Generation no longer crashes at boot:** if it can't start on your GPU or driver, the game starts with Frame Generation off. With Frame Generation on, the Reflex frame cap is no longer multiplied by the generated-frame factor (`R2_DLSS_FG_CAP=0` removes the cap).
+- **Ambient occlusion now works with DLSS, FSR and XeSS** (it runs on the upscaler's input). `RSX_SSAO_DLSS=0` turns it off under DLSS only.
+- **Garbage textures on bullet holes and rubble** fixed (`RSX_AV_NEIGHBOUR_SMALL_FLUSH`, default on; `0` = old).
+- **Microstutter** from texture copies reduced (`RSX_NV0039_PREINVAL`, default on; `0` = old).
+- Striped / purple textures fixed by turning on RSX memory tiling, as in RPCS3.
+- A black screen when the game ran out of thread slots after a cutscene is fixed (`PS3_THREAD_SLOT_FIX`, default on).
+- **DualSense / DualShock 4 controllers work again without Steam Input or DS4Windows** (GitHub issue #6): the prebuilt SDL3 library (`ps3recomp\third_party\SDL3\lib\SDL3-static.lib`) was missing from the release, so builds fell back to XInput only. It is now included.
+- **Garbled or partly black start-up splash and other linear textures** fixed: linear (non-swizzled) textures are byteswapped on the CPU instead of the GPU compute decoder (`RSX_TEXDECODE_LINEAR_CPU`, default on; `0` = old).
+- **DLSS / Frame Generation motion fixes:** the camera's motion is now found in every frame instead of only among the first 8 view matrices, so Frame Generation and DLSS see the real camera movement (less doubling and smearing while turning); a confirmed camera motion is no longer thrown away by the motion check; the de-jitter pass keeps signed depth values intact. Each is on by default and can be turned off with `0` for comparison: `RSX_AA_EXACT_ALL`, `RSX_AA_CONF_TRUST_EXACT`, `RSX_AA_DEJIT_SIGNED`.
+- Sound comes back after the audio device is unplugged or changed (`PORT_AUDIO_REOPEN`, default on), and no longer stays slowed or garbled after alt-tab or the F10 menu (`PORT_AUDIO_FOCUS_REPRIME`, default on).
+- **Freeze in fights fixed:** an occlusion result the game waits for could sit unsent while the GPU was idle; it is now submitted after 200 µs of idle (`RSX_ZCULL_IDLE_FLUSH`, default on). A second hang, where the GPU command position was reported past a label before it was written, is also fixed (`R2_FIFO_GET_AT_LABEL`, default on).
+- **Crash fix:** game threads opening and closing files at the same time could corrupt the file table and crash.
+- **DLSS / FSR image fixes:** boiling and shimmer on vegetation and fine detail when standing still (`RSX_AA_POST_STABLE`, default on), purple walls and ladders (`RSX_AA_DS_LATCH`, default on), flashing branches and overly bright bloom are fixed.
+- **AMD:** a driver crash while shaders were preloaded in the background (GitHub issue #10) is avoided: the preload skips MSAA pipelines that can't be used, uses one thread on AMD, and a pipeline that crashed the driver is caught and skipped on the next start (`PORT_PRELOAD_ALL_MSAA`, `PORT_PRELOAD_THREADS`, `PORT_PRELOAD_QUARANTINE`, `PORT_PRELOAD_SEH`); shadows and decals get a proper depth bias on 32-bit depth (`RSX_ZBIAS_D32`, auto).
+- **Closing the window ends the game** at once, and quitting no longer runs the full PS3 shutdown path that could hang (`PS3_EXIT_CRT=1` = old).
+- **Mouse aim learning is less eager**, so the mouse no longer gets mis-detected as a stick (`R2_ML_LEARN=0` off, `legacy` = old); delete an old `mouselook_r2.cfg` if aiming felt wrong.
+- **Triggers** no longer flicker between pressed and released near the threshold (`PAD_TRIGGER_HYST=0` = old).
+- **60 fps by default:** *Auto-detect* now recommends 60 fps (120 only on the fastest GPUs), because left-stick movement misbehaves above about 75 fps (`R2_AUTOCONFIG_120=1` = old recommendation).
+- The build log is no longer flooded with compiler warnings.
+
+### New features
+- **Online (experimental, off by default):** `PORT_ONLINE=1` plus your own RPCN account in `online.ini` (copy `online.ini.example`). Groundwork only: signing in and getting a ticket from RPCN works; online play itself is untested.
+- **PC SETTINGS inside the game's own Options menu** (`R2_MENU_ROWS`, default on), next to the F10 PC menu.
+- **HD UI pack (experimental):** launcher › Saves & tools › *Create HD UI pack* AI-upscales the menu / HUD bitmaps from your own game files on your PC, on the graphics card in one Real-ESRGAN run (the upscaler comes with the port; the official `realesrgan-x4plus` model is downloaded the first time, see `THIRD_PARTY_NOTICES.md`); if the graphics card fails, the upscaler is stopped at once and the rest is made on the CPU, and later runs use the CPU (delete `tools\upscaler\gpu_fault.txt` or run `HDUIPack.exe --use-gpu` to retry the GPU); turn it on with `RSX_HD_UI=1`. Nothing game-derived ships with the port.
+- **Save backups:** before the game overwrites a save, the previous version is copied to `saves_backup\` (newest 5 per save; `PORT_SAVE_BACKUP=0` off, `PORT_SAVE_BACKUP_KEEP=N`).
+- **Import saves from RPCS3** (launcher › Saves & tools), including saves from other regions; your saves are backed up first.
+- **Language fallback:** languages without a voice-over on the disc (for example English (UK)) play the English voices and keep their own text (`PS3_LANG_VOICE_FALLBACK`, default `1`; `0` = off).
+- **Photo mode (F7)** can now also hide the game's HUD (`R2_PHOTO_HIDE_HUD`, default on; needs DLSS, FSR or DLAA).
+- **PS3-style trophy pop-ups:** "You have earned a trophy." with the trophy's real icon from your game files (`PORT_TROPHY_STYLE=old` = the classic pop-up).
+- **Cutscene skip hint follows Skip unwatched movies** (*not yet tested in game*): *Show cutscene skip hint* **Auto** (default) shows it when *Skip unwatched movies* is on, since every story movie can then be skipped. Holding the button skips either way; `PORT_SKIP_HINT=1` always shows the hint, `0` never.
+- **Skip unwatched movies** (*not yet tested in game*): holding to skip now also skips pre-rendered movies you have not watched yet. While the hold fires, the game's own "already watched?" check in its movie skip code answers yes, so the game ends the movie through its normal skip path. Launcher / PC menu *Skip unwatched movies* (`R2_CUTSCENE_SKIP_ALL`, default on, `0` = off; needs *Hold to skip movies*). `logs\run.log` says how each movie ended (`[r2x] movie closed (...)`).
+- **Game language option** in the launcher (PC page): Auto (the Windows language) or a fixed language (`PS3_LANG`, e.g. `en`, `en-gb`).
+- Gore and adaptive difficulty options (`PORT_GORE`, `PORT_DYNDIFF`), a Steam Deck preset, a benchmark key (`R2_BENCH_KEY`, default F11), and a frame-time report in `logs\` at exit.
+- **Save location** (launcher Advanced › Saves): game folder (default), *Saved Games\Resistance 2* or a folder you pick (`PS3_GAMEDATA_ROOT`).
+
+### Setup and updates
+- **In-place updater:** the launcher's *Updates* option (Advanced page): **Notify** (default) offers *Update now*, which downloads the release (SHA-256 checked), replaces the port's files, runs Setup in update mode and restarts the launcher; **Auto-install** asks once, then updates; **Off** (`PORT_NO_UPDATE_CHECK=1`). Settings, saves, game copy and builds are kept; a failed update is rolled back (`logs\update.log`). `PORT_UPDATE_NOTIFY_ONLY=1` = the old notice. Git checkouts and RecompLauncher installs only get the notice.
+- **Portable build tools (experimental):** Setup lists the missing build tools, explains each one and asks first: **S** installs them system-wide, **P** puts them only into `tools_cache\` in the port folder (nothing is installed in Windows; `Setup.bat -PortableTools`). `Setup.bat -RemoveTools` removes again exactly what Setup installed (`tools\installer\buildtools.ps1`).
+- **LLVM 22 or newer is now needed:** the committed PGO profile (`pgo\r2.profdata`) is in a format older LLVM cannot read. Setup updates an older LLVM (or fetches a portable one), and `build.bat` stops with a clear message if clang-cl is older (`build.bat nopgo` builds without the profile).
+- **Build repair:** `tools\build_doctor.ps1` resets a broken build configuration (a moved folder, `build.ninja still dirty`), shows the first error of a failed build (`-FirstError`) and how much space each part takes (`-DiskUsage`); Setup uses it by itself.
+- **Game copy check:** Setup now also checks that `game.psarc` (the game's data archive) was copied, not only the program file; a copy without it started to a black screen. The PS3 menu extras and the disc's PS3 system update are no longer copied.
+- The launcher checks that `game\EBOOT.elf` and the built game are there before it starts the game, and says what to run if not.
+- **More reliable RPCS3 source download** (GitHub issue #13): every download is retried with a growing pause, then falls back to a full fetch and finally to GitHub's source archive of the exact pinned commit; a run that stopped half way continues where it stopped, exFAT / FAT32 / network drives and Git's "dubious ownership" error are handled, and Git's messages plus a plain-English hint go to `logs\fetch_rpcs3.log`.
+- **Build fix for folders with spaces:** the build no longer fails on the FFmpeg headers when the port folder's path contains spaces.
+- **Setup help:** if the compiler runs out of memory, Setup retries with fewer files at a time and continues where it stopped; it suggests excluding the port folder from Microsoft Defender and warns about slow USB / exFAT / network drives.
+
+### Controls
+- **Round-to-square stick mapping** like a DualShock 3, so diagonals reach full speed (`PAD_SQUIRCLE`, default `4000`; `0` = old).
+- New stick and button options, all off / as the game by default: outer deadzone (`PAD_OUTER_DEADZONE`), anti-deadzone (`PAD_ANTI_DEADZONE`), trigger deadzone (`PAD_TRIGGER_DEADZONE`), turn boost (`PAD_TURN_BOOST`), crouch and sprint toggle / hold (`PAD_CROUCH_MODE`, `PAD_SPRINT_MODE`, experimental).
+- Vibration strength (`PAD_RUMBLE`, default 100), Circle-to-confirm (`PS3_ENTER_BUTTON=circle`), controllers in the background (`PAD_BACKGROUND_INPUT`, default Auto), all controllers drive player 1 (`PAD_MERGE=1`, default off for co-op) and Nintendo button prompts (`R2_PAD_GLYPHS=nintendo`).
+
+### Graphics
+- **Direct3D 12 renderer: for testing only, not for playing** (`R2_RSX=d3d12`). It has many graphics bugs and runs much slower than the default Compatible (Vulkan) renderer. Upscaler there via `RSX_FSR` (`3` = FSR 3.1 native AA using the AMD FidelityFX Direct3D 12 DLLs in `tools\ffx_dx12\`, `2` = DLAA, `4` = XeSS native AA; unverified in game).
+- **AMD Anti-Lag 2 and a single latency option** (`PORT_LATENCY=off|reflex|antilag|auto`; unset = the Reflex setting alone decides, as before). Off while Frame Generation is on.
+- Native-resolution shadow maps option (`RSX_SHADOW_NATIVE=1`, default off), remembered window position (`RSX_WINDOW_REMEMBER`, default on) and many DLSS / FSR image fixes (less ghosting, smearing and shimmer on foliage and effects).
+- **DLSS preset** option (`RSX_DLSS_PRESET`); Auto picks the CNN preset E on RTX 20 / 30, where the transformer model costs much more (`PORT_DLSS_AUTO_ARCH=0` = NVIDIA's default everywhere).
+- **Frame generation backend** option: Auto (DLSS-G, else FSR 3), DLSS only or FSR 3 (`R2_FG_BACKEND`).
+- **Brightness** (`PS3_DISPLAY_GAMMA`), **texture detail / LOD bias** (`R2_LOD_BIAS`) and **Ultrawide HUD** (`RSX_HUD_FIX=1`, experimental: HUD in a centred 16:9 area) options.
+
+### Audio
+- Native code for the SPU audio mixer job (`R2_NATIVE_AUDIO_JOB`, default on; `0` = old).
+- **Speaker layout follows your playback device:** the recommended (default) choice is now **Stereo** on headphones / stereo speakers and 7.1 on 8-channel outputs, instead of always 5.1 (`PORT_SPEAKERS`; pick 5.1 / 7.1 / Stereo in the launcher).
+- Master volume and mono audio (`PORT_VOLUME`, default 100; `PORT_AUDIO_MONO=1`).
+- Steadier sound under load: clock-drift correction (`PORT_AUDIO_DRIFT`), an adaptive buffer (`PORT_AUDIO_ADAPTIVE`), and silence instead of looping sound while the game is paused or stalled (`PORT_AUDIO_PAUSE_FREEZE`, `PORT_AUDIO_STALL_FREEZE_MS`); all on by default.
+
+### Performance
+- **Native SPU job kernels** (`R2_NATIVE_JOBS`, default on; `0` = the translated SPU code only): hand-written, bit-exact versions of the hottest geometry and zlib routines, plus the water / ocean jobs (`R2_NATIVE_JOBS_WATER`, default on).
+- Native copies of the game's own memcpy / strcmp family (`R2_HOT_NATIVE`, default on).
+- **PGO-optimised build:** `build.bat` uses the committed profile `pgo\r2.profdata` automatically (`set PORT_PGO=0` or `build.bat nopgo` to opt out).
+- **CPUs without AVX2:** Setup also builds a variant without AVX2 (SSE4.1 minimum) and the launcher picks it on those CPUs.
+- Lower CPU use while waiting (`PORT_NOSPIN`, default on), a menu frame cap (`PORT_MENU_FPS`, default 90), better behaviour on 4-core CPUs and many renderer fast paths.
+- **Faster big fights:** scaled depth copies are one GPU blit instead of a slow colour round trip (`RSX_DEPTH_BLIT_DIRECT`, default on), the DLSS feature is created once and reused when the render size changes (`RSX_AA_DYNRES`), and an occlusion wait is capped at 50 ms, with objects drawn visible on timeout.
+- **Thread placement:** on Intel hybrid CPUs the busy game threads prefer P-cores (`PORT_CPU_PCORES`, on); optional raised priority (`PORT_THREAD_PRIORITY`, off); game threads opt out of Windows power throttling (`PORT_ECOQOS=1` keeps the Windows default).
+- **Reduce detail when the CPU is slow** (`R2_GOVERNOR_MS`): the game's own governor at its original 36.6 ms, earlier (30 ms, weak CPUs) or never.
+
+### Settings
+- `RSX_GPU_TIME` (GPU timing in the hitch log) is now off by default; `RSX_GPU_TIME=1` turns it on.
+- **Overlay:** the F3 overlay draws a frame-time graph (`PORT_OVERLAY_GRAPH`, on); the overlay, notifications and PC menus scale with the window (`PORT_UI_SCALE`, Auto; 75–200 %).
+- `PS3_THREAD_SLOT_FIX`, `RSX_AV_NEIGHBOUR_SMALL_FLUSH`, `RSX_NV0039_PREINVAL`, `R2_NATIVE_JOBS`, `R2_NATIVE_AUDIO_JOB` and `R2_HOT_NATIVE` are on by default; set one to `0` in `settings.bat` to compare with the old behaviour when reporting a bug.
+- Quieter `logs\run.log`: diagnostic logs and profilers are now off by default (shadow / depth diagnostics, renderer micro-stats, the RSX CPU profiler `PORT_RSX_CPU_PROF`, the fall detector `PORT_FALL_M`); file opens are logged for the first 200 only (`PS3_FSLOG=1` logs all) and the upscaler's summary is written every 60 s instead of every 5 s.
+
+### Known issues
+- **Frame Generation (DLSS-FG) is still experimental** and has remaining artifacts: jitter on grass / vegetation and around doors and entrances, and some ghosting. These will be fixed in an upcoming hot patch. Frame Generation is off by default.
+
+### Support
+This port is free and always will be. If you enjoy it and feel like buying me a coffee, it's genuinely appreciated: [buymeacoffee.com/damiro98](https://buymeacoffee.com/damiro98)
 
 ## 0.2.3-beta (last hotfix)
 
@@ -38,7 +139,7 @@ If 0.2.0 is already built and runs, you don't need this update.
 ### Launcher
 - `Launcher.exe` holds all settings and key bindings. **Auto-detect** recommends settings for your PC.
 - Pages: Display, Graphics, Upscaling & Frame Gen, Performance, Controls, Audio, Interface & Notifications, Advanced, **Trophies**, **Saves & tools** and About (`Launcher.exe --page N` opens one, 0–10).
-- The update check only opens the Releases page. Turn it off on the Advanced page or with `PORT_NO_UPDATE_CHECK=1`.
+- **Updates:** the launcher checks the Releases page at start and can update in place (*Update now*: downloads, replaces the port's files, runs Setup and restarts; a failed update is rolled back). The *Updates* option on the Advanced page picks Notify (default), Auto-install or Off (`PORT_NO_UPDATE_CHECK=1`).
 
 ### Graphics
 - **Upscaling and anti-aliasing:** NVIDIA DLSS on GeForce RTX cards, AMD FSR 3.1 on any GPU, or Off (`RSX_FSR` = 2 / 1 / 0). If DLSS can't start, the port uses FSR 3.1.
@@ -80,7 +181,7 @@ If 0.2.0 is already built and runs, you don't need this update.
 
 ## What you download
 
-- **`Resistance2Port-Setup-0.2.0-beta.exe`** from the GitHub release: an installer with the port's source, scripts and `Launcher.exe`. It installs the files and starts Setup.
+- **`Resistance2Port-Setup-<version>.exe`** from the GitHub release: an installer with the port's source, scripts and `Launcher.exe`. It installs the files and starts Setup.
 - or the **source code** (the release's source archive or `git clone` at the tag), then `Setup.bat`.
 
 Either way, the game itself is built on your PC; no built game program is published. Setup downloads the build tools, RPCS3's source, FFmpeg (an LGPL build), shaderscan and, if you accept their licences, the NVIDIA DLSS, Streamline (DLSS Frame Generation) and Intel XeSS SDKs.
@@ -88,7 +189,7 @@ Either way, the game itself is built on your PC; no built game program is publis
 ## Requirements
 
 - Windows 10 or 11, 64-bit.
-- A CPU with **AVX2** (Intel 4th generation or newer, or any AMD Ryzen).
+- A CPU with **AVX2** (Intel 4th generation or newer, or any AMD Ryzen) is recommended. On an older CPU with SSE4.1, Setup also builds a slower variant without AVX2 (`build_baseline\`) and the launcher uses it; below SSE4.1 the game says so and exits.
 - A **Vulkan 1.3** GPU. DLSS needs a GeForce RTX card. FSR works on AMD, NVIDIA and Intel. Only NVIDIA has been tested so far.
 - The Microsoft Visual C++ 2015–2022 x64 runtime, version 14.40 or newer.
 - Your own copy of **Resistance 2, EU disc (BCES00226), version 1.00**. Other regions, digital copies and patched versions are not supported yet.
@@ -122,7 +223,6 @@ Either way, the game itself is built on your PC; no built game program is publis
 - Above 60 fps, physics still updates at 60 Hz without interpolation, so motion can look slightly juddery.
 - Lighting and bloom can look brighter in some spots at 60 fps (also reported on RPCS3). If it bothers you, use 30 fps.
 - With DLSS, blob shadows under moving pickups can trail a little, and some foliage and wire fences can still shimmer.
-- **Ambient occlusion is disabled with DLSS** in this beta (also when DLSS falls back to FSR 3.1). It still works with FSR or no upscaler.
 - Heavy fights are CPU-bound (high 30s in the biggest ones on a mid-range CPU). Frame Generation (launcher → Upscaling & Frame Gen) can help here.
 - **Frame Generation is experimental and barely tested** (DLSS on RTX 40/50, FSR 3 elsewhere; off by default). Expect ghosting and HUD or menu artifacts; reports are welcome.
 - **Changing Frame Generation in-game** can double the sound and then leave constant static. Change it in the launcher, or restart the game after changing it.

@@ -5,6 +5,9 @@
 
 #define PortName      "Resistance 2 PC Port"
 #define PortShort     "Resistance2Port"
+; PortLinkName: the Start Menu shortcut. RecompLauncher matches an installed game by two words of its
+; name ("resistance" and "resistance2" from its catalog/repo name); "Resistance 2 PC Port" alone has one.
+#define PortLinkName  "Resistance 2 PC Port (Resistance2Port)"
 #define PortAppId     "{{6C1E6A0B-2F4D-4C55-9A4E-1F0A9B3D7E02}"
 #define PortUrl       "https://github.com/miroslavdanutalexandru-alt/Resistance2Port"
 #define GameTitle     "Resistance 2 (EU disc, BCES00226)"

@@ -1,5 +1,7 @@
 @echo off
 setlocal
+set "NOPAUSE="
+for %%A in (%*) do if /i "%%~A"=="nopause" set "NOPAUSE=1"
 cd /d "%~dp0"
 if not exist logs mkdir logs
 if not exist recompiled\ppu_recomp.h (echo The game code has not been generated yet - run Setup.bat first. & goto fail)
@@ -10,32 +12,82 @@ echo  Resistance 2 - native PC build
 echo  Builds one program (EBOOT.BIN; game.self is the same file).
 echo  The first build takes a long time. Leave it running.
 echo ============================================================
-set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-set "VSDIR="
-for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%I"
-if not defined VSDIR (echo Visual Studio C++ build tools not found - run Setup.bat. & goto fail)
-rem vcvars looks for vswhere on PATH (else it prints "'vswhere.exe' is not recognized")
-set "PATH=%PATH%;%ProgramFiles(x86)%\Microsoft Visual Studio\Installer"
-call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
-if errorlevel 1 (echo Could not set up the Visual Studio build tools. & goto fail)
-set "PATH=C:\Program Files\LLVM\bin;C:\Program Files\CMake\bin;%LOCALAPPDATA%\Microsoft\WinGet\Links;%PATH%"
-set "FFOPT=-DPS3RECOMP_FFMPEG_RUNTIME=ON -DPS3RECOMP_FFMPEG_INCLUDE_DIR=%~dp0ffmpeg\include"
+rem Visual Studio (vcvars64) or the portable build tools in tools_cache\ - see tools\toolchain_env.bat
+call "%~dp0tools\toolchain_env.bat"
+if errorlevel 1 goto fail
+rem An MSYS2/Cygwin cmake found first on PATH reads D:/... as a relative path (configure then fails with paths like
+rem /d/<folder>/D:/...): fall back to the CMake that comes with Visual Studio, else stop with a clear message.
+if not exist tools\cmake_native_probe.cmake goto cmake_ok
+cmake -P tools/cmake_native_probe.cmake >nul 2>&1 && goto cmake_ok
+set "VSCMK=%VSDIR%\Common7\IDE\CommonExtensions\Microsoft\CMake"
+if exist "%VSCMK%\CMake\bin\cmake.exe" set "PATH=%VSCMK%\CMake\bin;%VSCMK%\Ninja;%PATH%"
+cmake -P tools/cmake_native_probe.cmake >nul 2>&1 || goto cmake_bad
+echo Using the CMake that comes with Visual Studio - the cmake found first on PATH is not a Windows build.
+goto cmake_ok
+:cmake_bad
+echo No Windows CMake was found. The cmake on PATH, if any, is an MSYS2/Cygwin build, which cannot build this port:
+where cmake 2>nul
+echo Install CMake for Windows - winget install Kitware.CMake, or https://cmake.org/download/ - or run Setup.bat, then try again.
+goto fail
+:cmake_ok
+rem the header path goes on the cmake lines in quotes of its own: quotes nested in set "..." would leave %~dp0
+rem unquoted, and a folder name with "&" or ")" would then break the line
+set "FFOPT=-DPS3RECOMP_FFMPEG_RUNTIME=ON"
+set "FFINC=%~dp0ffmpeg\include"
 set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 rem files dated in the future (zip/installer time zones) make Ninja regenerate forever
 "%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\fix_timestamps.ps1"
 if not defined PORT_JOBS set "PORT_JOBS=4"
 rem Setup.exe sets these (and PORT_PPU_JOBS, read by project\CMakeLists.txt) from the free RAM
 if not defined RPCS3_JOBS set "RPCS3_JOBS=8"
+rem PGO (profile-guided optimisation): when pgo\r2.profdata exists (recorded with tools\pgo_train.bat, see README),
+rem the renderer, the runtime, the hand-written and the lifted SPU code are optimised with it. A profile older than
+rem the sources only loses part of the gain (changed functions are built without it). Opt out: set PORT_PGO=0 or
+rem "build.bat nopgo".
+set "PGOMODE=off"
+set "PGOPROF="
+if exist "%~dp0pgo\r2.profdata" set "PGOMODE=use"
+if "%PORT_PGO%"=="0" set "PGOMODE=off"
+if /i "%PORT_PGO%"=="off" set "PGOMODE=off"
+for %%A in (%*) do if /i "%%~A"=="nopgo" set "PGOMODE=off"
+if "%PGOMODE%"=="use" set "PGOPROF=%~dp0pgo\r2.profdata"
+if "%PGOMODE%"=="use" echo PGO: optimising with pgo\r2.profdata - set PORT_PGO=0 or run "build.bat nopgo" to build without it
+rem The committed profile is in LLVM's indexed profile format version 13, which LLVM 22 is the first to read: stop
+rem with a clear message instead of a "unsupported instrumentation profile format version" compile error.
+set "CLANGMAJ="
+for /f "tokens=3 delims=. " %%V in ('clang-cl --version 2^>nul ^| findstr /b /c:"clang version"') do if not defined CLANGMAJ set "CLANGMAJ=%%V"
+if not defined CLANGMAJ (echo clang-cl was not found - run Setup.bat to install the build tools. & goto fail)
+if "%PGOMODE%"=="use" if %CLANGMAJ% LSS 22 (
+  echo.
+  echo clang-cl %CLANGMAJ% is too old: the port needs LLVM 22 or newer. The committed PGO profile pgo\r2.profdata
+  echo is in a format older LLVM versions cannot read. Run Setup.bat - it installs a newer LLVM - or update LLVM
+  echo yourself: winget upgrade LLVM.LLVM, or https://github.com/llvm/llvm-project/releases
+  echo To build with this compiler anyway, without the profile: build.bat nopgo
+  goto fail
+)
 
 echo Building the RPCS3 RSX core...
-cmake -S ps3recomp\third_party\rpcs3 -B build_rpcs3 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DRPCS3_RSX_BUILD_LINKTEST=OFF -DENABLE_HLSL=ON > logs\configure_rpcs3.log 2>&1
+rem An update keeps ps3recomp\third_party\rpcs3: when it lacks a file this version's patch adds (it was patched by an
+rem older version, R2 issue #17), re-apply the patch first. Setup.bat does this before every build anyway.
+"%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\fetch_rpcs3.ps1" -CheckFiles
+if errorlevel 1 (
+  echo Re-applying the port's RPCS3 patch...
+  "%PS%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\fetch_rpcs3.ps1"
+  if errorlevel 1 (echo Could not update the RPCS3 source - see logs\fetch_rpcs3.log, then run Setup.bat again. & goto fail)
+)
+rem RSX code generation (output-identical: /fp:precise, no FMA contraction): AVX2 + ThinLTO + /GS-.
+rem The exe already needs AVX2 (lifted code); set PORT_RSX_ARCH=generic / PORT_RSX_LTO=0 for the old build.
+if not defined PORT_RSX_ARCH set "PORT_RSX_ARCH=AVX2"
+set "RSXLTO=ON"
+if "%PORT_RSX_LTO%"=="0" set "RSXLTO=OFF"
+cmake -S ps3recomp\third_party\rpcs3 -B build_rpcs3 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DRPCS3_RSX_BUILD_LINKTEST=OFF -DENABLE_HLSL=ON -DRPCS3_RSX_ARCH=%PORT_RSX_ARCH% -DRPCS3_RSX_LTO=%RSXLTO% -DRPCS3_RSX_GS_OFF=ON -DRPCS3_RSX_PGO=%PGOMODE% "-DRPCS3_RSX_PGO_PROFILE=%PGOPROF%" > logs\configure_rpcs3.log 2>&1
 if errorlevel 1 (echo RPCS3 RSX configure FAILED - see logs\configure_rpcs3.log & goto fail)
 cmake --build build_rpcs3 -j %RPCS3_JOBS% --target rpcs3_rsx > logs\build_rpcs3.log 2>&1
 if errorlevel 1 (echo RPCS3 RSX build FAILED - see logs\build_rpcs3.log & goto fail)
 
 (
   echo Configuring...
-  cmake -S project -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DPORT_NAME=Resistance2 -DPS3RECOMP_DIR="%~dp0ps3recomp" -DRECOMP_DIR="%~dp0recompiled" -DPORT_SPU_AVX2=ON %FFOPT% > logs\configure.log 2>&1
+  cmake -S project -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DPORT_NAME=Resistance2 -DPS3RECOMP_DIR="%~dp0ps3recomp" -DRECOMP_DIR="%~dp0recompiled" -DPORT_SPU_AVX2=ON -DPORT_PGO=%PGOMODE% "-DPORT_PGO_PROFILE=%PGOPROF%" %FFOPT% "-DPS3RECOMP_FFMPEG_INCLUDE_DIR=%FFINC%" > logs\configure.log 2>&1
   if errorlevel 1 (echo Configure FAILED - see logs\configure.log & type logs\configure.log & goto fail)
 )
 echo Building the game...
@@ -48,6 +100,11 @@ set "LRES="
 rc /nologo /i project /fo build\launcher.res project\launcher.rc > logs\build_launcher_rc.log 2>&1 && set "LRES=build\launcher.res"
 clang-cl /nologo /O2 /EHsc /W0 project\launcher.cpp /Fo:build\launcher.obj /Fe:Launcher.exe /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED %LRES% user32.lib gdi32.lib shell32.lib gdiplus.lib dwmapi.lib > logs\build_launcher.log 2>&1
 if errorlevel 1 (echo Launcher build failed - see logs\build_launcher.log) else (echo Launcher.exe built)
+rem HDUIPack.exe: the launcher's Create HD UI pack button (project\hd_ui_pack.cpp; reads the game's archives,
+rem upscales with tools\hdui_upscaler on the GPU (CPU if that fails), writes mods\hd_ui). Failure only disables that button.
+if not exist build\hdui mkdir build\hdui
+clang-cl /nologo /O2 /EHsc /W0 /std:c++17 /D_CRT_SECURE_NO_WARNINGS /I ps3recomp\third_party\rpcs3\rpcs3\Emu\RSX\Common /I ps3recomp\third_party\fossilize\miniz /I ps3recomp\third_party\rpcs3\3rdparty\stblib\stb /I project project\hd_ui_pack.cpp project\mods_psarc.cpp ps3recomp\third_party\fossilize\miniz\miniz.c /Fo:build\hdui\ /Fe:HDUIPack.exe /link urlmon.lib bcrypt.lib > logs\build_hdui.log 2>&1
+if errorlevel 1 (echo HDUIPack build failed - see logs\build_hdui.log) else (echo HDUIPack.exe built)
 
 rem shaderscan: the launcher's optional offline shader-cache seeding. It lives in its own repository
 rem (https://github.com/miroslavdanutalexandru-alt/shaderscan, GPL-2.0); tools\get_shaderscan.ps1 downloads the release
@@ -67,6 +124,8 @@ if exist "tools\dlss\lib\nvsdk_ngx_s.lib" (
 )
 rem FSR 3.1 for the Vulkan renderer (AMD FidelityFX SDK 1.1.x, MIT licence in tools\ffx_vk\LICENSE.txt)
 for %%D in (build) do if exist "tools\ffx_vk\amd_fidelityfx_vk.dll" copy /Y "tools\ffx_vk\amd_fidelityfx_vk.dll" %%D\ >nul
+rem FSR 3.1 for Direct3D 12 (experimental, rsx_d3d12_engine_aa.inc): AMD FidelityFX SDK loader + upscaler, MIT (tools\ffx_dx12\LICENSE.txt)
+for %%F in (amd_fidelityfx_loader_dx12.dll amd_fidelityfx_upscaler_dx12.dll amd_fidelityfx_framegeneration_dx12.dll) do if exist "tools\ffx_dx12\%%F" copy /Y "tools\ffx_dx12\%%F" build\ >nul
 rem Intel XeSS for the Vulkan renderer (RSX_FSR=4, VKR2XeSS.cpp): Intel's redistributable libxess.dll, unmodified,
 rem Intel Simplified Software License (tools\xess\LICENSE.txt, third-party-programs.txt). Missing = FSR 3.1.
 for %%D in (build) do if exist "tools\xess\bin\libxess.dll" copy /Y "tools\xess\bin\libxess.dll" %%D\ >nul
@@ -76,8 +135,8 @@ for %%F in (sl.interposer.dll sl.common.dll sl.dlss_g.dll sl.reflex.dll sl.pcl.d
 echo.
 echo BUILD SUCCEEDED: build\Resistance2.exe
 echo Start the game with Launcher.exe
-if /i not "%~1"=="nopause" pause
+if not defined NOPAUSE pause
 exit /b 0
 :fail
-if /i not "%~1"=="nopause" pause
+if not defined NOPAUSE pause
 exit /b 1

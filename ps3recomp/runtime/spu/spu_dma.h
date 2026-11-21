@@ -18,6 +18,7 @@
 #include "spu_context.h"
 #include "../../include/ps3emu/log_first.h"
 #include "spu_coherency.h"
+#include "spu_put_order.h"   /* GCM_PUT_ORDER: park-head PUTs written head-last */
 #include "ps3emu/ps3_ftrace.h"
 #include <stdint.h>
 #include <string.h>
@@ -39,7 +40,46 @@ extern uint8_t* vm_base;
  * Queries the page state and demand-commits on first touch; the whole
  * [ea, ea+size) range must be committed and accessible.
  * Returns 1 if the range is safe to memcpy. */
+/* Resistance port: SPU_DMA_FAST (default 1; SPU_DMA_FAST=0 = the old path).
+ * Every DMA, atomic and list element runs this check. With it on, the steady
+ * state is an inline test of the two page bits and the VirtualQuery slow path
+ * is a separate non-inlined function; the cache bit is set with an atomic OR
+ * so two lanes first-touching neighbouring 64K pages (same bitmap byte) cannot
+ * drop each other's bit and send later DMAs back to VirtualQuery (up to 17
+ * syscalls per miss on an RSX-protected page, whose 4K protection regions are
+ * always smaller than 64K). Same result either way. */
+static inline int spu_dma_fast_on(void)
+{
+    static int s_on = -1;
+    if (__builtin_expect(s_on < 0, 0)) {
+        const char* e = getenv("SPU_DMA_FAST");
+        s_on = !(e && *e == '0');
+    }
+    return s_on;
+}
+static int mfc_ea_range_committed_slow(uint64_t ea, uint32_t size);
 static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
+{
+    if (__builtin_expect(spu_dma_fast_on(), 1)) {
+        extern uint8_t g_vm_page_bitmap[65536 / 8];
+        const uint32_t e = (uint32_t)ea;
+        if (size != 0 && (uint64_t)e + (uint64_t)size <= 0x100000000ull && vm_base) {
+            const uint32_t p0 = e >> 16, p1 = (e + size - 1) >> 16;
+            if (((g_vm_page_bitmap[p0 >> 3] >> (p0 & 7)) & 1) &&
+                ((g_vm_page_bitmap[p1 >> 3] >> (p1 & 7)) & 1))
+                return 1;
+        }
+    }
+    return mfc_ea_range_committed_slow(ea, size);
+}
+#if defined(_MSC_VER) || defined(__clang__) || defined(__GNUC__)
+#  if defined(_MSC_VER)
+__declspec(noinline)
+#  else
+__attribute__((noinline))
+#  endif
+#endif
+static int mfc_ea_range_committed_slow(uint64_t ea, uint32_t size)
 {
     /* The VM reserves the full 32-bit guest space but only commits specific
      * regions (main mem, stack, RSX). A DMA to an uncommitted page must
@@ -82,7 +122,10 @@ static inline int mfc_ea_range_committed(uint64_t ea, uint32_t size)
               extern int (*g_vm_access_violation_hook)(uint32_t, int) __attribute__((weak));
               if (!&g_vm_access_violation_hook || !g_vm_access_violation_hook) return 0;
           }
-          g_vm_page_bitmap[pg[i] >> 3] |= (uint8_t)(1u << (pg[i] & 7));
+          if (spu_dma_fast_on())
+              __atomic_fetch_or(&g_vm_page_bitmap[pg[i] >> 3], (uint8_t)(1u << (pg[i] & 7)), __ATOMIC_RELAXED);
+          else
+              g_vm_page_bitmap[pg[i] >> 3] |= (uint8_t)(1u << (pg[i] & 7));
       }
     }
     return 1;
@@ -216,9 +259,20 @@ void spu_phys_trace_dump(const char* path);
 #ifdef __cplusplus
 }
 #endif
+/* cpu-replay: SPU job capture DMA hook (spu_cpurep.inl, compiled in spu_drain.c). */
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern volatile long g_cpurep_spu_live;
+void cpurep_spu_dma(spu_context* spu, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd);
+int cpurep_spu_atomic(spu_context* ctx, uint32_t cmd, int (*fn)(spu_context*, uint32_t));
+#ifdef __cplusplus
+}
+#endif
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    if (__builtin_expect(g_cpurep_spu_live != 0, 0)) cpurep_spu_dma(spu, lsa, ea, size, cmd); /* cpu-replay */
     { spu_dma_trace_ent* te = &g_spu_dma_ring[g_spu_dma_ring_n++ & 511u];
       te->cmd = cmd; te->lsa = lsa; te->ea = (uint32_t)ea; te->size = size; }
     if (((uint32_t)ea - 0x400F0000u) < 0x00510000u || ((uint32_t)ea - 0x10320000u) < 0x00010000u)
@@ -742,14 +796,14 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
             }
             if (span_reserved) {
                 spu_lockline_lock();
-                memcpy(ea_ptr, ls_ptr, size);
+                spu_put_copy(ea_ptr, ls_ptr, size, (uint32_t)ea);
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
                     if (a == a1) break;
                 }
                 spu_lockline_unlock();
             } else {
-                memcpy(ea_ptr, ls_ptr, size);
+                spu_put_copy(ea_ptr, ls_ptr, size, (uint32_t)ea);
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) {
                         spu_lockline_lock();

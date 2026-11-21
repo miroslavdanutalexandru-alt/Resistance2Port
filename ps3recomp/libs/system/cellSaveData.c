@@ -855,6 +855,8 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
     }
 }
 
+#include "savedata_backup.h" /* PC port: per-slot save backups (PORT_SAVE_BACKUP) */
+
 /* PC port: saves in progress (project/r2_pcport.cpp waits for 0 before it quits). */
 volatile long g_savedata_busy = 0;
 static s32 savedata_execute_body(const char* dirName, int is_save,
@@ -873,6 +875,12 @@ static s32 savedata_execute(const char* dirName, int is_save,
 #else
     __sync_fetch_and_add(&g_savedata_busy, 1);
 #endif
+    if (is_save && dirName) {
+        /* PC port: copy the slot to saves_backup\<slot>\<stamp> before it is overwritten */
+        char bk_path[1024];
+        build_save_path(bk_path, sizeof(bk_path), dirName);
+        sdbk_before_save(bk_path, dirName, s_save_root);
+    }
     const s32 r = savedata_execute_body(dirName, is_save, setBuf, funcStat, funcFile, userdata);
 #ifdef _WIN32
     _InterlockedDecrement(&g_savedata_busy);

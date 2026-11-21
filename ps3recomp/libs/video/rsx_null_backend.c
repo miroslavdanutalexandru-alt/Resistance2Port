@@ -12,6 +12,7 @@
 #include <string.h>
 #include <math.h>
 #include "../../runtime/ps3_log.h"
+#include "ps3emu/port_pc_extras2.h"
 
 #ifdef _WIN32
 
@@ -70,7 +71,8 @@ static DWORD nb_win_style(void)
  * target (144 -> 120 Hz). Temporary (CDS_FULLSCREEN) and given back when the
  * window loses focus, is minimised, leaves fullscreen, closes, the process
  * exits or crashes. Borderless / windowed never switch: there the [fps] note
- * suggests VRR or an even frame rate. With G-Sync / FreeSync it is not needed
+ * suggests VRR or an even frame rate -- unless PORT_REFRESH_SWITCH=2 (opt-in, perf r12): any fullscreen, borderless too,
+ * where the switch changes the desktop rate until focus loss / exit. With G-Sync / FreeSync it is not needed
  * (harmless: the VRR range still covers the target) -- PORT_REFRESH_SWITCH=0. */
 static struct { int active, warned, hooked; char dev[CCHDEVICENAME]; DWORD from_hz, to_hz; } s_rs;
 static LPTOP_LEVEL_EXCEPTION_FILTER s_rs_prev_filter;
@@ -104,9 +106,9 @@ void rsx_null_refresh_restore_on_crash(void) { nb_refresh_restore(); }
 static void nb_refresh_apply(HWND hwnd)
 {
     static int on = -1;
-    if (on < 0) { const char* e = getenv("PORT_REFRESH_SWITCH"); on = e && e[0] == '1'; }
+    if (on < 0) { const char* e = getenv("PORT_REFRESH_SWITCH"); on = e && (e[0] == '1' || e[0] == '2') ? e[0] - '0' : 0; }   /* 2 = borderless too */
     const char* dm = getenv("RSX_DISPLAY");
-    if (!on || s_rs.active || !hwnd || !s_state.fullscreen || !dm || _stricmp(dm, "exclusive")) return;
+    if (!on || s_rs.active || !hwnd || !s_state.fullscreen || (on != 2 && (!dm || _stricmp(dm, "exclusive")))) return;
     const char* fe = getenv("PORT_FPS_EFFECTIVE");
     const char* rf = getenv("R2_FPS");   /* before r2_fps_target ran: plain numbers only, unset = 30 */
     const double fps = fe ? atof(fe) : !rf || !*rf ? 30.0 : (rf[0] >= '1' && rf[0] <= '9') ? atof(rf) : 0.0;
@@ -257,10 +259,56 @@ void (*volatile g_port_ui_tick)(void* hwnd) = 0;
 void (*volatile g_port_close_hook)(void* hwnd) = 0;
 extern volatile int g_port_ui_modal;   /* libs/input/cellPad.c: a port overlay wants the cursor */
 
+/* RSX_WINDOW_REMEMBER (default 1): the windowed position and size are kept in window_pos.txt (game folder) and
+ * reused next start while the window size and monitor settings (RSX_WINDOW, RSX_MONITOR) are unchanged and the
+ * title bar would still be on a screen (ps3emu/port_pc_extras2.h); saved when a move / resize ends and on close,
+ * never while fullscreen. Fullscreen starts ignore it (RSX_MONITOR decides). 0 = always centred. */
+static int s_winpos_on = 0;
+static char s_winpos_key[32];
+struct NbWork { int n; int r[16][4]; };
+static BOOL CALLBACK nb_work_enum(HMONITOR m, HDC dc, LPRECT rc, LPARAM lp)
+{
+    struct NbWork* w = (struct NbWork*)lp; MONITORINFO mi; (void)dc; (void)rc;
+    mi.cbSize = sizeof mi;
+    if (w->n < 16 && GetMonitorInfoA(m, &mi)) {
+        w->r[w->n][0] = mi.rcWork.left; w->r[w->n][1] = mi.rcWork.top; w->r[w->n][2] = mi.rcWork.right; w->r[w->n][3] = mi.rcWork.bottom;
+        w->n++;
+    }
+    return TRUE;
+}
+static int nb_winpos_load(RECT* out)
+{
+    char line[96]; PcxWinPos p; struct NbWork w; FILE* f;
+    if (!s_winpos_on || !(f = fopen("window_pos.txt", "r"))) return 0;
+    line[0] = 0;
+    if (!fgets(line, sizeof line, f)) line[0] = 0;
+    fclose(f);
+    if (!pcx_winpos_parse(line, &p) || !pcx_winpos_same_base(&p, s_winpos_key)) return 0;
+    w.n = 0; EnumDisplayMonitors(NULL, NULL, nb_work_enum, (LPARAM)&w);
+    if (!pcx_winpos_visible(&p, (const int (*)[4])w.r, w.n)) { printf("[RSX null] window_pos.txt: off screen now, centring\n"); return 0; }
+    out->left = p.x; out->top = p.y; out->right = p.x + p.w; out->bottom = p.y + p.h;
+    return 1;
+}
+static void nb_winpos_save(HWND hwnd)
+{
+    RECT r; PcxWinPos p; char line[96]; FILE* f;
+    if (!s_winpos_on || !hwnd) return;
+    if (s_state.fullscreen || IsIconic(hwnd) || IsZoomed(hwnd) || !GetWindowRect(hwnd, &r)) return;
+    if (r.right - r.left < 160 || r.bottom - r.top < 100) return;
+    p.x = r.left; p.y = r.top; p.w = r.right - r.left; p.h = r.bottom - r.top;
+    snprintf(p.base, sizeof p.base, "%s", s_winpos_key);
+    pcx_winpos_format(&p, line, sizeof line);
+    if ((f = fopen("window_pos.txt", "w")) != NULL) { fputs(line, f); fclose(f); }
+}
 static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+    case WM_EXITSIZEMOVE:
+        nb_winpos_save(hwnd);
+        break;
+
     case WM_CLOSE:
+        nb_winpos_save(hwnd);
         { void (*h)(void*) = g_port_close_hook; if (h) h(hwnd); }
         s_state.window_closed = 1;
         DestroyWindow(hwnd);
@@ -525,6 +573,74 @@ static BOOL CALLBACK nb_mon_enum(HMONITOR m, HDC dc, LPRECT r, LPARAM lp)
     return FALSE;
 }
 
+/* RSX_CLAIM_FOREGROUND (default 1; 0 = old behaviour), mirrored from R1
+ * (scratch/alt_tab_stutter.md): the game is started Launcher -> run.bat (hidden
+ * cmd) -> game and the launcher closes at once, so by the time this window
+ * exists the foreground has gone to whatever was behind the launcher and
+ * Windows refuses the activation. The game then runs visible but in the
+ * background (no foreground boost; Windows 11 / hybrid CPUs may treat it as
+ * background work) until the player alt-tabs. Take the foreground once, at
+ * creation, only when nothing the player chose since the start is in front: no
+ * keyboard/mouse input since this process started (required for a console,
+ * Windows Terminal or the taskbar too), or the window in front is the desktop or
+ * the launcher. Never from a hung window; every check runs before any
+ * SetForegroundWindow call. */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+static int nb_claim_foreground_on(void)
+{
+    const char* e = getenv("RSX_CLAIM_FOREGROUND");
+    return !(e && *e == '0');
+}
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+static void nb_claim_foreground(HWND hw)
+{
+    /* only the desktop and the launcher skip the no-input test; a console, Windows
+     * Terminal or the taskbar the player may be using must pass it (as in R1) */
+    static const char chain[] = "|Progman|WorkerW|PortLauncher2|";
+    char cls[64] = "", key[72];
+    DWORD fpid = 0, me = GetCurrentThreadId();
+    HWND fg = GetForegroundWindow();
+    DWORD ftid = fg ? GetWindowThreadProcessId(fg, &fpid) : 0;
+    int ok = !fg;
+    BOOL att = FALSE;
+    if (!hw || !nb_claim_foreground_on()) return;
+    if (fg && fpid == GetCurrentProcessId()) return;
+    if (fg) GetClassNameA(fg, cls, sizeof cls);
+    if (!ok) { snprintf(key, sizeof key, "|%s|", cls); ok = cls[0] && strstr(chain, key) != NULL; }
+    if (!ok) {   /* no keyboard/mouse input since the process started */
+        FILETIME c, x, k, u, n;
+        LASTINPUTINFO li; li.cbSize = sizeof li;
+        GetSystemTimeAsFileTime(&n);
+        if (GetProcessTimes(GetCurrentProcess(), &c, &x, &k, &u) && GetLastInputInfo(&li)) {
+            const ULONGLONG c64 = ((ULONGLONG)c.dwHighDateTime << 32) | c.dwLowDateTime;
+            const ULONGLONG n64 = ((ULONGLONG)n.dwHighDateTime << 32) | n.dwLowDateTime;
+            const ULONGLONG up_ms = n64 > c64 ? (n64 - c64) / 10000 : 0;
+            const DWORD idle_ms = GetTickCount() - li.dwTime;
+            ok = idle_ms >= up_ms;
+        }
+    }
+    if (!ok || (fg && IsHungAppWindow(fg))) {
+        printf("[focus] started in the background (\"%s\" is in front, %s) -- "
+               "not taking the foreground; click the game or alt-tab\n", cls,
+               ok ? "not responding" : "used since the start");
+        return;
+    }
+    if (SetForegroundWindow(hw) && GetForegroundWindow() == hw) {
+        printf("[focus] window took the foreground at start-up\n");
+        return;
+    }
+    att = ftid && ftid != me && AttachThreadInput(ftid, me, TRUE);
+    BringWindowToTop(hw);
+    SetForegroundWindow(hw);
+    if (att) AttachThreadInput(ftid, me, FALSE);
+    printf("[focus] start-up foreground (from \"%s\"): %s\n", fg ? cls : "none",
+           GetForegroundWindow() == hw ? "taken" : "refused by Windows -- click the game or alt-tab");
+}
 int rsx_null_backend_init(u32 width, u32 height, const char* title)
 {
     memset(&s_state, 0, sizeof(s_state));
@@ -572,7 +688,20 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     int ww = wr.right - wr.left, wh = wr.bottom - wr.top;
     if (ww > work.right - work.left) ww = work.right - work.left;
     if (wh > work.bottom - work.top) wh = work.bottom - work.top;
-    const int wx = work.left + (work.right - work.left - ww) / 2, wy = work.top + (work.bottom - work.top - wh) / 2;
+    int wx = work.left + (work.right - work.left - ww) / 2, wy = work.top + (work.bottom - work.top - wh) / 2;
+    { const char* e = getenv("RSX_WINDOW_REMEMBER"); const char* mo = getenv("RSX_MONITOR"); const char* sz = getenv("RSX_WINDOW");
+      RECT saved;
+      s_winpos_on = !(e && *e == '0');
+      snprintf(s_winpos_key, sizeof s_winpos_key, "%s@%s", sz && *sz ? sz : "-", mo && *mo ? mo : "0");
+      if (!start_full && nb_winpos_load(&saved)) {
+          /* keep the whole window on the monitor it lands on (resolution, scaling or taskbar may have changed) */
+          PcxWinPos fp = { saved.left, saved.top, saved.right - saved.left, saved.bottom - saved.top, "" };
+          MONITORINFO mi; mi.cbSize = sizeof mi;
+          if (GetMonitorInfoA(MonitorFromRect(&saved, MONITOR_DEFAULTTONEAREST), &mi)) {
+              const int wk[4] = { mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom };
+              pcx_winpos_fit(&fp, wk);
+          }
+          wx = fp.x; wy = fp.y; ww = fp.w; wh = fp.h; } }
 
     s_state.hwnd = CreateWindowExA(
         0, "ps3recomp_null",
@@ -594,6 +723,7 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
       rid.hwndTarget = s_state.hwnd;
       if (!RegisterRawInputDevices(&rid, 1, sizeof rid))
           printf("[RSX null] raw mouse input unavailable (%lu)\n", GetLastError()); }
+    nb_claim_foreground(s_state.hwnd);
 
     s_state.hdc = GetDC(s_state.hwnd);
     s_state.last_fps_time = GetTickCount64();

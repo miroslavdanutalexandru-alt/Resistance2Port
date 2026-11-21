@@ -1,0 +1,17 @@
+# Online (experimental) - read when PORT_ONLINE=1 (launcher: Controls -> "Online (experimental)").
+# Copy this file to online.ini (same folder) and fill in YOUR OWN account.
+# online.ini holds your password: it is ignored by git; never share it.
+# The port never creates accounts: make one with RPCS3 (Configuration -> RPCN) first.
+
+# RPCN server (host or host:port, default port 31313)
+rpcn_host = np.rpcs3.net
+rpcn_user =
+rpcn_password =
+# Only if the server asked for an email token when the account was made
+rpcn_token =
+
+# DNS server for the game's own server lookups (community servers), e.g. a revival's DNS
+# dns = 0.0.0.0
+
+# Fixed answers for single host names (checked before dns=)
+# host.example.server.name = 192.0.2.1

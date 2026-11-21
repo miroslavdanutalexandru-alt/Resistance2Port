@@ -19,6 +19,7 @@
 /logs/
 /rsxcap/
 /Launcher.exe
+/HDUIPack.exe
 /settings.bat
 /settings.ini
 *.obj
@@ -69,8 +70,35 @@ logs_build_*.txt
 
 # Setup.exe is attached to the GitHub release, not committed
 /Setup.exe
+# build tools Setup put into this folder (portable mode) and the list of what it installed
+/tools_cache/
 /scratch/RSXFIFOCommands*.pdf
 
 # local save backups (launcher) and the NVIDIA Streamline SDK that Setup downloads after licence acceptance
 /save_backups/
 /tools/streamline/
+
+# online credentials (online.ini.example is the template)
+/online.ini
+# HD UI pack (tools\hd_ui_pack.py): texture dumps and the upscaler/models downloaded on the user's PC
+/texdump/
+/tools/upscaler/
+# PGO: pgo\<rN>.profdata is committed (build.bat uses it); training output and build stamps stay local
+/pgo/raw*/
+/pgo/run_*/
+*.profraw
+/pgo/*.sha256
+
+# per-save backups the game writes (savedata_backup.h), QA/replay output and crash-report scratch
+/saves_backup/
+/tools/qa/runs/
+/tools/replay/
+/crash_report_work/
+# developer-only scripts (not shipped)
+/try_r2.bat
+/try_pop.bat
+/renderdoc.bat
+/capture_physics.bat
+/build_pgo.bat
+/safe_mode.bat
+/safe_half_*.bat

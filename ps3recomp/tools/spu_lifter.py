@@ -1523,6 +1523,7 @@ def main() -> None:
         with open(args.report, "w", encoding="utf-8") as report:
             json.dump({"functions": [[f.start_addr, f.end_addr] for f in lifter.functions],
                        "unsupported": lifter.unsupported,
+                       "invalid_words": lifter.invalid_words,
                        "call_targets": sorted(lifter.call_targets),
                        "branch_targets": sorted(lifter.branch_targets)}, report, indent=2)
 

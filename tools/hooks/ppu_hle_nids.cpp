@@ -356,6 +356,7 @@ extern "C" {
     void cellHttpSetRequestContentLength(void);
     void cellHttpAddRequestHeader(void);
     void cellHttpAbortTransaction(void);
+    void cellHttpClientPollConnections(void);
     void cellHttpUtilParseUri(void);
     void cellHttpUtilBuildUri(void);
     void cellHttpUtilEscapeUri(void);
@@ -1565,6 +1566,7 @@ extern "C" void ppu_hle_register_all(void) {
     ps3_hle_register(0xF5CD624Au, "cellHttpSetRequestContentLength", (void*)cellHttpSetRequestContentLength);
     ps3_hle_register(0x5C0816F6u, "cellHttpAddRequestHeader", (void*)cellHttpAddRequestHeader);
     ps3_hle_register(0xD505EB0Au, "cellHttpAbortTransaction", (void*)cellHttpAbortTransaction);
+    ps3_hle_register(0xADC0A4B2u, "cellHttpClientPollConnections", (void*)cellHttpClientPollConnections);
     ps3_hle_register(0x32FAAF58u, "cellHttpUtilParseUri", (void*)cellHttpUtilParseUri);
     ps3_hle_register(0x6F0F7667u, "cellHttpUtilBuildUri", (void*)cellHttpUtilBuildUri);
     ps3_hle_register(0x9003B1F2u, "cellHttpUtilEscapeUri", (void*)cellHttpUtilEscapeUri);

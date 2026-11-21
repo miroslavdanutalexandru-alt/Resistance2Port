@@ -117,7 +117,7 @@
     {
       "id": "fps",
       "label": "Frame rate",
-      "help": "The PS3 game runs at 30. 60 doubles how often it updates and draws without playing faster; it needs about twice the CPU and GPU time.",
+      "help": "The PS3 game runs at 30. 60 doubles how often it updates and draws without playing faster; it needs about twice the CPU and GPU time. Above about 75 the left stick can stop moving the player until you jump, so 60 is recommended.",
       "choices": [
         {
           "label": "30 (PS3 original)",
@@ -385,7 +385,7 @@
     {
       "id": "renderer",
       "label": "Renderer",
-      "help": "Compatible (RPCS3) is the most tested. Native Vulkan is faster on weaker PCs but experimental.",
+      "help": "Use Compatible (RPCS3). Direct3D 12 is NOT WORKING YET: an early work-in-progress renderer with many graphics bugs and much lower performance, for testing only (no upscaling or frame generation); without Direct3D 12 the game uses Compatible.",
       "choices": [
         {
           "label": "Compatible",
@@ -394,9 +394,9 @@
           }
         },
         {
-          "label": "Native Vulkan (experimental)",
+          "label": "Direct3D 12 (not working yet - testing only)",
           "set": {
-            "renderer": "vulkan"
+            "renderer": "d3d12"
           }
         }
       ],

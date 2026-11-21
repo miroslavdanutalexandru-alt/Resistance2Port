@@ -12,22 +12,34 @@
  *   low  GCM_VBLANK_SPIN_US=0 R2_PACE_SPIN_US=100 RSX_SPIN_US=50
  *        RSX_PERF_VK_SUBMIT_THREAD=0 RSX_VK_PIPELINE_THREADS=1 (2 with >= 8
  *        logical CPUs) PS3_PRIO_BOOST=0
+ *        (SPURS_AUDIO_BOOST_FORCE is now 1 by default on every CPU: audio
+ *        threads only keep a priority boost: the synth lane, the guest audio
+ *        PPU threads incl. syn_tick, raw SPU 0 while PORT_NOSPIN parks it;
+ *        the mix thread is boosted anyway. Opt out: SPURS_AUDIO_BOOST_FORCE=0,
+ *        or PORT_PLACE_AUDIO=0, which sets it to 0 with any profile but off)
  *   mid  GCM_VBLANK_SPIN_US=100 R2_PACE_SPIN_US=250
+ *   low, or <= 8 logical CPUs: R2_PRELOAD_THREADS=1 (background shader
+ *        preload / Fossilize replay threads in play; logical/4 otherwise)
  *   high nothing (the shipped defaults).
  *   off: no switches and no placement -- exactly the old behaviour.
+ *   The low-core no-spin waits are a separate switch, PORT_NOSPIN
+ *   (sys_ppu_thread.c ps3_host_nospin; scratch\cpu_nospin.md).
  *
- * Placement (PORT_THREAD_PLACEMENT=0 disables; off with PORT_CPU_PROFILE=off):
+ * Placement (PORT_THREAD_PLACEMENT=off disables; off with PORT_CPU_PROFILE=off):
  *   hybrid CPUs with >= 4 P-cores: process default CPU sets = the P-cores, so
  *   the PPU, SPU, FIFO walker and RSX engine threads stay off the E-cores;
  *   background threads (monitors, pipeline compilers) get all CPUs back and a
- *   lower priority. With SMT, the main PPU thread, the RSX engine thread and
- *   the FIFO walker get ideal processors on different physical cores (a soft
- *   hint; the scheduler still moves them), unless main_core_keeper pins them
- *   (>= 12 logical CPUs or PORT_MAIN_CPU). */
+ *   lower priority. The main PPU thread, the RSX engine thread (rsx::thread in
+ *   RPCS3 RSX mode), the SPURS audio synth lane and the FIFO walker get ideal
+ *   processors on different physical cores -- P-cores of the largest L3
+ *   domain (Ryzen CCX/CCD), core 0 last -- a soft hint; the scheduler still
+ *   moves them, unless main_core_keeper pins them (>= 12 logical CPUs or
+ *   PORT_MAIN_CPU). PORT_PLACE_AUDIO=0: no synth-lane slot (the old layout). */
 #ifdef _WIN32
 #include <intrin.h>
 #include <tlhelp32.h>
 #include <wchar.h>
+#include "port_cpu_sets.h"
 
 enum { PORT_CPU_OFF = 0, PORT_CPU_LOW, PORT_CPU_MID, PORT_CPU_HIGH };
 static int s_cpu_profile = PORT_CPU_OFF;
@@ -42,6 +54,9 @@ static struct {
     BYTE core_eff[64];
     DWORD_PTR pmask;                /* logical CPUs of available P-cores (all when not hybrid) */
     DWORD_PTR affinity;
+    int nl3;                        /* L3 caches (Ryzen CCX/CCD) seen inside the affinity mask */
+    DWORD_PTR l3_mask[16];
+    BYTE core_l3[64];               /* L3 index of each core_mask[] entry (0 when unknown) */
 } s_cpu;
 
 static int port_popcount(DWORD_PTR m) { int n = 0; for (; m; m &= m - 1) n++; return n; }
@@ -95,6 +110,24 @@ static void port_cpu_detect(void)
             if (port_popcount(cores[i].m) > 1) s_cpu.smt = 1;
         }
     if (!s_cpu.hybrid) s_cpu.ecores = 0;
+    /* L3 domains (Ryzen CCX / CCD; one on Intel and on single-CCX Ryzen):
+     * the hot-thread hints below keep main / RSX / synth inside one. */
+    len = 0;
+    GetLogicalProcessorInformationEx(RelationCache, NULL, &len);
+    buf = len ? (BYTE*)malloc(len) : NULL;
+    if (buf && GetLogicalProcessorInformationEx(RelationCache, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf, &len)) {
+        for (DWORD off = 0; off < len;) {
+            const PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX e = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buf + off);
+            if (e->Relationship == RelationCache && e->Cache.Level == 3 && e->Cache.GroupMask.Group == 0 &&
+                (e->Cache.GroupMask.Mask & pm) && s_cpu.nl3 < 16)
+                s_cpu.l3_mask[s_cpu.nl3++] = e->Cache.GroupMask.Mask & pm;
+            off += e->Size;
+        }
+    }
+    free(buf);
+    for (int i = 0; i < s_cpu.ncore; i++)
+        for (int j = 0; j < s_cpu.nl3; j++)
+            if (s_cpu.core_mask[i] & s_cpu.l3_mask[j]) { s_cpu.core_l3[i] = (BYTE)j; break; }
 }
 
 static void port_cpu_setdef(const char* name, const char* value, char* log, size_t cap)
@@ -106,37 +139,38 @@ static void port_cpu_setdef(const char* name, const char* value, char* log, size
     size_t n = strlen(log); snprintf(log + n, cap - n, " %s=%s", name, value);
 }
 
-/* PORT_THREAD_PLACEMENT=0 or PORT_CPU_PROFILE=off: no placement anywhere. */
+/* PORT_THREAD_PLACEMENT=off or PORT_CPU_PROFILE=off: no placement anywhere. */
 extern "C" int port_thread_placement_on(void) { return s_cpu_place; }
 
-/* CPU set IDs of the logical CPUs in mask (group 0, inside the process affinity). */
-static ULONG port_cpu_set_ids(DWORD_PTR mask, ULONG* ids, ULONG cap)
-{
-    typedef BOOL (WINAPI *gscsi_t)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
-    gscsi_t g = (gscsi_t)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetSystemCpuSetInformation");
-    ULONG need = 0, n = 0;
-    if (g) g(NULL, 0, &need, GetCurrentProcess(), 0);
-    BYTE* b = need ? (BYTE*)malloc(need) : NULL;
-    if (b && g((PSYSTEM_CPU_SET_INFORMATION)b, need, &need, GetCurrentProcess(), 0))
-        for (ULONG o = 0; o < need && n < cap;) {
-            const PSYSTEM_CPU_SET_INFORMATION c = (PSYSTEM_CPU_SET_INFORMATION)(b + o);
-            if (c->Type == CpuSetInformation && c->CpuSet.Group == 0 &&
-                (mask & s_cpu.affinity) >> c->CpuSet.LogicalProcessorIndex & 1) ids[n++] = c->CpuSet.Id;
-            o += c->Size;
-        }
-    free(b);
-    return n;
-}
-
-/* CPU pass, task "P-cores": on Intel hybrid CPUs the threads the frame rate
- * hangs on -- main PPU, rawSPU0 (SPU job kernel), rsx::thread, the FIFO
- * walker / RSX engine -- get thread CPU sets = the P-cores. The process
- * default sets do the same only with >= 4 P-cores, and threads that later get
- * a background placement or an explicit affinity are not covered by them.
- * PORT_PCORE_HOT=0 off; default on with hybrid CPUs only (no-op elsewhere). */
-static int s_pcore_hot = 0;
-static ULONG s_pset_ids[256], s_pset_n = 0;
+/* P-cores on hybrid CPUs (port_cpu_sets.h, the same rules in all three ports):
+ * the threads the frame rate hangs on -- main guest thread, raw SPUs, SPURS
+ * lanes, RSX FIFO / render / engine threads (rsx::thread, FIFO walker), audio
+ * mixer -- get thread CPU sets = the usable P-cores and EcoQoS off, as many
+ * of them as the usable P-cores allow (port_pcore_role_ok). The process
+ * default sets do the same only with >= 4 usable P-cores, and threads that
+ * later get a background placement or an explicit affinity are not covered by
+ * them. While main_core_keeper (debugtools.inc) hard-pins, the hot threads are
+ * planned against its rest mask, the threads it pins get no CPU sets, and the
+ * default sets are dropped when fewer than 4 usable P-cores are left in it.
+ * PORT_CPU_PCORES=off (older name PORT_PCORE_HOT) off; no-op on CPUs that are
+ * not hybrid. PORT_THREAD_PRIORITY=on: main / RSX threads above normal. */
+static port_pcore_plan s_pcore = { 0, 0, 0, 0, 0, 0, 0, { 0 }, "not started" };
+static port_pcore_plan s_pcore_rest;              /* the hot threads' plan while the keeper hard-pins */
+static const port_pcore_plan* volatile s_phot = &s_pcore;
+static int s_pcore_prio = 0;
+static int s_keeper_expected = 0, s_default_sets = 0;
 static DWORD s_place_main_tid = 0;
+extern "C" volatile long port_keeper_state;           /* debugtools.inc main_core_keeper */
+extern "C" volatile unsigned long long port_keeper_rest;
+extern "C" volatile unsigned long port_keeper_tid[4];
+static int port_keeper_pinned(DWORD tid)
+{
+    if (!tid || port_keeper_state != 1) return 0;
+    for (int i = 0; i < 4; i++) if (port_keeper_tid[i] == tid) return 1;
+    return 0;
+}
+/* [native] summary (main.cpp): NULL = P-core placement in effect, else why not */
+static const char* port_pcore_why(void) { return s_pcore.why_off; }
 extern "C" unsigned long long port_cpu_pmask(void) { return s_cpu.hybrid ? (unsigned long long)s_cpu.pmask : 0; }
 /* Lowest logical CPU of physical core #core (P-cores first, topology order,
  * inside the process affinity mask); -1 when there is no such core. */
@@ -145,13 +179,6 @@ extern "C" int port_cpu_core_first(int core)
     if (core < 0 || core >= s_cpu.ncore || !s_cpu.core_mask[core]) return -1;
     int c = 0; for (DWORD_PTR m = s_cpu.core_mask[core]; !(m & 1); m >>= 1) c++;
     return c;
-}
-static int port_place_pcore(HANDLE th)
-{
-    if (!s_pcore_hot || !s_pset_n) return 0;
-    typedef BOOL (WINAPI *stscs_t)(HANDLE, const ULONG*, ULONG);
-    static stscs_t stscs = (stscs_t)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetThreadSelectedCpuSets");
-    return stscs && stscs(th, s_pset_ids, s_pset_n);
 }
 
 /* Background threads: lower priority, and every CPU (E-cores included). */
@@ -183,19 +210,57 @@ extern "C" void port_place_background(HANDLE th)
     }
 }
 
-/* Main thread / FIFO walker / RSX engine: ideal processor on its own core. */
-enum { PORT_ROLE_MAIN = 0, PORT_ROLE_ENGINE = 1, PORT_ROLE_WALKER = 2 };
+/* Main thread / RSX engine / FIFO walker / audio synth lane: ideal processor
+ * on its own physical core (below 12 logical CPUs; above that
+ * main_core_keeper hard-pins). Hot cores: P-cores only, those of the L3
+ * domain (Ryzen CCX/CCD) with the most of them first, skipping core 0 (most
+ * interrupts land there) when there are >= 4. Distinct cores = no hot thread
+ * is hinted onto another hot thread's SMT sibling. */
+enum { PORT_ROLE_MAIN = 0, PORT_ROLE_ENGINE = 1, PORT_ROLE_WALKER = 2, PORT_ROLE_SYNTH = 3 };
 static int s_place_ideal = 0;
+static int s_place_audio = 0;   /* PORT_PLACE_AUDIO: synth lane gets its own hot core */
+static int s_hot_core[64], s_nhot = -1;
+static void port_hot_cores_init(void)
+{
+    if (s_nhot >= 0) return;
+    int best = 0, bestn = -1;
+    for (int j = 0; j < (s_cpu.nl3 ? s_cpu.nl3 : 1); j++) {
+        int n = 0;
+        for (int i = 0; i < s_cpu.ncore; i++)
+            if ((!s_cpu.hybrid || (s_cpu.core_mask[i] & s_cpu.pmask)) && s_cpu.core_l3[i] == j) n++;
+        if (n > bestn) { bestn = n; best = j; }
+    }
+    int n = 0;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < s_cpu.ncore; i++) {
+            if (s_cpu.hybrid && !(s_cpu.core_mask[i] & s_cpu.pmask)) continue;
+            if ((s_cpu.core_l3[i] == best) != (pass == 0)) continue;
+            s_hot_core[n++] = i;
+        }
+    /* core 0 (interrupts) last when there are >= 4: it is then out of reach */
+    if (n >= 4) {
+        int z = -1; for (int i = 0; i < n; i++) if (s_hot_core[i] == 0) z = i;
+        if (z >= 0) { for (int i = z; i < n - 1; i++) s_hot_core[i] = s_hot_core[i + 1]; s_hot_core[n - 1] = 0; }
+    }
+    s_nhot = n;
+}
 static void port_place_hot(HANDLE th, int role)
 {
     if (!s_cpu_place || !s_place_ideal || s_cpu.ncore < 2) return;
-    /* hot cores: P-cores, skipping core 0 (most interrupts land there) when there are >= 4 */
-    const int np = s_cpu.hybrid ? s_cpu.pcores : s_cpu.ncore;
-    const int first = np >= 4 ? 1 : 0, avail = np - first;
+    port_hot_cores_init();
+    const int np = s_nhot;
+    const int avail = np >= 4 ? np - 1 : np;   /* without core 0 */
     if (avail < 1) return;
-    /* two cores: the walker shares the engine's (they run in lockstep), never main's */
-    const int slot = (role == PORT_ROLE_WALKER && avail < 3) ? PORT_ROLE_ENGINE : role;
-    const DWORD_PTR m = s_cpu.core_mask[first + slot % avail];
+    /* slots: main 0, engine 1, synth 2 (with PORT_PLACE_AUDIO), walker next.
+     * The walker shares the engine's core when there is none left for it
+     * (they run in lockstep); the synth shares the engine's, never main's. */
+    const int nslot = s_place_audio ? 4 : 3;
+    int slot;
+    if (role == PORT_ROLE_MAIN) slot = 0;
+    else if (role == PORT_ROLE_ENGINE) slot = 1;
+    else if (role == PORT_ROLE_SYNTH) slot = avail >= 3 ? 2 : 1;
+    else slot = avail >= nslot ? nslot - 1 : 1;
+    const DWORD_PTR m = s_cpu.core_mask[s_hot_core[slot % avail]];
     PROCESSOR_NUMBER pn = { 0 };
     pn.Group = 0;
     for (BYTE i = 0; i < 64; i++) if (m >> i & 1) { pn.Number = i; break; }
@@ -204,7 +269,11 @@ static void port_place_hot(HANDLE th, int role)
 
 extern "C" unsigned long rsx_draw_engine_host_tid(void);
 extern "C" unsigned long spu_raw_host_tid(unsigned n);
+extern "C" unsigned long spurs_lane_host_tid(unsigned lane);
+extern "C" unsigned long rsx_render_host_tid(void);
 extern "C" unsigned long rsx_fifo_host_tid(void);
+extern "C" unsigned long spurs_synth_host_tid(void);   /* cellSpurs.c: lane running the synth list */
+extern "C" int ps3_host_nospin(void);                  /* sys_ppu_thread.c */
 static DWORD s_place_walker_tid = 0;
 
 /* Applies placement to threads that appear later: the RSX engine thread
@@ -218,26 +287,79 @@ static DWORD WINAPI port_place_keeper(LPVOID)
     typedef HRESULT (WINAPI *gtd_t)(HANDLE, PWSTR*);
     static gtd_t gtd = (gtd_t)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
     static DWORD seen[1024]; int nseen = 0;
-    DWORD eng_done = 0;
-    DWORD hot_done[4] = { 0, 0, 0, 0 };
+    DWORD eng_done = 0, syn_done = 0;
+    /* hot roles: last tid placed for each (threads restart, e.g. a raw SPU on a checkpoint reload) */
+    enum { R_RENDER, R_FIFO, R_ENGINE, R_RAW0, R_LANE0 = R_RAW0 + 4, R_N = R_LANE0 + 16 };
+    DWORD hot_done[R_N] = { 0 };
     const char* ke = getenv("PORT_KEEPER_MS");
     const DWORD idle_ms = ke && atoi(ke) >= 250 ? (DWORD)atoi(ke) : 5000;
-    int quiet = 0;
+    int quiet = 0, kwait = 0, replanned = 0;
+    DWORD kpin_done[4] = { 0 };
     const DWORD pid = GetCurrentProcessId();
     for (;;) {
         int fresh = 0;
+        /* main_core_keeper decides once, shortly after start-up: wait for it (<= 30 s) before placing hot threads */
+        const long kst = s_keeper_expected ? port_keeper_state : 2;
+        if (!kst && kwait < 30) { kwait++; Sleep(1000); continue; }
+        if (kst == 1 && !replanned) {
+            char kb[512];
+            replanned = 1;
+            port_pcore_query(&s_pcore_rest, port_keeper_rest);
+            if (s_pcore.why_off) s_pcore_rest.why_off = s_pcore.why_off;
+            s_phot = &s_pcore_rest;
+            fprintf(stderr, "[cpu] core keeper pins: hot threads by its rest mask 0x%llX: %s\n",
+                    (unsigned long long)port_keeper_rest, port_pcore_describe(&s_pcore_rest, kb, sizeof kb));
+            if (s_default_sets && (s_pcore_rest.why_off || s_pcore_rest.usable < 4)) {
+                typedef BOOL (WINAPI *spdcs_t)(HANDLE, const ULONG*, ULONG);
+                spdcs_t s = (spdcs_t)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetProcessDefaultCpuSets");
+                if (s && s(GetCurrentProcess(), NULL, 0)) {
+                    s_default_sets = 0;
+                    fprintf(stderr, "[cpu] game threads: P-core default dropped (%d usable P-cores beside the pinned ones)\n",
+                            s_pcore_rest.usable);
+                }
+            }
+            if (s_place_walker_tid)
+                port_pcore_place_role(&s_pcore_rest, s_place_walker_tid, "FIFO walker", PORT_PCORE_FIFO, 0, PORT_PCORE_PRIO);
+            fresh = 1;
+        }
+        const port_pcore_plan* hp = s_phot;
+        /* threads the keeper hard-pins (main, FIFO / rsx::thread, rawSPU0, synth lane): no CPU sets */
+        if (kst == 1) {
+            static const char* const kn[4] = { "main guest thread", "RSX FIFO thread", "raw SPU 0", "audio synth lane" };
+            for (int i = 0; i < 4; i++) {
+                const DWORD t = (DWORD)port_keeper_tid[i];
+                if (!t || t == kpin_done[i]) continue;
+                port_pcore_place_tid(&s_pcore, t, kn[i], PORT_PCORE_PINNED | (i < 2 ? PORT_PCORE_PRIO : 0));
+                kpin_done[i] = t; fresh = 1;
+            }
+        }
         const DWORD et = (DWORD)rsx_draw_engine_host_tid();
         if (et && et != eng_done && et != s_place_walker_tid) {
             HANDLE h = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, et);
             if (h) { port_place_hot(h, PORT_ROLE_ENGINE); CloseHandle(h); eng_done = et; fresh = 1; }
         }
-        if (s_pcore_hot) {
-            const DWORD hot[4] = { s_place_main_tid, (DWORD)spu_raw_host_tid(0), (DWORD)rsx_fifo_host_tid(), et };
-            for (int i = 0; i < 4; i++)
-                if (hot[i] && hot[i] != hot_done[i]) {
-                    HANDLE h = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION, FALSE, hot[i]);
-                    if (h) { port_place_pcore(h); hot_done[i] = hot[i]; CloseHandle(h); fresh = 1; }
-                }
+        /* the SPURS audio synth lane (r2_audio_lowcore.md): its own hot core.
+         * The lane serving the list can change; the new one is hinted. */
+        if (s_place_audio && s_place_ideal) {
+            const DWORD yt = (DWORD)spurs_synth_host_tid();
+            if (yt && yt != syn_done) {
+                HANDLE h = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, yt);
+                if (h) { port_place_hot(h, PORT_ROLE_SYNTH); CloseHandle(h); syn_done = yt; fresh = 1;
+                         fprintf(stderr, "[cpu] audio synth lane thread %lu: ideal CPU on its own core%c", (unsigned long)yt, 10); }
+            }
+        }
+        if (!hp->why_off || s_pcore_prio) {
+            for (int r = 0; r < R_N; r++) {
+                DWORD tid; char nm[48]; int role, idx = 0;
+                if (r == R_RENDER) { tid = (DWORD)rsx_render_host_tid(); snprintf(nm, sizeof nm, "RSX render thread"); role = PORT_PCORE_RENDER; }
+                else if (r == R_FIFO) { tid = (DWORD)rsx_fifo_host_tid(); snprintf(nm, sizeof nm, "RSX FIFO thread"); role = PORT_PCORE_FIFO; }
+                else if (r == R_ENGINE) { tid = et; snprintf(nm, sizeof nm, "RSX engine thread"); role = PORT_PCORE_RENDER; }
+                else if (r < R_LANE0) { idx = r - R_RAW0; tid = (DWORD)spu_raw_host_tid((unsigned)idx); snprintf(nm, sizeof nm, "raw SPU %d", idx); role = PORT_PCORE_RAW; }
+                else { idx = r - R_LANE0; tid = (DWORD)spurs_lane_host_tid((unsigned)idx); snprintf(nm, sizeof nm, "SPURS lane %d", idx); role = PORT_PCORE_LANE; }
+                if (!tid || tid == hot_done[r] || tid == s_place_main_tid || tid == s_place_walker_tid || port_keeper_pinned(tid)) continue;
+                port_pcore_place_role(hp, tid, nm, role, idx, r < R_RAW0 ? PORT_PCORE_PRIO : 0);
+                hot_done[r] = tid; fresh = 1;
+            }
         }
         HANDLE snap = gtd ? CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) : INVALID_HANDLE_VALUE;
         THREADENTRY32 te; te.dwSize = sizeof te;
@@ -254,8 +376,15 @@ static DWORD WINAPI port_place_keeper(LPVOID)
                     if (wcsstr(d, L"ompil") || wcsstr(d, L"shader") || wcsstr(d, L"monitor") ||
                         wcsstr(d, L"thrcpu") || wcsstr(d, L"affinity keeper") || wcsstr(d, L"watchdog"))
                         port_place_background(h);
-                    else if (!wcscmp(d, L"rsx::thread") || !wcscmp(d, L"FIFO walker"))
-                        port_place_pcore(h);
+                    else if (!wcscmp(d, L"rsx::thread") || (!wcscmp(d, L"FIFO walker") && te.th32ThreadID != s_place_walker_tid)) {
+                        if (!port_keeper_pinned(te.th32ThreadID))
+                            port_pcore_place_role(hp, te.th32ThreadID, !wcscmp(d, L"rsx::thread") ? "rsx::thread" : "FIFO walker",
+                                                  PORT_PCORE_FIFO, 0, PORT_PCORE_PRIO);
+                        /* RPCS3 RSX mode: rsx::thread is the RSX thread (no engine tid) */
+                        if (s_place_audio && !wcscmp(d, L"rsx::thread") && !et) port_place_hot(h, PORT_ROLE_ENGINE);
+                    }
+                    else if (!wcscmp(d, L"cellAudio mixer"))
+                        port_pcore_place_role(hp, te.th32ThreadID, "audio mixer", PORT_PCORE_AUDIO, 0, 0);
                     if (nseen < 1024) seen[nseen++] = te.th32ThreadID;
                     fresh = 1;
                 }
@@ -275,7 +404,7 @@ static void port_place_walker(void)
     s_place_walker_tid = GetCurrentThreadId();
     SetThreadDescription(GetCurrentThread(), L"FIFO walker");
     port_place_hot(GetCurrentThread(), PORT_ROLE_WALKER);
-    port_place_pcore(GetCurrentThread());
+    if (s_cpu_place) port_pcore_place_role(s_phot, GetCurrentThreadId(), "FIFO walker", PORT_PCORE_FIFO, 0, PORT_PCORE_PRIO);
 }
 
 #ifdef PORT_PGO_GEN
@@ -302,6 +431,8 @@ static void port_pgo_start(void)
     const char* e = getenv("PORT_PGO_DUMP_S");
     const int s = e && atoi(e) > 0 ? atoi(e) : 30;
     atexit(port_pgo_atexit);
+    /* sys_process_exit leaves with ExitProcess (no atexit) unless PS3_EXIT_CRT=1: keep the final profile dump */
+    if (!getenv("PS3_EXIT_CRT")) _putenv_s("PS3_EXIT_CRT", "1");
     HANDLE h = CreateThread(NULL, 0, port_pgo_dumper, (LPVOID)(uintptr_t)s, 0, NULL);
     if (h) CloseHandle(h);
     fprintf(stderr, "[pgo] instrumented build: profile -> %s every %d s and at exit\n", getenv("LLVM_PROFILE_FILE"), s);
@@ -340,7 +471,43 @@ static void port_cpu_profile_init(void)
             s_cpu.hybrid ? " hybrid" : "", s_cpu.phys, s_cpu.logical, (unsigned long long)s_cpu.affinity,
             s_cpu.smt ? " SMT" : " no SMT", s_cpu.hybrid ? s_cpu.pcores : s_cpu.phys, s_cpu.ecores,
             pn[prof], forced ? "PORT_CPU_PROFILE" : "auto");
-    if (prof == PORT_CPU_OFF) return;
+    {
+        /* Opt out of EcoQoS / power throttling. Windows 11 may otherwise run the
+         * game's threads at an efficient clock or on E-cores when the window loses
+         * focus or the scheduler thinks the process is background work, and may
+         * ignore its 1 ms timer resolution (the frame limiter and the GPU pacing
+         * depend on it). PORT_ECOQOS=1 keeps the Windows default for both.
+         * PORT_TIMER_NOTHROTTLE (default 1) keeps the timer-resolution opt-out even
+         * with PORT_ECOQOS=1; 0 = only what PORT_ECOQOS asks for. One call: a second
+         * SetProcessInformation(ProcessPowerThrottling) replaces the first. Both at
+         * their old values (PORT_ECOQOS=1, PORT_TIMER_NOTHROTTLE=0): no call. */
+        const char* eq = getenv("PORT_ECOQOS");
+        const char* tn = getenv("PORT_TIMER_NOTHROTTLE");
+        const int eco_out = !(eq && *eq && atoi(eq) != 0);
+        const int timer_out = !(tn && *tn) || atoi(tn) != 0;
+        ULONG ctl = 0;
+        if (eco_out) ctl |= PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+        if (timer_out) ctl |= PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+        if (ctl) {
+            PROCESS_POWER_THROTTLING_STATE pt;
+            memset(&pt, 0, sizeof pt);
+            pt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+            pt.ControlMask = ctl;
+            pt.StateMask = 0;
+            const BOOL ok = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof pt);
+            fprintf(stderr, "[cpu] EcoQoS / power throttling: %s%s (PORT_ECOQOS=1 keeps the Windows default, "
+                            "PORT_TIMER_NOTHROTTLE=0 the timer throttling)\n",
+                    ok ? "opted out" : "opt-out failed",
+                    eco_out ? "" : " (timer resolution only)");
+        }
+    }
+    port_pcore_query(&s_pcore, 0);
+    s_pcore_prio = port_thread_priority_env() && port_thread_placement_env();
+    if (prof == PORT_CPU_OFF) {
+        if (!s_pcore.why_off) s_pcore.why_off = "PORT_CPU_PROFILE=off";
+        s_pcore_prio = 0;
+        return;
+    }
 
     char log[1024] = { 0 };
     if (prof == PORT_CPU_LOW) {
@@ -354,54 +521,61 @@ static void port_cpu_profile_init(void)
         port_cpu_setdef("GCM_VBLANK_SPIN_US", "100", log, sizeof log);
         port_cpu_setdef("R2_PACE_SPIN_US", "250", log, sizeof log);
     }
+    /* The shader threads left running in play (background preload of the
+     * recorded pipelines, Fossilize replay; already below normal) default to
+     * logical/4 = 2 on a 4c/8t CPU. One is enough there: the pipeline
+     * compiler pool (RSX_VK_PIPELINE_THREADS) handles new shaders. */
+    if (prof == PORT_CPU_LOW || s_cpu.logical <= 8)
+        port_cpu_setdef("R2_PRELOAD_THREADS", "1", log, sizeof log);
+    /* PS3_PRIO_BOOST is off with the low profile and below 8 logical CPUs (a
+     * boosted spinner starved the normal threads there), which also dropped
+     * the synth lane's boost and left audio short of realtime on 4-core CPUs
+     * (r2_audio_lowcore.md). The audio threads alone keep it (ps3_host_audio_boost,
+     * sys_ppu_thread.c): the synth lane runs a bounded list per batch and its DMA
+     * poll naps after SPURS_AUDIO_SPIN_US; the guest audio PPU threads (prio < 100,
+     * syn_tick) sleep between polls; raw SPU 0 only ABOVE_NORMAL and only while
+     * PORT_NOSPIN parks its waits. */
+    /* SPURS_AUDIO_BOOST_FORCE defaults to 1 in the runtime (cellSpurs.c), so
+     * the profile no longer sets it; PORT_PLACE_AUDIO=0 (the old layout) also
+     * opts out of the boost, unless SPURS_AUDIO_BOOST_FORCE is set explicitly. */
+    {
+        const char* pa = getenv("PORT_PLACE_AUDIO");
+        if (pa && *pa && atoi(pa) == 0) port_cpu_setdef("SPURS_AUDIO_BOOST_FORCE", "0", log, sizeof log);
+    }
     if (log[0]) fprintf(stderr, "[cpu] profile %s sets:%s\n", pn[prof], log);
 
-    const char* pl = getenv("PORT_THREAD_PLACEMENT");
-    s_cpu_place = !(pl && *pl && atoi(pl) == 0);
-    if (!s_cpu_place) { fprintf(stderr, "[cpu] thread placement off (PORT_THREAD_PLACEMENT=0)\n"); return; }
+    s_cpu_place = port_thread_placement_env();
+    if (!s_cpu_place) { fprintf(stderr, "[cpu] thread placement off (PORT_THREAD_PLACEMENT=off)\n"); return; }
 
     char plog[512] = { 0 };
-    if (s_cpu.hybrid && s_cpu.pcores >= 4) {
-        typedef BOOL (WINAPI *gscsi_t)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
-        typedef BOOL (WINAPI *spdcs_t)(HANDLE, const ULONG*, ULONG);
-        HMODULE k32 = GetModuleHandleA("kernel32.dll");
-        gscsi_t g = (gscsi_t)GetProcAddress(k32, "GetSystemCpuSetInformation");
-        spdcs_t s = (spdcs_t)GetProcAddress(k32, "SetProcessDefaultCpuSets");
-        ULONG need = 0, ids[256], n = 0;
-        if (g && s) g(NULL, 0, &need, GetCurrentProcess(), 0);
-        BYTE* buf = need ? (BYTE*)malloc(need) : NULL;
-        if (buf && g((PSYSTEM_CPU_SET_INFORMATION)buf, need, &need, GetCurrentProcess(), 0))
-            for (ULONG o = 0; o < need && n < 256;) {
-                const PSYSTEM_CPU_SET_INFORMATION c = (PSYSTEM_CPU_SET_INFORMATION)(buf + o);
-                if (c->Type == CpuSetInformation && c->CpuSet.Group == 0 &&
-                    (s_cpu.pmask >> c->CpuSet.LogicalProcessorIndex & 1)) ids[n++] = c->CpuSet.Id;
-                o += c->Size;
-            }
-        free(buf);
-        if (n && s(GetCurrentProcess(), ids, n))
-            snprintf(plog + strlen(plog), sizeof plog - strlen(plog), " game threads on the %d P-cores (%lu CPU sets);",
-                     s_cpu.pcores, (unsigned long)n);
-    }
     /* main_core_keeper (debugtools.inc) hard-pins main and the FIFO thread
      * with >= 12 logical CPUs or PORT_MAIN_CPU; leave those to it. */
     s_place_main_tid = GetCurrentThreadId();
-    {
-        const char* ph = getenv("PORT_PCORE_HOT");
-        if (s_cpu.hybrid && s_cpu.pcores >= 1 && !(ph && *ph && atoi(ph) == 0)) {
-            s_pset_n = port_cpu_set_ids(s_cpu.pmask, s_pset_ids, 256);
-            s_pcore_hot = s_pset_n > 0;
-            if (s_pcore_hot && port_place_pcore(GetCurrentThread()))
-                snprintf(plog + strlen(plog), sizeof plog - strlen(plog),
-                         " main / rawSPU0 / rsx::thread / FIFO threads on the P-cores (thread CPU sets);");
+    fprintf(stderr, "[cpu] %s\n", port_pcore_describe(&s_pcore, plog, sizeof plog));
+    plog[0] = 0;
+    if (!s_pcore.why_off && s_pcore.usable >= 4) {
+        typedef BOOL (WINAPI *spdcs_t)(HANDLE, const ULONG*, ULONG);
+        spdcs_t s = (spdcs_t)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SetProcessDefaultCpuSets");
+        if (s && s(GetCurrentProcess(), (const ULONG*)s_pcore.ids, (ULONG)s_pcore.n)) {
+            s_default_sets = 1;
+            snprintf(plog + strlen(plog), sizeof plog - strlen(plog), " game threads on the %d usable P-cores (%lu CPU sets);",
+                     s_pcore.usable, (unsigned long)s_pcore.n);
         }
     }
+    port_pcore_place_role(&s_pcore, s_place_main_tid, "main guest thread", PORT_PCORE_MAIN, 0, PORT_PCORE_PRIO);
     const char* mc = getenv("PORT_MAIN_CORE");
     const int keeper_pins = !(mc && atoi(mc) == 0) && (getenv("PORT_MAIN_CPU") || s_cpu.logical >= 12);
+    s_keeper_expected = keeper_pins;
     s_place_ideal = !keeper_pins && s_cpu.ncore >= 2;
+    { const char* pa = getenv("PORT_PLACE_AUDIO");
+      s_place_audio = !(pa && *pa && atoi(pa) == 0); }
     if (s_place_ideal) {
         port_place_hot(GetCurrentThread(), PORT_ROLE_MAIN);
+        port_hot_cores_init();
         snprintf(plog + strlen(plog), sizeof plog - strlen(plog),
-                 " main / RSX engine / FIFO walker ideal CPUs on separate cores;");
+                 " main / RSX engine%s / FIFO walker ideal CPUs on separate cores (%d hot cores, %d L3 domain%s);",
+                 s_place_audio ? " / audio synth lane" : "", s_nhot >= 4 ? s_nhot - 1 : s_nhot,
+                 s_cpu.nl3 ? s_cpu.nl3 : 1, s_cpu.nl3 > 1 ? "s, the largest first" : "");
     }
     HANDLE kh = CreateThread(NULL, 0, port_place_keeper, NULL, 0, NULL);
     if (kh) CloseHandle(kh);
@@ -413,4 +587,5 @@ static void port_place_walker(void) {}
 extern "C" unsigned long long port_cpu_pmask(void) { return 0; }
 extern "C" int port_cpu_core_first(int core) { (void)core; return -1; }
 extern "C" int port_thread_placement_on(void) { return 0; }
+static const char* port_pcore_why(void) { return "not Windows"; }
 #endif

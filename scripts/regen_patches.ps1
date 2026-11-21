@@ -37,6 +37,61 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell started from a PowerShell 7 window (directly or through cmd / a .bat) inherits pwsh's module
+# paths and then cannot load its own modules: Get-FileHash and Get-AuthenticodeSignature are 'not recognized', and
+# Expand-Archive loads pwsh's copy and fails. Keep only Windows PowerShell's own paths. Get-PortFileHash and
+# Expand-PortZip fall back to .NET if the cmdlets still cannot run (same output: upper-case hex / the same files).
+# (Same block in setup.ps1, tools\update.ps1, tools\get_shaderscan.ps1, tools\installer\prereqs.ps1, scripts\*.ps1.)
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    $pmp = @(($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '\\PowerShell\\(7[^\\]*\\)?Modules\\?$' })
+    $pmpSys = Join-Path $PSHOME 'Modules'
+    if (-not @($pmp | Where-Object { $_.TrimEnd('\') -eq $pmpSys }).Count) { $pmp += $pmpSys }
+    $env:PSModulePath = $pmp -join ';'
+}
+$script:PortHashCmd = $null
+function Get-PortFileHash([string]$LiteralPath, [string]$Algorithm = 'SHA256') {
+    if ($script:PortHashCmd -ne $false) {
+        try {
+            $r = Get-FileHash -LiteralPath $LiteralPath -Algorithm $Algorithm
+            $script:PortHashCmd = $true
+            if ($null -eq $r) { return $null }
+            return "$($r.Hash)".ToUpperInvariant()
+        } catch [System.Management.Automation.CommandNotFoundException] { $script:PortHashCmd = $false }
+    }
+    $a = switch ($Algorithm.ToUpperInvariant()) {
+        'SHA1' { [Security.Cryptography.SHA1]::Create() }
+        'SHA384' { [Security.Cryptography.SHA384]::Create() }
+        'SHA512' { [Security.Cryptography.SHA512]::Create() }
+        'MD5' { [Security.Cryptography.MD5]::Create() }
+        default { [Security.Cryptography.SHA256]::Create() }
+    }
+    $s = [IO.File]::OpenRead($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LiteralPath))
+    try { return ([BitConverter]::ToString($a.ComputeHash($s)) -replace '-', '') } finally { $s.Dispose(); $a.Dispose() }
+}
+function Expand-PortZip([string]$LiteralPath, [string]$DestinationPath, [switch]$Force) {
+    try { Expand-Archive -LiteralPath $LiteralPath -DestinationPath $DestinationPath -Force:$Force -ErrorAction Stop; return }
+    catch {
+        $e = $_.Exception
+        while ($e -is [System.Management.Automation.ActionPreferenceStopException] -and $e.InnerException) { $e = $e.InnerException }
+        if (-not ($e -is [System.Management.Automation.CommandNotFoundException] -or $e -is [System.Management.Automation.MethodException])) { Write-Error -ErrorRecord $_; return }
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $src = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LiteralPath)
+    $dst = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DestinationPath))
+    [void][IO.Directory]::CreateDirectory($dst)
+    $root = $dst.TrimEnd('\') + '\'
+    $z = [IO.Compression.ZipFile]::OpenRead($src)
+    try {
+        foreach ($en in $z.Entries) {
+            $t = [IO.Path]::GetFullPath([IO.Path]::Combine($dst, $en.FullName))
+            if (-not $t.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw "Unsafe path in $src`: $($en.FullName)" }
+            if ($en.FullName.EndsWith('/') -or $en.FullName.EndsWith('\')) { [void][IO.Directory]::CreateDirectory($t); continue }
+            if (-not $Force -and [IO.File]::Exists($t)) { throw "$t already exists (Expand-Archive without -Force)" }
+            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($t))
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($en, $t, $true)
+        }
+    } finally { $z.Dispose() }
+}
 Set-StrictMode -Version 2.0
 $Repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $Tree = Join-Path $Repo 'ps3recomp\third_party\rpcs3'
@@ -61,10 +116,15 @@ function Git-Ok([string]$dir) {
 
 # ---------------------------------------------------------------- inputs
 $fetch = Get-Content -Raw -LiteralPath (Join-Path $Repo 'tools\fetch_rpcs3.ps1')
-if ($fetch -notmatch "\`$Commit\s*=\s*'([0-9a-f]{40})'") { throw "pinned commit not found in tools\fetch_rpcs3.ps1" }
+if ($fetch -notmatch "\`$(?:script:)?Commit\s*=\s*'([0-9a-f]{40})'") { throw "pinned commit not found in tools\fetch_rpcs3.ps1" }
 $Commit = $Matches[1]
-if ($fetch -notmatch "patches\\([\w\-]+\.patch)") { throw "patch name not found in tools\fetch_rpcs3.ps1" }
-$PatchName = $Matches[1]
+# fetch_rpcs3.ps1 applies the single ps3recomp\patches\*-rpcs3.patch (older versions named it explicitly).
+if ($fetch -match "patches\\([\w\-]+\.patch)") { $PatchName = $Matches[1] }
+else {
+    $found = @(Get-ChildItem -Path (Join-Path $Repo 'ps3recomp\patches') -Filter '*-rpcs3.patch' -File)
+    if ($found.Count -ne 1) { throw "expected exactly one ps3recomp\patches\*-rpcs3.patch, found $($found.Count)" }
+    $PatchName = $found[0].Name
+}
 $Patch = Join-Path $Repo "ps3recomp\patches\$PatchName"
 
 Write-Host "== $PatchName  (RPCS3 tree: $Tree)"
@@ -75,7 +135,7 @@ Write-Host "   tree HEAD = pinned commit $($Commit.Substring(0,10))"
 
 # ---------------------------------------------------------------- new files
 $untracked = @(Git-In $Tree ls-files --others --exclude-standard -- . ':(exclude)3rdparty') | Where-Object { $_ }
-$junk = @($untracked | Where-Object { $_ -match '\.(orig|rej|bak|tmp|swp)$|~$|(^|/)(build|out|\.vs)/' })
+$junk = @($untracked | Where-Object { $_ -match '\.(orig|rej|bak\w*|tmp|swp)$|~$|(^|/)(build|out|\.vs)/' })
 if ($junk.Count -and -not $AllowJunk) {
     $junk | ForEach-Object { Write-Host "   junk: $_" -ForegroundColor Red }
     throw "untracked junk files in the RPCS3 tree would end up in the patch; delete them or use -AllowJunk"
@@ -165,7 +225,7 @@ if ($problems.Count) {
 # ---------------------------------------------------------------- compare / replace
 $oldBytes = if (Test-Path -LiteralPath $Patch) { [System.IO.File]::ReadAllBytes($Patch) } else { [byte[]]@() }
 $same = ($oldBytes.Length -eq $bytes.Length) -and ([Convert]::ToBase64String($oldBytes) -eq [Convert]::ToBase64String($bytes))
-$hash = (Get-FileHash -LiteralPath $NewPatch -Algorithm SHA256).Hash
+$hash = (Get-PortFileHash $NewPatch SHA256)
 if ($same) {
     Write-Host "   unchanged: $PatchName already matches the tree ($hash)" -ForegroundColor Green
     Remove-Item -LiteralPath $NewPatch

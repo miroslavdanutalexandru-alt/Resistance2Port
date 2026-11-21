@@ -282,13 +282,17 @@ def spu(port, tk, eboot, work, stage_raw=None):
         if stage_raw is not None: shutil.copytree(x, os.path.join(stage_raw, n))
         hp = os.path.join(hk, 'r2_' + n + '.json')
         f = os.path.join(x, 'spu_recomp.c')
-        if os.path.exists(hp): spu_post(f, hp)
-        else:
-            run([sys.executable, os.path.join(HERE, 'spu_regcache.py'), f, f]); run([sys.executable, os.path.join(HERE, 'spu_directhop.py'), f])
-            if n.startswith(('jobmod_', 'wwsplug_', 'wwspic_')):
-                run([sys.executable, os.path.join(HERE, 'spu_writeback.py'), f, f])
-                run([sys.executable, os.path.join(HERE, 'spu_group_entry.py'), f, f])
-                run([sys.executable, os.path.join(HERE, 'spu_loop_ib.py'), f, f])   # v193: same-function bi loops
+        jobpass = n.startswith(('jobmod_', 'wwsplug_', 'wwspic_'))
+        if os.path.exists(hp): run([sys.executable, os.path.join(HERE, 'spu_hooks.py'), 'apply', 'pre', f, hp])
+        run([sys.executable, os.path.join(HERE, 'spu_regcache.py'), f, f]); run([sys.executable, os.path.join(HERE, 'spu_directhop.py'), f])
+        if jobpass:
+            run([sys.executable, os.path.join(HERE, 'spu_writeback.py'), f, f])
+            run([sys.executable, os.path.join(HERE, 'spu_group_entry.py'), f, f])
+            run([sys.executable, os.path.join(HERE, 'spu_loop_ib.py'), f, f])   # v193: same-function bi loops
+        # hand edits last (R2_NATIVE_JOBS hooks etc.); the job-module passes above run for hooked modules
+        # too (spu_post skipped them, so a regen dropped group entry / writeback from dd413, 7db0, 4154 ...)
+        if os.path.exists(hp): run([sys.executable, os.path.join(HERE, 'spu_hooks.py'), 'apply', 'post', f, hp])
+        run([sys.executable, os.path.join(HERE, 'spu_w0.py'), f])
         dst = os.path.join(spudir, n)
         if os.path.isdir(dst): shutil.rmtree(dst)
         shutil.copytree(x, dst)

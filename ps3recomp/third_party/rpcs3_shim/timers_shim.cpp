@@ -33,12 +33,20 @@ namespace
 		return s_info;
 	}
 
+	// R2PORT: QPC runs at 10 MHz: the two common outputs (1 MHz, 80 MHz) are an exact divide / multiply.
+	// Same value as the general formula below, minus two 64-bit divisions per call.
 	u64 qpc_scaled(u64 out_freq)
 	{
 		LARGE_INTEGER c;
 		QueryPerformanceCounter(&c);
-		const u64 t = c.QuadPart - qpc().start;
-		const u64 f = qpc().freq;
+		const qpc_info& q = qpc();
+		const u64 t = c.QuadPart - q.start;
+		const u64 f = q.freq;
+		if (f == 10'000'000ull)
+		{
+			if (out_freq == 1'000'000ull) return t / 10;
+			if (out_freq == 80'000'000ull) return t * 8;
+		}
 		return t / f * out_freq + (t % f) * out_freq / f;
 	}
 }

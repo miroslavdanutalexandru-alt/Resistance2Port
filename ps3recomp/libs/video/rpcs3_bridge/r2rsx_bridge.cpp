@@ -12,6 +12,7 @@
 #include "Emu/RSX/Core/RSXContext.h"
 #include "Emu/RSX/Core/RSXRendererFactory.h"
 #include "Emu/RSX/port_prof.h"
+#include "Emu/RSX/port_texdiag.h" // R2PORT: [texcache]
 #include "../../../include/ps3emu/port_hitch.h"
 #include "util/logs.hpp"
 #include "util/fixed_typemap.hpp"
@@ -21,8 +22,10 @@
 #include <windows.h>
 // ---- R2PORT autoconfig (launcher/autoconfig owner): shared R2_PRESET mapping, used only in apply_launcher_overrides ----
 #include "../../../../project/r2_autoconfig.h"
+#include "../../../../project/port_native_summary.h"
 // ---- end R2PORT autoconfig ----
 #include <tlhelp32.h> // R2PORT perf: R2_RSX_PROF thread times
+#include "r2rsx_host_sampler.h" // R3PORT perf r8: RSX_HOST_SAMPLE=1 rsx::thread host sampler
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -40,6 +43,7 @@
 
 extern "C" uint8_t* vm_base;
 extern "C" uint8_t* vm_sudo_base;
+extern "C" void cpu_replay_rsx_replay(uint32_t dma_control_ea); // cpu-replay: rpcs3_shim/cpu_replay_rsx.cpp
 extern "C" int (*g_vm_access_violation_hook)(uint32_t guest_addr, int is_write);
 // project/stubs.cpp: R2_FPS target (0 = uncapped) and the display refresh, as main.cpp uses them
 extern "C" double r2_fps_target(void);
@@ -54,7 +58,12 @@ namespace r2port
 {
 	extern std::string g_rsx_cache_dir;
 	extern int g_pipe_compiler_threads; // VK/VKPipelineCompiler.cpp
+	extern int g_shader_preload;        // VK/VKPipelineCompiler.cpp: PORT_SHADER_PRELOAD
+	extern int g_gpu_texdecode; // VK/VKTexture.cpp (RSX_GPU_TEXDECODE)
 }
+namespace rsx::FIFO { bool inline_active(); } // RSXFIFO.cpp (RSX_FIFO_INLINE)
+namespace rsx { bool r2_zcull_idle_flush_enabled(); u64 r2_zcull_crit_flush_us(); } // RSXThread.cpp (RSX_ZCULL_IDLE_FLUSH, RSX_ZCULL_CRIT_FLUSH_US)
+namespace vk { bool r2_sampler_cache_active(); bool r2_vtx_reuse_active(); bool r2_ibind_skip_active(); bool r2_vprun_fast_active(); } // VKDraw.cpp / VKVertexBuffers.cpp (RSX_SAMPLER_CACHE, RSX_VTX_REUSE, RSX_IBIND_SKIP, RSX_VPRUN_FAST)
 
 namespace rsx
 {
@@ -161,7 +170,11 @@ namespace
 		{
 			const double s = std::atof(e);
 			if (s >= 0.25 && s <= 8.0) g_cfg.video.resolution_scale_percent.set(static_cast<u32>(s * 100.0 + 0.5));
+			else std::printf("[r2rsx] RSX_RES_SCALE=%s is outside 0.25..8 -- ignored\n", e);
 		}
+		else // diagnostics (scratch/res_cap_720.md): the launcher always writes it, so the game was started another way
+			std::printf("[r2rsx] RSX_RES_SCALE not set (game not started via Launcher/run.bat?) -- rpcs3_config.yml scale %u%%\n",
+				g_cfg.video.resolution_scale_percent.get());
 		if (const char* e = env("RSX_FILTER"))
 		{
 			if (!_stricmp(e, "point") || !_stricmp(e, "nearest")) g_cfg.video.output_scaling.set(output_scaling_mode::nearest);
@@ -203,10 +216,13 @@ namespace
 		// RSX_DISPLAY=exclusive: the fullscreen window (rsx_null_backend.c) may take Vulkan exclusive fullscreen.
 		if (const char* e = env("RSX_DISPLAY"))
 			g_cfg.video.vk.exclusive_fullscreen_mode.set(!_stricmp(e, "exclusive") ? vk_exclusive_fs_mode::enable : vk_exclusive_fs_mode::disable);
-		std::printf("[r2rsx] video: scale %u%%, output scaling %d, sharpen %u, aniso %u, vsync %d, exclusive fs %d\n",
+		std::printf("[r2rsx] video: scale %u%%, output scaling %d, sharpen %u, aniso %u, vsync %d, exclusive fs %d, "
+			"display %s, window %s, upscaler RSX_FSR=%s x%s\n",
 			g_cfg.video.resolution_scale_percent.get(), static_cast<int>(g_cfg.video.output_scaling.get()),
 			g_cfg.video.rcas_sharpening_intensity.get(), g_cfg.video.anisotropic_level_override.get(),
-			static_cast<int>(g_cfg.video.vsync.get()), static_cast<int>(g_cfg.video.vk.exclusive_fullscreen_mode.get()));
+			static_cast<int>(g_cfg.video.vsync.get()), static_cast<int>(g_cfg.video.vk.exclusive_fullscreen_mode.get()),
+			env("RSX_DISPLAY") ? env("RSX_DISPLAY") : "(unset: windowed)", env("RSX_WINDOW") ? env("RSX_WINDOW") : "(unset)",
+			env("RSX_FSR") ? env("RSX_FSR") : "0", env("RSX_UPSCALE") ? env("RSX_UPSCALE") : "-");
 	}
 
 	// Shader compilation and logging defaults (env overrides, applied over rpcs3_config.yml).
@@ -214,6 +230,8 @@ namespace
 	//                 | interp (async recompiler + shader interpreter until ready; untested) | sync | interpreter
 	//  R2_SHADER_INTERP=1 (default 0): safety net for shaders not in the cache, same as R2_SHADER_MODE=interp
 	//                 (g_cfg.video.shadermode = "Async with Shader Interpreter"); R2_SHADER_MODE wins when set.
+	//                 On AMD GPUs both interpreter modes are replaced by the recompiler in VKGSRender (RPCS3 #20025;
+	//                 R2_AMD_SHADER_INTERP=1 keeps them).
 	//  R2_SHADER_CACHE=0 disables the on-disk shader cache (shadercache\rpcs3\shaders_cache).
 	void apply_shader_defaults()
 	{
@@ -233,8 +251,15 @@ namespace
 		const char* c = std::getenv("R2_SHADER_CACHE");
 		g_cfg.video.disable_on_disk_shader_cache.set(c && *c == '0');
 		g_cfg.video.log_programs.set(false);
-		std::printf("[r2rsx] shaders: mode %d, disk cache %s\n", static_cast<int>(mode),
-			g_cfg.video.disable_on_disk_shader_cache.get() ? "off" : "on");
+		static const char* const k_mode_name[] = { "sync (recompiler)", "async", "async+interpreter", "interpreter" };
+		const int mi = static_cast<int>(mode);
+		// PORT_SHADER_PRELOAD (default on; launcher "Compile shaders before playing", the same switch in all three ports):
+		// on = every cached pipeline is built before the first frame, off = none at start-up or in the background, on demand only (issue #10)
+		// (VKGSRender.cpp preload_shaders; R2_PRELOAD_BOOT still overrides).
+		r2port::g_shader_preload = port_native_parse_bool(std::getenv("PORT_SHADER_PRELOAD"), 1);
+		std::printf("[r2rsx] shaders: mode %d = %s (R2_SHADER_MODE=%s), disk cache %s, preload %s (PORT_SHADER_PRELOAD)\n", mi,
+			mi >= 0 && mi < 4 ? k_mode_name[mi] : "?", m && *m ? m : "(unset)",
+			g_cfg.video.disable_on_disk_shader_cache.get() ? "off" : "on", r2port::g_shader_preload ? "on" : "off");
 	}
 
 	// ---- R2PORT perf (RPCS3 path speed / pacing / quality switches) ----
@@ -243,11 +268,7 @@ namespace
 	// 1/0 for "1/on/true/yes" and "0/off/false/no"; -1 when unset or unrecognised.
 	int penv_bool(const char* n)
 	{
-		const char* e = penv(n);
-		if (!e) return -1;
-		if (!_stricmp(e, "1") || !_stricmp(e, "on") || !_stricmp(e, "true") || !_stricmp(e, "yes")) return 1;
-		if (!_stricmp(e, "0") || !_stricmp(e, "off") || !_stricmp(e, "false") || !_stricmp(e, "no")) return 0;
-		return -1;
+		return port_native_parse_bool(penv(n), -1);   // the shared switch rules (port_native_summary.h)
 	}
 
 	// Host CPU as project/cpu_profile.inc classifies it: PORT_CPU_PROFILE, else cores available to the
@@ -393,7 +414,45 @@ namespace
 
 		// A/B switches that may change the image; defaults keep the yml.
 		if (const int b = penv_bool("R2_WCB"); b >= 0) g_cfg.video.write_color_buffers.set(b != 0);
-		if (const int b = penv_bool("R2_ZCULL_ACCURATE"); b >= 0) g_cfg.video.precise_zpass_count.set(b != 0);
+		// R2PORT: "Handle RSX Memory Tiling" on by default (RPCS3 #19676 / #19785; R3 ships it on). Without it the
+		// ported detilers (VKTextureCache shader_read detile, nv3089 R2_BLIT_DETILE_SRC, render-target tile/detile on
+		// flush/load) never run and tiled main-memory surfaces are read raw (striped / purple textures). Forced here
+		// too, since tools/update.ps1 keeps a user-edited rpcs3_config.yml that still has it off. R2_RSX_TILING=0: off.
+		{
+			int b = penv_bool("RSX_TILING");                 // shared name; R2_RSX_TILING = alias
+			if (b < 0) b = penv_bool("R2_RSX_TILING");
+			const bool yml = g_cfg.video.handle_tiled_memory.get();
+			g_cfg.video.handle_tiled_memory.set(b != 0);
+			std::printf("[r2rsx] tiling: Handle RSX Memory Tiling %s (%s; yml %s)\n", b != 0 ? "on" : "off",
+				b < 0 ? "default, RSX_TILING=0 turns it off" : "RSX_TILING", yml ? "on" : "off");
+		}
+		// RSX_NO_BLIT_UPSCALE=1: RPCS3's Debug option "Disable Blit Engine Upscaling" (yml default false). A blit target
+		// that is in no cache becomes a surface-cache render target since RPCS3 PR #19013; normally it is created at the
+		// resolution scale, with this at 100%. Workaround listed in RPCS3 issue #19391 (Insomniac blit regression).
+		if (const int b = penv_bool("RSX_NO_BLIT_UPSCALE"); b >= 0) g_cfg.video.disable_blit_engine_upscaling.set(b != 0);
+		// PORT: RSX_ZCULL_COUNT=approx|precise (same switch as Resistance 3, where approx is the default). R2 keeps
+		// the config.yml value when unset (precise): its sun/bloom occlusion fades with the exact count.
+		// approx = RPCS3 "ZCULL Accuracy: Approximate": any visible pixel reports 0xFFFF, so a proxy near a pixel
+		// threshold cannot drop out from DLSS jitter / reduced-scale count noise.
+		{
+			int approx = -1; // -1 = no RSX_ZCULL_COUNT
+			if (const char* e = penv("RSX_ZCULL_COUNT"))
+			{
+				char w[16];
+				if (port_native_word(e, w, sizeof w) && (!std::strcmp(w, "approx") || !std::strcmp(w, "approximate"))) approx = 1;
+				else if (port_native_word(e, w, sizeof w) && (!std::strcmp(w, "precise") || !std::strcmp(w, "exact"))) approx = 0;
+				else std::printf("[r2rsx] RSX_ZCULL_COUNT=\"%s\" not recognised (approx|precise); using the default\n", e);
+			}
+			const char* why = "RSX_ZCULL_COUNT";
+			if (approx < 0)
+			{
+				if (const int b = penv_bool("R2_ZCULL_ACCURATE"); b >= 0) { approx = b ? 0 : 1; why = "R2_ZCULL_ACCURATE"; }
+				else { approx = g_cfg.video.precise_zpass_count.get() ? 0 : 1; why = "config.yml"; }
+			}
+			g_cfg.video.precise_zpass_count.set(approx == 0);
+			std::printf("[r2rsx] ZCULL counts: %s (%s; RSX_ZCULL_COUNT=approx|precise)\n",
+				approx ? "approximate (any visible pixel reports visible)" : "precise (exact pixel counts)", why);
+		}
 		// R2PORT round 7: relaxed by default (like R3). Heli gameplay rp7 (strict): blocking label
 		// drains cost 14 ms/f, 33 fps; rp8 (relaxed): 48 fps with visuals verified identical (no
 		// flicker, sun/bloom occlusion correct). A report the game reads may be up to a frame old.
@@ -436,6 +495,50 @@ namespace
 			static_cast<int>(g_cfg.video.antialiasing_level.get()), g_cfg.video.force_high_precision_z_buffer.get() ? 1 : 0,
 			static_cast<double>(g_cfg.video.texture_lod_bias.get()), g_cfg.video.use_gpu_texture_scaling.get() ? 1 : 0,
 			r2prof::enabled ? "on (R2_RSX_PROF, every 5 s)" : "off");
+	}
+
+	// GPU offload switches (shared naming with R1/R3: RSX_GPU_*). Graphics work runs on the GPU; each feature that is
+	// on prints one "[gpu-offload] <name> ON" line. Vertex fetch/decode is always GPU-side in this renderer (texel
+	// buffers read by the vertex shader); tiled surface detile/encode is always GPU compute (cs_tile_memcpy).
+	//  RSX_GPU_TEXDECODE (default 1): texture deswizzle + byteswap in compute shaders (cs_deswizzle_3d / cs_shuffle)
+	//    for images >= 1 KB; bit-exact vs the CPU path (scratch\gpu_offload\vk_texdecode_test). 0 = CPU decode.
+	//  RSX_GPU_BLIT (opt-in; alias R2_GPU_TEX_SCALING): blit-engine copies between main-memory images on the GPU
+	//    instead of the CPU detile/scale path (nv3089). Filtering differs from the CPU path -> not bit-exact.
+	//  RSX_GPU_TEXSTREAM (opt-in; alias R2_ASYNC_TEX): texture uploads on a separate Vulkan transfer/compute queue.
+	//  The switches parse like every [native] switch (port_native_parse_bool). main.cpp's start-up [native] line
+	//  cannot know the yml/alias result yet, so the effective state is printed here, in the same format.
+	void apply_gpu_offload()
+	{
+		const int td = port_native_parse_bool(penv("RSX_GPU_TEXDECODE"), 1);
+		r2port::g_gpu_texdecode = td;
+		if (const int b = port_native_parse_bool(penv("RSX_GPU_BLIT"), -1); b >= 0) g_cfg.video.use_gpu_texture_scaling.set(b != 0);
+		if (const int b = port_native_parse_bool(penv("RSX_GPU_TEXSTREAM"), -1); b >= 0) g_cfg.video.vk.asynchronous_texture_streaming.set(b != 0);
+		const bool detile = g_cfg.video.handle_tiled_memory.get();
+		const bool blit = g_cfg.video.use_gpu_texture_scaling.get();
+		const bool stream = g_cfg.video.vk.asynchronous_texture_streaming.get();
+		std::printf("[gpu-offload] vertex fetch ON (vertex shader)\n");
+		if (detile) std::printf("[gpu-offload] surface detile ON (compute)\n");
+		if (td) std::printf("[gpu-offload] texture decode ON (RSX_GPU_TEXDECODE)\n");
+		if (blit) std::printf("[gpu-offload] blit ON (RSX_GPU_BLIT)\n");
+		if (stream) std::printf("[gpu-offload] texture streaming ON (RSX_GPU_TEXSTREAM)\n");
+		std::fflush(stdout);
+		// Effective state (after the yml and the R2_* aliases), not just the RSX_GPU_* values.
+		const port_native_feature k_gpu[] = {
+			{ "gpu-texdecode", "RSX_GPU_TEXDECODE", 1 }, { "gpu-blit", "RSX_GPU_BLIT", 0 },
+			{ "gpu-texstream", "RSX_GPU_TEXSTREAM", 0 },
+			{ "gpu-detile", "RSX_TILING", 0 },
+			{ "rsx-fifo-inline", "RSX_FIFO_INLINE", 1 },
+			{ "rsx-sampler-cache", "RSX_SAMPLER_CACHE", 1 }, { "rsx-vtx-reuse", "RSX_VTX_REUSE", 0 },
+			{ "rsx-ibind-skip", "RSX_IBIND_SKIP", 1 }, { "rsx-vprun-fast", "RSX_VPRUN_FAST", 1 },
+			{ "rsx-zcull-idle-flush", "RSX_ZCULL_IDLE_FLUSH", 1 }, { "rsx-zcull-crit-flush", "RSX_ZCULL_CRIT_FLUSH_US", 1 },
+		};
+		const int k_gpu_on[] = { td, blit, stream, detile, rsx::FIFO::inline_active() ? 1 : 0,
+			vk::r2_sampler_cache_active() ? 1 : 0, vk::r2_vtx_reuse_active() ? 1 : 0,
+			vk::r2_ibind_skip_active() ? 1 : 0, vk::r2_vprun_fast_active() ? 1 : 0,
+			// effective: the idle flush only runs with relaxed ZCULL sync and queries on
+			(rsx::r2_zcull_idle_flush_enabled() && g_cfg.video.relaxed_zcull_sync.get() && !g_cfg.video.disable_zcull_queries.get()) ? 1 : 0,
+			(rsx::r2_zcull_crit_flush_us() && g_cfg.video.relaxed_zcull_sync.get() && !g_cfg.video.disable_zcull_queries.get()) ? 1 : 0 };
+		port_native_summary_state(k_gpu, k_gpu_on, (int)(sizeof k_gpu / sizeof k_gpu[0]));
 	}
 
 	// R2_RSX_PROF=1: every 5 s, one block of [r2rsx-prof] lines on stdout.
@@ -636,6 +739,19 @@ namespace
 				"vertex uploads uncacheable %.0f%% | program slow-path loads %.1f/f\n",
 				dx(r2prof::av_wait_ns) / 1000.0 / avfl, dx(r2prof::av_flush_ns) / 1000.0 / avfl, static_cast<double>(p1.x[r2prof::av_max_ns]) / 1000.0,
 				vreq > 0 ? dx(r2prof::vtx_uncacheable) * 100.0 / vreq : 0.0, std::max(0.0, plook / 2.0 - dx(r2prof::prog_memo_hits)) / fr);
+			if (dx(r2prof::smp_memo_hits) + dx(r2prof::smp_memo_miss) + dx(r2prof::vtx_reuse_hits) + dx(r2prof::ibind_skipped) > 0)
+			{
+				bp("[r2rsx-prof]   RSX_SAMPLER_CACHE: memo hits %.1f/f, derivations %.1f/f | RSX_VTX_REUSE: reused uploads %.1f/f (%.1f KB/f) | "
+					"RSX_IBIND_SKIP: index binds left out %.1f/f | RSX_ATEST_RESAMPLE: re-uploads avoided %.1f/f\n",
+					dx(r2prof::smp_memo_hits) / fr, dx(r2prof::smp_memo_miss) / fr, dx(r2prof::vtx_reuse_hits) / fr, dx(r2prof::vtx_reuse_bytes) / 1024.0 / fr,
+					dx(r2prof::ibind_skipped) / fr, dx(r2prof::smp_bias_only) / fr);
+				bp("[r2rsx-prof]   resolve split us/draw: r2aa texture reads %.2f (jittered-content checks %.1f/f, RSX_AA_TEXREAD_MEMO hits %.1f/f), get_current programs %.2f\n",
+					dx(r2prof::aa_texr_ns) / 1000.0 / dr, dx(r2prof::aa_texr_jd) / fr, dx(r2prof::aa_texr_memo) / fr, dx(r2prof::prog_getcur_ns) / 1000.0 / dr);
+				bp("[r2rsx-prof]   texture env split us/draw: expiry tests %.2f, upload_texture %.2f (%.1f/f, %.2f us each; search on memo miss %.2f), fs sampler %.2f, vs units %.2f\n",
+					dx(r2prof::tex_expire_ns) / 1000.0 / dr, dx(r2prof::tex_upl_ns) / 1000.0 / dr, dx(r2prof::tex_upl_n) / fr,
+					dx(r2prof::tex_upl_n) ? dx(r2prof::tex_upl_ns) / 1000.0 / dx(r2prof::tex_upl_n) : 0.0, dx(r2prof::tex_search_ns) / 1000.0 / dr,
+					dx(r2prof::tex_smp_ns) / 1000.0 / dr, dx(r2prof::tex_vs_ns) / 1000.0 / dr);
+			}
 
 			// Round-3: outside draws, self times (nested scopes subtracted), ms per frame
 			const double ms = 1e6 * fr;
@@ -741,11 +857,19 @@ namespace
 					dx(r2prof::xc_memo_hits) / fr, dx(r2prof::xc_memo_bytes) / 1024.0 / fr,
 					dx(r2prof::idx_dedup_hits) / fr, dx(r2prof::idx_dedup_bytes) / 1024.0 / fr, dx(r2prof::idx_dedup_stale) / fr,
 					dx(r2prof::tex_up_count) / fr, dx(r2prof::tex_up_count) ? dx(r2prof::tex_up_ns) / 1000.0 / dx(r2prof::tex_up_count) : 0.0, dx(r2prof::tex_up_async) / fr);
+				bp("[r2rsx-prof]   set0 (RSX_SET0_SHARE): allocations %.1f/f, shared-set reuses %.1f/f (with =2: would-be reuses, not taken), pool-epoch invalidations %.2f/f\n",
+					dx(r2prof::set0_alloc) / fr, dx(r2prof::set0_adopt) / fr, dx(r2prof::set0_inval) / fr);
 			}
+			// RSX_FIFO_HOOKS_FAST: FIFO packets and the housekeeping split (each bucket includes nested od scopes)
+			bp("[r2rsx-prof]   fifo: run_FIFO calls %.0f/f (%.1f methods each) | housekeeping runs %.1f/f (interrupt-forced %.1f/f, draw-light %.1f/f): "
+				"context %.3f + local task %.3f + zcull %.3f + labels %.3f + host dma %.3f ms/f\n",
+				dx(r2prof::fifo_packets) / fr, dx(r2prof::fifo_methods) / std::max(dx(r2prof::fifo_packets), 1.0),
+				dx(r2prof::hk_runs) / fr, dx(r2prof::hk_irq) / fr, dx(r2prof::hk_light) / fr, dx(r2prof::hk_ctx_ns) / ms, dx(r2prof::hk_local_ns) / ms,
+				dx(r2prof::hk_zcull_ns) / ms, dx(r2prof::hk_labels_ns) / ms, dx(r2prof::hk_dma_ns) / ms);
 			// Round-9: usage census (R2_RSX_CENSUS=1): what to specialise for
 			if (r2prof::census_on)
 			{
-				static std::vector<u32> s_prev(0x4000 * 2 + 32 + 8 + 256 + 5 + 2);
+				static std::vector<u32> s_prev(0x4000 * 2 + 32 + 8 + 256 + 5 + 2 + 3);
 				std::vector<u32> cur(s_prev.size());
 				auto& c = r2prof::census;
 				usz k = 0;
@@ -757,10 +881,13 @@ namespace
 				for (auto& v : c.mrt) cur[k++] = v.load(std::memory_order_relaxed);
 				cur[k++] = c.cond_render.load(std::memory_order_relaxed);
 				cur[k++] = c.draws.load(std::memory_order_relaxed);
+				cur[k++] = c.delta_only.load(std::memory_order_relaxed);
+				cur[k++] = c.delta_only_va.load(std::memory_order_relaxed);
+				cur[k++] = c.vk_same.load(std::memory_order_relaxed);
 				std::vector<double> d(cur.size());
 				for (usz j = 0; j < cur.size(); ++j) d[j] = static_cast<double>(cur[j] - s_prev[j]);
 				s_prev = std::move(cur);
-				const double cdr = std::max(d[d.size() - 1], 1.0);
+				const double cdr = std::max(d[d.size() - 4], 1.0);
 
 				std::vector<u32> order(0x4000);
 				for (u32 j = 0; j < 0x4000; ++j) order[j] = j;
@@ -790,6 +917,38 @@ namespace
 					"texture fmt (per 100 draws) %s\n",
 					list(cb, 32, "%s%u %.0f%%").c_str(), list(cb + 32, 8, "%s%u %.0f%%").c_str(), list(cb + 40 + 256, 5, "%s%u %.0f%%").c_str(),
 					d[cb + 40 + 256 + 5] * 100.0 / cdr, list(cb + 40, 256, "%s0x%02x %.0f").c_str());
+				bp("[r2rsx-prof]   r9 census draw-call reduction: delta-only draws %.1f%% (only constants / vertex base / index address / "
+					"invalidates / reports changed since the previous draw), %.1f%% also allowing vertex array offsets | "
+					"Vulkan state equal to the previous draw %.1f%% (multi-draw-indirect upper bound)\n",
+					d[d.size() - 3] * 100.0 / cdr, d[d.size() - 2] * 100.0 / cdr, d[d.size() - 1] * 100.0 / cdr);
+				// RSX_FIFO_HOOKS_FAST census: method handler cost by register, methods that met each optional FIFO hook
+				static std::vector<u64> s_prev_ns(0x4000);
+				static u32 s_prev_hk[4];
+				std::vector<double> dn(0x4000);
+				double dn_all = 0;
+				for (u32 j = 0; j < 0x4000; ++j)
+				{
+					const u64 v = c.meth_ns[j].load(std::memory_order_relaxed);
+					dn[j] = static_cast<double>(v - s_prev_ns[j]);
+					s_prev_ns[j] = v;
+					dn_all += dn[j];
+				}
+				std::partial_sort(order.begin(), order.begin() + 16, order.end(), [&](u32 a, u32 b) { return dn[a] > dn[b]; });
+				std::string hs;
+				for (u32 j = 0; j < 16 && dn[order[j]] > 0; ++j)
+				{
+					char b[80];
+					std::snprintf(b, sizeof(b), "%s%04x %.3f ms (%.0f ns each)", j ? ", " : "", order[j] * 4, dn[order[j]] / (1e6 * fr),
+						d[order[j]] > 0 ? dn[order[j]] / d[order[j]] : 0.0);
+					hs += b;
+				}
+				const u32 hk[4] = { c.hook_drawlog.load(std::memory_order_relaxed), c.hook_capture.load(std::memory_order_relaxed),
+					c.hook_flat.load(std::memory_order_relaxed), c.hook_featcov.load(std::memory_order_relaxed) };
+				double dh[4];
+				for (int j = 0; j < 4; ++j) { dh[j] = static_cast<double>(hk[j] - s_prev_hk[j]); s_prev_hk[j] = hk[j]; }
+				bp("[r2rsx-prof]   hooks census: method handlers %.2f ms/f (timed, incl. rdtsc), top by ms/f: %s | methods/f meeting FIFO hooks: "
+					"draw log %.0f, frame capture %.0f, flattener %.0f, featcov on %.0f (RSX_FIFO_HOOKS_FAST skips all of them when none is active)\n",
+					dn_all / (1e6 * fr), hs.empty() ? "-" : hs.c_str(), dh[0] / fr, dh[1] / fr, dh[2] / fr, dh[3] / fr);
 			}
 			// Round-7: the monitor's own cost (previous cycle's print included)
 			const u64 mon_cpu1 = self_cpu_ns();
@@ -850,6 +1009,7 @@ namespace
 		apply_shader_defaults();
 		apply_launcher_overrides();
 		apply_port_perf(); // R2PORT perf
+		apply_gpu_offload(); // RSX_GPU_* (after the R2_* names, which they override)
 	}
 
 	void commit(u32 ea, u32 size)
@@ -860,16 +1020,33 @@ namespace
 		}
 	}
 
+	// R2PORT [texcache]: an unclaimed fault on a page that is accessible again by now lost a race (another
+	// thread's fault lifted the guard while this one was dispatched); the host handler just retries it.
+	// Only the rest (still protected) are real unclaimed faults, logged by the host as "[vm] unclaimed".
+	static bool av_page_open(uint32_t addr, int is_write)
+	{
+		if (!vm_base) return false;
+		MEMORY_BASIC_INFORMATION mbi{};
+		if (!VirtualQuery(vm_base + addr, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+		return (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | (is_write ? 0 : (PAGE_READONLY | PAGE_EXECUTE_READ)))) != 0;
+	}
+
 	int access_violation_hook(uint32_t addr, int is_write)
 	{
+		// R3PORT: per-thread fault count and time (the PORT_HITCH_RSX_METH nv0039 split reads rsx::thread's)
+		const u64 r3_tf0 = port_hitch_t0();
+		struct r3_tf_scope { u64 t0; ~r3_tf_scope() { r2texdiag::tl_faults++; r2texdiag::tl_fault_ticks += port_hitch_t0() - t0; } } r3_tf{ r3_tf0 };
 		if (!r2prof::enabled) [[likely]]
 		{
-			return rsx::g_access_violation_handler && rsx::g_access_violation_handler(addr, is_write != 0);
+			const int r0 = rsx::g_access_violation_handler && rsx::g_access_violation_handler(addr, is_write != 0);
+			r2texdiag::on_fault(r0 != 0, !r0 && av_page_open(addr, is_write)); // R2PORT: [texcache]
+			return r0;
 		}
 
 		// R2PORT perf: R2_RSX_PROF counts the faults and the time RPCS3 spends in them
 		const u64 t0 = r2prof::now_ns();
 		const int r = rsx::g_access_violation_handler && rsx::g_access_violation_handler(addr, is_write != 0);
+		r2texdiag::on_fault(r != 0, !r && av_page_open(addr, is_write)); // R2PORT: [texcache]
 		r2prof::add(r2prof::g.av_ns, r2prof::now_ns() - t0);
 		r2prof::add(r2prof::g.av_calls, 1);
 		if (r) r2prof::add(r2prof::g.av_handled, 1);
@@ -915,7 +1092,7 @@ extern "C" int r2rsx_enabled(void)
 {
 	if (s_enabled < 0)
 	{
-		// RPCS3/Vulkan is the default renderer; R2_RSX=d3d12 (or 0) selects the old D3D12 backend,
+		// RPCS3/Vulkan is the default renderer; R2_RSX=d3d12 the Direct3D 12 (experimental) draw engine (or 0 the old D3D12 backend),
 		// R2_RSX=vulkan the native Vulkan renderer (ps3recomp's draw engine).
 		const char* e = std::getenv("R2_RSX");
 		s_enabled = !(e && (!_stricmp(e, "d3d12") || !_stricmp(e, "vulkan") || !_stricmp(e, "native") ||
@@ -1000,6 +1177,13 @@ extern "C" int r2rsx_context_allocate(uint32_t dma_control_ea, uint32_t label_ea
 	commit(dma_control_ea & ~0xFFFu, 0x1000);
 
 	g_fxo->init();
+	// PS3_DISPLAY_GAMMA=<g> (launcher "Brightness"): RPCS3's video-out gamma (out = in^g, the present pass
+	// RPCS3 uses for cellVideoOutSetGamma); the native renderer reads it in cellAvconfExt_display_gamma.
+	if (const char* e = penv("PS3_DISPLAY_GAMMA"))
+	{
+		const double g = std::atof(e);
+		if (g >= 0.5 && g <= 2.0) g_fxo->get<rsx::avconf>().gamma = static_cast<f32>(g);
+	}
 	rsx::create_render_thread(nullptr);
 
 	s_render = rsx::get_current_renderer();
@@ -1068,12 +1252,15 @@ extern "C" int r2rsx_context_allocate(uint32_t dma_control_ea, uint32_t label_ea
 
 	std::thread(intr_thread_main).detach();
 	if (r2prof::enabled) std::thread(prof_thread_main).detach(); // R2PORT perf
+	rsx_host_sample::start_if_enabled(); // R3PORT perf r8: RSX_HOST_SAMPLE=1 (default off)
+	r2texdiag::start_reporter(); // R2PORT: [texcache] 10 s line (RSX_TEXDIAG=0 off)
 
 	render->start_device();
 	s_up = true;
 
 	std::printf("[r2rsx] RPCS3 RSX up (dma=0x%08X labels=0x%08X driver=0x%08X device=0x%08X local=0x%X)\n",
 		dma_control_ea, label_ea, driver_info_ea, device_ea, local_size);
+	cpu_replay_rsx_replay(dma_control_ea); // cpu-replay: one-time getenv; with PORT_RSX_REPLAY set it replays and exits
 	return 0;
 }
 
@@ -1140,9 +1327,100 @@ extern "C" uint64_t r2rsx_last_flip_time(void)
 	return s_up ? s_render->display_ctrl().get_last_guest_flip_timestamp() : 0;
 }
 
+// Flip commands rsx::thread has executed so far (r2_hot occlusion fence); UINT64_MAX when the renderer is not up.
+// Written by the RSX thread only; an aligned 64-bit load, read lag only delays the reader.
+extern "C" uint64_t r2rsx_flips_executed(void)
+{
+	return s_up ? *reinterpret_cast<const volatile uint64_t*>(&s_render->m_r2_flip_seq) : UINT64_MAX;
+}
+
 extern "C" uint64_t r2rsx_vblank_count(void)
 {
 	return s_up ? s_render->display_ctrl().get_vblank_count() : 0;
+}
+
+// PORT: RSX_ZCULL_GUEST_WAIT. The game's blocking occlusion wait names the report EA it is blocked on, so rsx::thread
+// submits that report's query at once (RSXZCULL.h guest_wait_state). Values are untouched; only the submit is earlier.
+extern "C" void r2rsx_occ_guest_wait(uint32_t ea)
+{
+	if (!s_up || !ea || !rsx::reports::guest_wait_enabled()) return;
+	auto& gw = rsx::reports::g_guest_wait;
+	const u64 req = (static_cast<u64>(static_cast<u32>(get_system_time())) << 32) | ea;
+	if (gw.req.exchange(req, std::memory_order_acq_rel)) gw.raced.fetch_add(1, std::memory_order_relaxed);
+	gw.notices.fetch_add(1, std::memory_order_relaxed);
+	// written between the guest's check and this store: drop the request (else the next frame's reuse of the slot matches)
+	if (*static_cast<const volatile u64*>(vm::base(ea)))
+	{
+		u64 exp = req;
+		gw.req.compare_exchange_strong(exp, 0);
+	}
+}
+
+// Cumulative stats: notices, raced, claimed_before, claimed_during, written_unseen, submits,
+// lat_before_us, lat_during_us, lat_unseen_us, lat_max_us (reset on read), claim_to_write_us. Returns 0 when off.
+extern "C" int r2rsx_occ_guest_wait_stats(uint64_t out[11])
+{
+	if (!rsx::reports::guest_wait_enabled()) return 0;
+	auto& gw = rsx::reports::g_guest_wait;
+	out[0] = gw.notices.load(); out[1] = gw.raced.load(); out[2] = gw.claimed_before.load();
+	out[3] = gw.claimed_during.load(); out[4] = gw.written_unseen.load(); out[5] = gw.submits.load();
+	out[6] = gw.lat_before_us.load(); out[7] = gw.lat_during_us.load(); out[8] = gw.lat_unseen_us.load();
+	out[9] = gw.lat_max_us.exchange(0); out[10] = gw.claim_to_write_us.load();
+	return 1;
+}
+
+// PORT: RSX_OCC_SPEC_VISIBLE report fence. The guest answered an occlusion set without waiting for its last report `ea`;
+// that report (and every report claimed before it) can still land after the game has zeroed and reused slots. Arm a
+// fence slot that rsx::thread frees when it writes `ea` (RSXZCULL.cpp write()). Returns 1 when armed (or `ea` is already
+// written), 0 when no slot is free or `ea` is already fenced (the caller must then wait as usual).
+extern "C" int r2rsx_occ_spec_arm(uint32_t ea)
+{
+	if (!s_up || !ea) return 0;
+	auto& gw = rsx::reports::g_guest_wait;
+	for (auto& s : gw.spec_sink)
+		if (s.load(std::memory_order_acquire) == ea) return 0;
+	const u64 flips = *reinterpret_cast<const volatile uint64_t*>(&s_render->m_r2_flip_seq);
+	for (int i = 0; i < rsx::reports::guest_wait_state::spec_slots; i++)
+	{
+		u32 e = 0;
+		if (!gw.spec_sink[i].compare_exchange_strong(e, ea, std::memory_order_acq_rel)) continue;
+		gw.spec_flip[i].store(flips, std::memory_order_relaxed);
+		gw.spec_armed.fetch_add(1);
+		std::atomic_thread_fence(std::memory_order_seq_cst);
+		// written between the guest's check and the arm: nothing left in flight for this report
+		if (*static_cast<const volatile u64*>(vm::base(ea)))
+		{
+			u32 x = ea;
+			if (gw.spec_sink[i].compare_exchange_strong(x, 0, std::memory_order_acq_rel))
+				gw.spec_armed.fetch_sub(1, std::memory_order_acq_rel);
+		}
+		return 1;
+	}
+	return 0;
+}
+
+// Armed fence slots whose report is not written yet. A slot older than 120 executed flips is dropped (its report was
+// discarded, e.g. by a ZCULL reset; a write that late cannot be pending). UINT32_MAX when the renderer is not up.
+extern "C" uint32_t r2rsx_occ_spec_pending(void)
+{
+	if (!s_up) return UINT32_MAX;
+	auto& gw = rsx::reports::g_guest_wait;
+	if (gw.spec_armed.load(std::memory_order_acquire) <= 0) return 0;
+	const u64 flips = *reinterpret_cast<const volatile uint64_t*>(&s_render->m_r2_flip_seq);
+	u32 n = 0;
+	for (int i = 0; i < rsx::reports::guest_wait_state::spec_slots; i++)
+	{
+		u32 ea = gw.spec_sink[i].load(std::memory_order_acquire);
+		if (!ea) continue;
+		if (flips - gw.spec_flip[i].load(std::memory_order_relaxed) > 120)
+		{
+			if (gw.spec_sink[i].compare_exchange_strong(ea, 0, std::memory_order_acq_rel))
+				gw.spec_armed.fetch_sub(1, std::memory_order_acq_rel);
+			continue;
+		}
+		n++;
+	}
+	return n;
 }
 
 extern "C" uint32_t r2rsx_current_display_buffer(void)

@@ -13,9 +13,12 @@
  *                    the game, 0 = off): the game's Lua script functions are pointed
  *                    at a no-op function (their OPD words in the Lua binding table).
  *   Cutscene skip    R2_CUTSCENE_SKIP=1: hold Space / Enter / A / Start for 1 s
- *                    while a pre-rendered movie (.bik) plays.
+ *                    while a pre-rendered movie (.bik) plays. R2_CUTSCENE_SKIP_ALL
+ *                    (default 1; 0 = off): unwatched movies too (r2x_movie_seen).
  *   Photo mode       R2_PHOTO (default on; 0 = off), F7: pause, hide the port's
- *                    overlays, F12 = shot.
+ *                    overlays, F12 = shot. R2_PHOTO_HIDE_HUD (default 1; 0 = off):
+ *                    game's HUD too (the last frame's scene from before its first
+ *                    HUD draw, VKR2FrameGen.cpp; one display-buffer copy a frame).
  *   Crosshair        R2_CROSSHAIR=0|dot|cross: a small marker at the centre while
  *                    on foot (for when the game's reticle is hard to see).
  *   Pause on pad loss R2_PAD_DISCONNECT_PAUSE=1.
@@ -46,7 +49,9 @@
 #include <string>
 #include <algorithm>
 #include <mutex>
+#include <set>
 #include "port_osd.h"
+#include "ps3emu/port_pc_extras2.h"
 #pragma comment(lib, "xinput.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
@@ -61,7 +66,7 @@ extern "C" {
 extern volatile int g_port_ui_modal;                         /* cellPad.c */
 extern volatile int g_port_input_kbm;                        /* cellPad.c: port 0 is the keyboard */
 extern volatile unsigned long long g_pad_inj_until;          /* cellPad.c: injected presses on port 0 */
-extern volatile uint32_t g_pad_inj_btn, g_pad_inj_sticks;
+extern volatile uint32_t g_pad_inj_btn, g_pad_inj_sticks, g_pad_inj_clear;
 void cellpad_reload_controls(void);                          /* cellPad.c */
 extern void (*volatile g_port_xi_hook)(int port, void* gamepad);
 extern void (*volatile g_port_file_open_cb)(int slot, const char* path);   /* sys_fs.c */
@@ -80,6 +85,11 @@ extern volatile int g_pc_cvd_mode;                           /* 0 off, 1 protan,
 extern volatile int g_pc_hdr_active;                         /* the swapchain is HDR */
 extern volatile int g_pc_reflex_active;
 void r2pc_reflex_sleep(void);
+/* cellPad.c: called on the first pad read of a game frame (Reflex INPUT_SAMPLE) */
+extern void (*volatile g_pad_input_hook)(void);
+/* rsx_d3d12_engine.c: Direct3D 12 renderer latency reduction (no-op on the other renderers) */
+int  rsx_d3d12_engine_latency_frame(void);
+void rsx_d3d12_engine_latency_input(void);
 }
 
 /* ---- small helpers (same file formats as r2_pcport.cpp / the launcher) ---- */
@@ -128,16 +138,26 @@ static std::string envs(const char* name, const char* def)
     const char* e = getenv(full); return (e && *e) ? e : def;
 }
 static int envi(const char* name, int def) { std::string v = envs(name, ""); return v.empty() ? def : atoi(v.c_str()); }
-/* the "Hold Space / A to skip" hint when a movie starts. PORT_SKIP_HINT=0 (or <prefix>_SKIP_HINT=0; launcher
-   "Show cutscene skip hint") hides it; holding the button still skips. */
+/* the "Hold Space / A to skip" hint when a movie starts. PORT_SKIP_HINT (or <prefix>_SKIP_HINT; launcher
+   "Show cutscene skip hint") unset/empty = auto: shown while Hold to skip movies and Skip unwatched movies
+   are both on (checked live), since every story movie can then be skipped. 0/off = never, 1/on = always. */
+static int skip_hint_auto(void);
 static int skip_hint_on(void)
 {
-    static int on = -1;
-    if (on < 0) {
+    static int mode = -2;  /* -1 auto, 0 never, 1 always; only the explicit env value is cached */
+    if (mode == -2) {
         const char* e = getenv("PORT_SKIP_HINT");
         const std::string v = (e && *e) ? std::string(e) : envs("SKIP_HINT", "");
-        on = !(v == "0" || _stricmp(v.c_str(), "off") == 0 || _stricmp(v.c_str(), "false") == 0);
+        const char* s = v.c_str();
+        mode = (v == "1" || _stricmp(s, "on") == 0 || _stricmp(s, "true") == 0) ? 1
+             : (v == "0" || _stricmp(s, "off") == 0 || _stricmp(s, "false") == 0) ? 0 : -1;
     }
+    return mode < 0 ? skip_hint_auto() : mode;
+}
+static int skip_test_unseen(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PORT_SKIP_TEST_UNSEEN"); on = e && atoi(e) == 1; }
     return on;
 }
 static double now_s(void)
@@ -234,8 +254,30 @@ static void xi_hook(int port, void* gp_)
 
 /* ======================================================================
  * Movies (cutscene skip) and level names (Discord) from the file hooks */
-static volatile int s_movie_slot = -1;
+static volatile int s_movie_slot = -1;          /* >= 0 while a movie handle is open */
 static volatile ULONGLONG s_movie_t0 = 0;
+/* issue #6: every open movie handle is tracked, so a second open (or a probe handle closed
+ * while the stream plays) no longer turns the skip off mid-movie. PORT_MOVIE_TRACK=0: the old
+ * single slot (the newest open; its close ends the movie). */
+static std::mutex s_mv_mu;
+static std::set<int> s_mv_slots;
+/* how the current movie is being skipped (logged when it closes): 0 = not skipped (natural end),
+ * 1 = the game's own skip of a watched movie, 2 = the game's skip with its "watched" check
+ * overridden (Skip unwatched movies, r2x_movie_seen) */
+static volatile int s_skip_mech = 0;
+static volatile ULONGLONG s_skip_fire_ms = 0;   /* the hold is pulsing Start / Cross (window thread) */
+static const char* skip_mech_name(int m)
+{
+    return m == 2 ? "skipped: game skip, watched-check overridden (unwatched movie)"
+         : m == 1 ? "skipped: game skip (already watched)"
+         : m == -1 ? "not skipped: unwatched, Skip unwatched movies off" : "played to the end";
+}
+static int movie_track(void)
+{
+    static int t = -1;
+    if (t < 0) { const char* e = getenv("PORT_MOVIE_TRACK"); t = (e && *e) ? atoi(e) != 0 : 1; }
+    return t;
+}
 static std::mutex s_lvl_mu;
 static std::string s_level;                /* "" = not known yet */
 static volatile int s_level_gen = 0;
@@ -245,8 +287,21 @@ static void file_open_cb(int slot, const char* path)
     std::string p(path);
     for (auto& c : p) { if (c == '\\') c = '/'; c = (char)tolower((unsigned char)c); }
     if (slot >= 0 && p.size() > 4 && p.compare(p.size() - 4, 4, ".bik") == 0) {
-        if (p.find("c00_insom") == std::string::npos) { s_movie_slot = slot; s_movie_t0 = GetTickCount64(); }
+        if (p.find("c00_insom") == std::string::npos) {
+            if (movie_track()) {
+                std::lock_guard<std::mutex> g(s_mv_mu);
+                if (s_mv_slots.empty()) { s_movie_t0 = GetTickCount64(); s_skip_mech = 0; }
+                s_mv_slots.insert(slot);
+                s_movie_slot = slot;
+                LOG("movie open: %s (slot %d, %u open)", p.c_str(), slot, (unsigned)s_mv_slots.size());
+            } else { s_movie_slot = slot; s_movie_t0 = GetTickCount64(); s_skip_mech = 0; }
+        }
         return;
+    }
+    if (slot >= 0 && movie_track()) {
+        /* the slot was reused for another file: its movie close was not seen */
+        std::lock_guard<std::mutex> g(s_mv_mu);
+        if (s_mv_slots.erase(slot)) s_movie_slot = s_mv_slots.empty() ? -1 : *s_mv_slots.begin();
     }
     const size_t k = p.find("/levels/");
     if (k == std::string::npos || p.find("level_uncached") == std::string::npos) return;
@@ -256,7 +311,16 @@ static void file_open_cb(int slot, const char* path)
     std::lock_guard<std::mutex> g(s_lvl_mu);
     if (lv != s_level) { s_level = lv; s_level_gen++; LOG("level: %s", lv.c_str()); }
 }
-static void file_close_cb(int slot) { if (slot == s_movie_slot) s_movie_slot = -1; }
+static void file_close_cb(int slot)
+{
+    if (movie_track()) {
+        std::lock_guard<std::mutex> g(s_mv_mu);
+        if (s_mv_slots.erase(slot)) {
+            s_movie_slot = s_mv_slots.empty() ? -1 : *s_mv_slots.begin();
+            if (s_movie_slot < 0) { LOG("movie closed (%s)", skip_mech_name(s_skip_mech)); s_skip_mech = 0; }
+        }
+    } else if (slot == s_movie_slot) { s_movie_slot = -1; LOG("movie closed (%s)", skip_mech_name(s_skip_mech)); s_skip_mech = 0; }
+}
 static std::string level_pretty(void)
 {
     std::string lv; { std::lock_guard<std::mutex> g(s_lvl_mu); lv = s_level; }
@@ -336,7 +400,6 @@ struct BenchStep { double at; uint32_t btn; };
 static std::vector<BenchStep> s_bench_steps;
 static int s_bench = 0, s_bench_step = 0, s_bench_state = 0;   /* 0 script, 1 measuring, 2 done */
 static double s_bench_t0 = 0, s_bench_m0 = 0, s_bench_secs = 60;
-static std::vector<float> s_bench_ft;
 static double s_last_frame = 0;
 static uint32_t btn_named(const std::string& n)
 {
@@ -362,47 +425,83 @@ static void bench_parse(void)
         s_bench_steps.push_back({ t, c == std::string::npos ? 0u : btn_named(tok.substr(c + 1)) });
     }
 }
-static void bench_report(void)
+/* Frame-time capture, shared by the scripted benchmark (R2_BENCH=1) and the hotkey capture (F11,
+ * R2_BENCH_KEY): the game thread (r2x_frame_tick) appends to a preallocated buffer, the UI thread
+ * starts / stops it and writes the report. */
+#define BENCH_CAP_MAX 400000u                    /* ~28 min at 240 fps */
+static float* s_cap_buf = NULL;
+static volatile LONG s_cap_n = 0, s_cap_on = 0;
+static double s_cap_t0 = 0;
+static int s_cap_kind = 0;                       /* 1 scripted benchmark, 2 hotkey capture */
+static int s_cap_key = 0x7A;                     /* VK_F11; 0 = off */
+static int cap_start(int kind)
 {
-    std::vector<float> v = s_bench_ft;
-    const double secs = now_s() - s_bench_m0;
+    if (!s_cap_buf) s_cap_buf = (float*)malloc(BENCH_CAP_MAX * sizeof(float));
+    if (!s_cap_buf) return 0;
+    s_cap_kind = kind; s_cap_t0 = now_s();
+    InterlockedExchange(&s_cap_n, 0);
+    InterlockedExchange(&s_cap_on, 1);
+    return 1;
+}
+/* logs\bench\<P>_bench_<date>.txt (summary, read by the launcher), .csv (every frame) and a row in bench_history.csv */
+static std::string bench_report(const float* ft, unsigned n, double secs, int kind)
+{
     double us_draw = 0, dpf = 0, fr = 0;
-    r2rsx_prof_sample(&fr, &dpf, &us_draw);
-    std::sort(v.begin(), v.end());
-    auto pct = [&](double p) { if (v.empty()) return 0.0; size_t k = (size_t)((v.size() - 1) * p); return (double)v[k]; };
-    auto low = [&](double frac) {   /* average fps over the slowest `frac` of frames */
-        if (v.empty()) return 0.0; size_t n = std::max<size_t>(1, (size_t)(v.size() * frac)); double s = 0;
-        for (size_t k = v.size() - n; k < v.size(); k++) s += v[k]; return 1000.0 * n / s; };
-    const double avg = v.empty() ? 0 : v.size() / secs;
+    if (kind == 1) r2rsx_prof_sample(&fr, &dpf, &us_draw);
+    std::vector<float> scratch(n ? n : 1);
+    PcxBenchStats st; pcx_bench_stats(ft, n, secs, scratch.data(), &st);
     CreateDirectoryA("logs", NULL); CreateDirectoryA("logs\\bench", NULL);
     SYSTEMTIME t; GetLocalTime(&t);
-    char path[MAX_PATH]; snprintf(path, sizeof path, "logs\\bench\\%s_bench_%04u%02u%02u_%02u%02u%02u.txt", PCX_PREFIX,
+    char base[MAX_PATH]; snprintf(base, sizeof base, "logs\\bench\\%s_bench_%04u%02u%02u_%02u%02u%02u", PCX_PREFIX,
                                   t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-    FILE* f = fopen(path, "w");
-    if (f) {
+    const std::string txt = std::string(base) + ".txt", csv = std::string(base) + ".csv";
+    if (FILE* f = fopen(txt.c_str(), "w")) {
         fprintf(f, "%s built-in benchmark\n", PCX_GAME_NAME);
+        fprintf(f, "mode             %s\n", kind == 1 ? "scripted" : "hotkey capture");
         fprintf(f, "level            %s\n", level_pretty().c_str());
-        fprintf(f, "seconds          %.1f\n", secs);
-        fprintf(f, "frames           %zu\n", v.size());
-        fprintf(f, "avg fps          %.2f\n", avg);
-        fprintf(f, "1%% low fps       %.2f\n", low(0.01));
-        fprintf(f, "0.1%% low fps     %.2f\n", low(0.001));
-        fprintf(f, "median ms        %.3f\n", pct(0.5));
-        fprintf(f, "p99 ms           %.3f\n", pct(0.99));
-        fprintf(f, "max ms           %.3f\n", v.empty() ? 0.0 : (double)v.back());
-        fprintf(f, "draws/frame      %.1f\n", dpf);
-        fprintf(f, "us/draw          %.3f\n", us_draw);
+        fprintf(f, "seconds          %.1f\n", st.secs);
+        fprintf(f, "frames           %u\n", st.frames);
+        fprintf(f, "avg fps          %.2f\n", st.avg_fps);
+        fprintf(f, "1%% low fps       %.2f\n", st.low1_fps);
+        fprintf(f, "0.1%% low fps     %.2f\n", st.low01_fps);
+        fprintf(f, "stutters         %u\n", st.stutters);
+        fprintf(f, "lows             average of the slowest 1%% / 0.1%% frame times (CapFrameX style)\n");
+        fprintf(f, "stutter rule     frame > 2x the average of the previous 30 and >= 4 ms over it\n");
+        fprintf(f, "median ms        %.3f\n", st.median_ms);
+        fprintf(f, "p99 ms           %.3f\n", st.p99_ms);
+        fprintf(f, "max ms           %.3f\n", st.max_ms);
+        if (kind == 1) {
+            fprintf(f, "draws/frame      %.1f\n", dpf);
+            fprintf(f, "us/draw          %.3f\n", us_draw);
+        }
         fprintf(f, "frame cap        %s\n", getenv(PCX_PREFIX "_FPS") ? getenv(PCX_PREFIX "_FPS") : "default");
+        fprintf(f, "frame times      %s\n", csv.c_str());
+        fclose(f);
+    }
+    if (FILE* f = fopen(csv.c_str(), "w")) {
+        fprintf(f, "frame,t_ms,frame_ms\n");
+        double at = 0;
+        for (unsigned i = 0; i < n; i++) { at += ft[i]; fprintf(f, "%u,%.3f,%.3f\n", i, at, ft[i]); }
         fclose(f);
     }
     const bool hdr = GetFileAttributesA("logs\\bench\\bench_history.csv") == INVALID_FILE_ATTRIBUTES;
     if (FILE* h = fopen("logs\\bench\\bench_history.csv", "a")) {
         if (hdr) fprintf(h, "date,game,level,seconds,frames,avg_fps,low1_fps,low01_fps,draws_per_frame,us_per_draw\n");
-        fprintf(h, "%04u-%02u-%02u %02u:%02u:%02u,%s,%s,%.1f,%zu,%.2f,%.2f,%.2f,%.1f,%.3f\n", t.wYear, t.wMonth, t.wDay, t.wHour,
-                t.wMinute, t.wSecond, PCX_PREFIX, level_pretty().c_str(), secs, v.size(), avg, low(0.01), low(0.001), dpf, us_draw);
+        fprintf(h, "%04u-%02u-%02u %02u:%02u:%02u,%s,%s,%.1f,%u,%.2f,%.2f,%.2f,%.1f,%.3f\n", t.wYear, t.wMonth, t.wDay, t.wHour,
+                t.wMinute, t.wSecond, PCX_PREFIX, level_pretty().c_str(), st.secs, st.frames, st.avg_fps, st.low1_fps, st.low01_fps, dpf, us_draw);
         fclose(h);
     }
-    LOG("benchmark: avg %.2f fps, 1%% low %.2f, %.3f us/draw -> %s", avg, low(0.01), us_draw, path);
+    LOG("benchmark (%s): avg %.2f fps, 1%% low %.2f, 0.1%% low %.2f, %u stutters, %.3f us/draw -> %s",
+        kind == 1 ? "scripted" : "hotkey", st.avg_fps, st.low1_fps, st.low01_fps, st.stutters, us_draw, txt.c_str());
+    char s[200]; snprintf(s, sizeof s, "%.1f fps avg, %.1f 1%% low, %.1f 0.1%% low, %u stutters (%u frames, %.0f s)",
+                          st.avg_fps, st.low1_fps, st.low01_fps, st.stutters, st.frames, st.secs);
+    return s;
+}
+static std::string cap_stop_report(void)
+{
+    InterlockedExchange(&s_cap_on, 0);
+    const unsigned n = (unsigned)InterlockedCompareExchange(&s_cap_n, 0, 0);
+    return bench_report(s_cap_buf, n, now_s() - s_cap_t0, s_cap_kind);
 }
 static void bench_tick(HWND game)
 {
@@ -411,28 +510,51 @@ static void bench_tick(HWND game)
     if (s_bench_state == 0) {
         while (s_bench_step < (int)s_bench_steps.size() && t >= s_bench_steps[s_bench_step].at) {
             const BenchStep& st = s_bench_steps[s_bench_step++];
-            if (st.btn) { g_pad_inj_sticks = 0x80808080u; g_pad_inj_btn = st.btn; g_pad_inj_until = GetTickCount64() + 150; }
+            if (st.btn) { g_pad_inj_sticks = 0x80808080u; g_pad_inj_clear = 0; g_pad_inj_btn = st.btn; g_pad_inj_until = GetTickCount64() + 150; }
             LOG("benchmark: step %d at %.0f s", s_bench_step, t);
         }
         if (s_bench_step >= (int)s_bench_steps.size()) {
-            s_bench_state = 1; s_bench_m0 = now_s(); s_bench_ft.clear(); s_bench_ft.reserve(60 * 400);
+            if (s_cap_on) cap_stop_report();     /* a hotkey capture still running is saved first */
+            s_bench_state = 1; s_bench_m0 = now_s(); cap_start(1);
             r2rsx_prof_enable(1); r2rsx_prof_sample(NULL, NULL, NULL);
             LOG("benchmark: measuring for %.0f s", s_bench_secs);
         }
     } else if (now_s() - s_bench_m0 >= s_bench_secs) {
         s_bench_state = 2;
-        bench_report();
+        cap_stop_report();
         r2rsx_prof_enable(0);
         if (envi("BENCH_QUIT", 1) && game) PostMessageA(game, WM_CLOSE, 0, 0);
     }
+}
+/* the capture hotkey: press to start, press again to stop and save (also stops when the buffer is full) */
+static void bench_key_tick(int focused, int other_prompt)
+{
+    static int was = 0;
+    const int d = s_cap_key && focused && (GetAsyncKeyState(s_cap_key) & 0x8000) != 0;
+    char key[8]; snprintf(key, sizeof key, "F%d", s_cap_key - 0x6F);
+    if (d && !was && s_bench_state != 1 && !other_prompt) {
+        if (!s_cap_on) {
+            if (cap_start(2)) {
+                char m[96]; snprintf(m, sizeof m, "Recording frame times. Press %s again to stop.", key);
+                r2pf_hint("Benchmark", m, 3000); LOG("benchmark: hotkey capture started");
+            }
+        } else r2pf_hint("Benchmark saved (logs\\bench)", cap_stop_report().c_str(), 8000);
+    } else if (s_cap_on && s_cap_kind == 2 && (unsigned)s_cap_n >= BENCH_CAP_MAX)
+        r2pf_hint("Benchmark saved (buffer full)", cap_stop_report().c_str(), 8000);
+    was = d;
 }
 /* stubs.cpp r2_frame_period: once per game frame */
 extern "C" void r2x_frame_tick(void)
 {
     const double t = now_s();
-    if (s_bench_state == 1 && s_last_frame > 0) s_bench_ft.push_back((float)((t - s_last_frame) * 1000.0));
+    if (s_cap_on && s_last_frame > 0) {
+        const LONG i = s_cap_n;
+        if ((unsigned)i < BENCH_CAP_MAX) { s_cap_buf[i] = (float)((t - s_last_frame) * 1000.0); InterlockedExchange(&s_cap_n, i + 1); }
+    }
     s_last_frame = t;
     r2pc_reflex_sleep();                         /* NVIDIA Reflex: no-op unless R2_REFLEX is on and the driver has it */
+    if (rsx_d3d12_engine_latency_frame() && g_pad_input_hook != rsx_d3d12_engine_latency_input)
+        g_pad_input_hook = rsx_d3d12_engine_latency_input;   /* Direct3D 12: Reflex / Anti-Lag 2 */
     static int n = 0;
     if ((++n & 15) == 0) fx_apply();
 }
@@ -448,15 +570,21 @@ struct XOpt {
 static std::vector<XOpt> s_opts;
 static int s_photo_on = 0;
 static int s_crosshair = 0;             /* 0 off, 1 dot, 2 cross */
-static int s_disc_pause_on = 1, s_cut_skip = 1, s_photo_allowed = 1;
+static int s_disc_pause_on = 1, s_cut_skip = 1, s_cut_skip_all = 1, s_photo_allowed = 1;
 static void live_fx_blur(const std::string& v) { fx_set("FX_SCREEN_BLUR", v != "0"); }
 static void live_fx_shake(const std::string& v) { fx_set("FX_CAMERA_SHAKE", v != "0"); }
 static void live_fx_lbox(const std::string& v) { fx_set("FX_LETTERBOX", v != "0"); }
 static void live_cvd(const std::string& v) { g_pc_cvd_mode = atoi(v.c_str()); }
 static int crosshair_parse(const std::string& v) { return v == "dot" || v == "1" ? 1 : v == "cross" || v == "2" ? 2 : 0; }
 static void live_xhair(const std::string& v) { s_crosshair = crosshair_parse(v); }
+static unsigned s_xh_rgb = 0xF0F0F0; static int s_xh_scale = 100;
+static void live_xhcolor(const std::string& v) { s_xh_rgb = pcx_xhair_rgb(v.c_str()); }
+static void live_xhsize(const std::string& v) { s_xh_scale = pcx_xhair_scale(v.c_str()); }
+static void live_benchkey(const std::string& v) { s_cap_key = pcx_bench_key(v.c_str()); }
 static void live_dpause(const std::string& v) { s_disc_pause_on = v != "0"; }
 static void live_cut(const std::string& v) { s_cut_skip = v != "0"; }
+static void live_cut_all(const std::string& v) { s_cut_skip_all = v != "0"; }
+static int skip_hint_auto(void) { return s_cut_skip && s_cut_skip_all; }
 extern "C" void cellpad_set_pad_opt(const char* key, const char* v);   /* cellPad.c (SDL3 backend) */
 static void live_gyro(const std::string& v) { cellpad_set_pad_opt("gyro", v.c_str()); }
 static void live_gyrosens(const std::string& v) { cellpad_set_pad_opt("gyrosens", v.c_str()); }
@@ -464,6 +592,21 @@ static void live_gyroinvy(const std::string& v) { cellpad_set_pad_opt("gyroinvy"
 static void live_gyrospace(const std::string& v) { cellpad_set_pad_opt("gyrospace", v.c_str()); }
 static void live_lightbar(const std::string& v) { cellpad_set_pad_opt("lightbar", v.c_str()); }
 static void live_nswap(const std::string& v) { cellpad_set_pad_opt("nswap", v.c_str()); }
+/* PC extras (ps3emu/port_pc_extras.h): the cellPad.c keys are the environment variable names */
+static void live_rumble(const std::string& v) { cellpad_set_pad_opt("PAD_RUMBLE", v.c_str()); }
+static void live_padbg(const std::string& v) { cellpad_set_pad_opt("PAD_BACKGROUND_INPUT", v.c_str()); }
+static void live_outerdz(const std::string& v) { cellpad_set_pad_opt("PAD_OUTER_DEADZONE", v.c_str()); }
+static void live_antidz(const std::string& v) { cellpad_set_pad_opt("PAD_ANTI_DEADZONE", v.c_str()); }
+static void live_trigdz(const std::string& v) { cellpad_set_pad_opt("PAD_TRIGGER_DEADZONE", v.c_str()); }
+static void live_turnboost(const std::string& v) { cellpad_set_pad_opt("PAD_TURN_BOOST", v.c_str()); }
+static void live_crouch(const std::string& v) { cellpad_set_pad_opt("PAD_CROUCH_MODE", v.c_str()); }
+static void live_sprint(const std::string& v) { cellpad_set_pad_opt("PAD_SPRINT_MODE", v.c_str()); }
+extern "C" void cellaudio_set_pc_mix(int volume_pct, int mono);        /* cellAudio.c */
+static void live_volume(const std::string& v) { cellaudio_set_pc_mix(v.empty() ? 100 : pcx_parse_pct(v.c_str(), 100, 0, 100), -1); }
+static void live_mono(const std::string& v) { cellaudio_set_pc_mix(-1, v == "1"); }
+static void live_uiscale(const std::string& v) { posd_ui_scale_set(v.c_str()); }
+extern "C" void r2pf_overlay_graph_set(int on);                        /* r2_pcfeat.cpp */
+static void live_ovgraph(const std::string& v) { r2pf_overlay_graph_set(v != "0"); }
 static void opt_add(const wchar_t* title, const wchar_t* help, const char* ini, const char* env, int restart,
                     std::vector<XChoice> ch, const char* def, void (*live)(const std::string&))
 {
@@ -486,10 +629,20 @@ static void opts_init(void)
     opt_add(L"Cinematic black bars", L"Letterbox bars in in-engine cutscenes.", "fx_letterbox", ENVN("FX_LETTERBOX"), 0, onoff, "", live_fx_lbox);
     opt_add(L"Colour-blind filter", L"Daltonization filter on the final image.", "colorblind", ENVN("COLORBLIND"), 0,
             { {L"Off", ""}, {L"Protanopia (red)", "1"}, {L"Deuteranopia (green)", "2"}, {L"Tritanopia (blue)", "3"} }, "", live_cvd);
+    /* same key, values and env as launcher.cpp "gamma"; title / help as R1's row (R2/R3 apply it at the next start) */
+    opt_add(L"Brightness", L"Picture gamma on top of the game's own brightness option (SDR; in HDR use HDR paper white). Takes effect on restart.",
+            "gamma", "PS3_DISPLAY_GAMMA", 1,
+            { {L"Game default", ""}, {L"Brighter", "0.9"}, {L"Brightest", "0.8"}, {L"Darker", "1.1"}, {L"Darkest", "1.2"} }, "", NULL);
     opt_add(L"Crosshair", L"A small extra marker at the screen centre while on foot.", "crosshair", ENVN("CROSSHAIR"), 0,
             { {L"Off", ""}, {L"Dot", "dot"}, {L"Cross", "cross"} }, "", live_xhair);
+    opt_add(L"Crosshair colour", L"Colour of the extra crosshair (high-contrast choices; a dark outline is always drawn).", "xhair_color", ENVN("CROSSHAIR_COLOR"), 0,
+            { {L"White", ""}, {L"Green", "green"}, {L"Yellow", "yellow"}, {L"Cyan", "cyan"}, {L"Red", "red"}, {L"Pink", "pink"}, {L"Orange", "orange"} }, "", live_xhcolor);
+    opt_add(L"Crosshair size", L"Size of the extra crosshair.", "xhair_size", ENVN("CROSSHAIR_SIZE"), 0,
+            { {L"Small", ""}, {L"Medium", "medium"}, {L"Large", "large"}, {L"Huge", "huge"} }, "", live_xhsize);
     opt_add(L"Hold to skip movies", L"Hold Space / Enter / A / Menu for 1 s to skip a pre-rendered movie.", "cutscene_skip",
             ENVN("CUTSCENE_SKIP"), 0, onoff, "", live_cut);
+    opt_add(L"Skip unwatched movies", L"The hold also skips movies you have not seen yet (the game only allows watched ones). "
+            L"Needs Hold to skip movies.", "cutscene_skip_all", ENVN("CUTSCENE_SKIP_ALL"), 0, onoff, "", live_cut_all);
     opt_add(L"Skip intro logos", L"Skips the start-up logo movies.", "skipintro", ENVN("SKIP_INTRO"), 1, onoff, "", NULL);
     opt_add(L"Pause on controller loss", L"Pauses when the controller in use disconnects.", "pad_disconnect_pause",
             ENVN("PAD_DISCONNECT_PAUSE"), 0, onoff, "", live_dpause);
@@ -508,12 +661,28 @@ static void opts_init(void)
             { {L"1.0", ""}, {L"0.9", "0.9"}, {L"1.1", "1.1"}, {L"1.2", "1.2"} }, "", NULL);
     opt_add(L"NVIDIA Reflex", L"Low-latency mode (VK_NV_low_latency2, GeForce). Experimental.", "reflex", ENVN("REFLEX"), 1,
             { {L"Off", ""}, {L"On", "1"}, {L"On + Boost", "2"} }, "", NULL);
+    opt_add(L"Latency reduction", L"NVIDIA Reflex (GeForce), AMD Anti-Lag 2 (Radeon RX 5000+) or Auto (by GPU). Default: the Reflex row "
+            L"alone decides. Off while frame generation is on. Experimental.", "latency", "PORT_LATENCY", 1,
+            { {L"Default", ""}, {L"Off", "off"}, {L"NVIDIA Reflex", "reflex"}, {L"AMD Anti-Lag 2", "antilag"}, {L"Auto", "auto"} }, "", NULL);
     opt_add(L"Frame Generation", L"NVIDIA DLSS Frame Generation (RTX 40: 2x, RTX 50: up to 4x). Smoother when the CPU is the limit; "
             L"a little more input lag. Needs Anti-aliasing = NVIDIA DLSS. FSR 3 2x: AMD frame interpolation for other GPUs "
             L"(Anti-aliasing = FSR, DLSS or XeSS; no Reflex).", "dlss_fg", ENVN("DLSS_FG"), 1,
             { {L"Off", ""}, {L"2x", "2"}, {L"3x", "3"}, {L"4x", "4"}, {L"FSR 3 2x", "fsr3"} }, "", NULL);
+    opt_add(L"Frame generation backend", L"Auto: DLSS Frame Generation, else FSR 3 2x. DLSS only: no fallback. Takes effect on restart.",
+            "fg_backend", ENVN("FG_BACKEND"), 1,
+            { {L"Auto", ""}, {L"DLSS Frame Generation only", "dlss"}, {L"AMD FSR 3", "fsr3"} }, "", NULL);
+    /* launcher.cpp "language" (PS3_LANG, cellSysutil sysutil_language) */
+    opt_add(L"Game language", L"The language the game uses (text and speech it has). Takes effect on restart.",
+            "language", "PS3_LANG", 1,
+            { {L"Windows language", ""}, {L"English", "en"}, {L"English (UK)", "en-gb"}, {L"French", "fr"}, {L"Spanish", "es"},
+              {L"German", "de"}, {L"Italian", "it"}, {L"Portuguese (Brazil)", "pt-br"}, {L"Portuguese", "pt"}, {L"Dutch", "nl"},
+              {L"Russian", "ru"}, {L"Polish", "pl"} }, "", NULL);
     opt_add(L"Discord Rich Presence", L"Shows the game and level in Discord (needs discord_appid.txt or " ENVN("DISCORD_APPID") L").",
             "discord", ENVN("DISCORD"), 1, { {L"Off", ""}, {L"On", "1"} }, "", NULL);
+    opt_add(L"Benchmark capture key", L"Press to start recording frame times, again to stop: logs\\bench gets a summary (avg, 1% / 0.1% low, stutters) and a per-frame CSV.",
+            "benchkey", ENVN("BENCH_KEY"), 0, { {L"F11", ""}, {L"F6", "F6"}, {L"F5", "F5"}, {L"Off", "off"} }, "", live_benchkey);
+    opt_add(L"Remember window position", L"Windowed mode: reopen where the window was last left (window_pos.txt).", "winremember",
+            "RSX_WINDOW_REMEMBER", 1, { {L"On", ""}, {L"Off", "0"} }, "", NULL);
     /* controllers (SDL3 backend, cellPad.c); keys and values match the launcher's Controls page */
     opt_add(L"Controller support", L"SDL3: DualShock / DualSense / Switch / Xbox directly (prompts, rumble, light bar, gyro). "
             L"XInput: the old path.", "padbackend", "PAD_BACKEND", 1, { {L"SDL3", ""}, {L"XInput", "xinput"} }, "", NULL);
@@ -530,6 +699,39 @@ static void opts_init(void)
             { {L"Player colour", ""}, {L"Off", "0"} }, "", live_lightbar);
     opt_add(L"Nintendo button layout", L"Switch Pro / Joy-Con: Nintendo style confirms with A and shows Xbox-style letters.",
             "nswap", "PAD_NINTENDO_SWAP", 0, { {L"By position", ""}, {L"Nintendo style (A confirms)", "1"} }, "", live_nswap);
+    /* PC extras: keys and values match launcher.cpp register_input_options / register_pc_options */
+    opt_add(L"Vibration", L"Controller rumble strength.", "rumble", "PAD_RUMBLE", 0,
+            { {L"100%", ""}, {L"75%", "75"}, {L"50%", "50"}, {L"25%", "25"}, {L"Off", "0"} }, "", live_rumble);
+    opt_add(L"Confirm button", L"Which button accepts in the game's menus (Circle: Japanese PS3 layout). The game reads it at start-up.",
+            "enterbtn", "PS3_ENTER_BUTTON", 1, { {L"Cross", ""}, {L"Circle", "circle"} }, "", NULL);
+    opt_add(L"Controller in the background", L"Controller input while another window has the focus. Auto: only when "
+            L"\"When the game is in the background\" is Keep running or Mute only.", "padbg", "PAD_BACKGROUND_INPUT", 0,
+            { {L"Auto", ""}, {L"On", "1"}, {L"Off", "0"} }, "", live_padbg);
+    opt_add(L"Stick outer deadzone", L"How much of the stick's edge already counts as full deflection.", "outerdz",
+            "PAD_OUTER_DEADZONE", 0, { {L"Off", ""}, {L"5%", "5"}, {L"10%", "10"}, {L"15%", "15"} }, "", live_outerdz);
+    opt_add(L"Stick anti-deadzone", L"Skips the game's own deadzone: the smallest stick movement already moves.", "antidz",
+            "PAD_ANTI_DEADZONE", 0, { {L"Off", ""}, {L"10%", "10"}, {L"20%", "20"}, {L"30%", "30"} }, "", live_antidz);
+    opt_add(L"Trigger deadzone", L"How far a trigger must be pulled before it counts.", "trigdz", "PAD_TRIGGER_DEADZONE", 0,
+            { {L"Off", ""}, {L"10%", "10"}, {L"20%", "20"}, {L"30%", "30"} }, "", live_trigdz);
+    opt_add(L"Turn boost", L"Extra turning speed (degrees per second) while the right stick is held at the edge. Not while aiming.",
+            "turnboost", "PAD_TURN_BOOST", 0, { {L"Off", ""}, {L"90", "90"}, {L"180", "180"}, {L"270", "270"} }, "", live_turnboost);
+    opt_add(L"Crouch button (L2)", L"As the game, Toggle (press on / press off) or Hold (crouch while held). L2 also sprints "
+            L"while running, so Toggle / Hold change that too. Experimental.",
+            "crouchmode", "PAD_CROUCH_MODE", 0, { {L"As the game", ""}, {L"Toggle", "toggle"}, {L"Hold", "hold"} }, "", live_crouch);
+    opt_add(L"Sprint button", L"As the game, or Toggle: a started sprint (L2 held while running) keeps going until you stop or press L2 again; "
+            L"a tap still crouches. Not used when Crouch button is Toggle / Hold. Experimental.",
+            "sprintmode", "PAD_SPRINT_MODE", 0, { {L"As the game", ""}, {L"Toggle", "toggle"} }, "", live_sprint);
+    opt_add(L"Master volume", L"All game sound, on top of the game's own volume options.", "volume", "PORT_VOLUME", 0,
+            { {L"100%", ""}, {L"90%", "90"}, {L"80%", "80"}, {L"70%", "70"}, {L"60%", "60"}, {L"50%", "50"}, {L"40%", "40"},
+              {L"30%", "30"}, {L"20%", "20"}, {L"10%", "10"}, {L"Muted", "0"} }, "", live_volume);
+    opt_add(L"Mono audio", L"Mixes all channels to both ears (hearing in one ear).", "audio_mono", "PORT_AUDIO_MONO", 0,
+            { {L"Off", ""}, {L"On", "1"} }, "", live_mono);
+    opt_add(L"UI scale", L"Size of the PC menus and overlays. Auto grows them on 1440p / 4K screens. The F3 overlay and "
+            L"notifications change at the next start.", "uiscale", "PORT_UI_SCALE", 0,
+            { {L"Auto", ""}, {L"75%", "75"}, {L"100%", "100"}, {L"125%", "125"}, {L"150%", "150"}, {L"175%", "175"},
+              {L"200%", "200"} }, "", live_uiscale);
+    opt_add(L"Frame-time graph", L"A graph of the last 120 frame times under the F3 performance overlay.", "ovgraph",
+            "PORT_OVERLAY_GRAPH", 0, { {L"On", ""}, {L"Off", "0"} }, "", live_ovgraph);
 }
 enum { PG_MAIN, PG_KEYS, PG_PAD };
 static int s_open = 0, s_page = PG_MAIN, s_sel = 0, s_top = 0, s_capture = 0, s_release = 0;
@@ -729,6 +931,7 @@ static void ov_show(int kind)
         h = std::max(kind == 2 ? 56 : 130, ch * (kind == 2 ? 8 : 20) / 100);
         x = (cw - w) / 2; y = kind == 2 ? ch * 4 / 100 : (ch - h) / 2;
     }
+    posd_ui_scale_rect(&x, &y, &w, &h, cw, ch, kind == 2);   /* PORT_UI_SCALE */
     s_ov_kind = kind; s_ov_cw = cw; s_ov_ch = ch;
     s_ov_osd = posd_on();
     if (s_ov_osd) {
@@ -811,16 +1014,47 @@ static int edges(int in)
     s_prev_in = in;
     return e;
 }
-static void opt_change(int i, int d)
+static void opt_commit(int i)
 {
     XOpt& o = s_opts[i];
-    const int n = (int)o.ch.size();
-    o.sel = (o.sel + d + n) % n;
     const std::string& v = o.ch[o.sel].value;
     ini_set(o.ini, v);
     bat_set(o.env, v);
     if (o.live) o.live(v);
     LOG("%ls = %ls%s", o.title, o.ch[o.sel].label.c_str(), o.restart ? " (next start)" : "");
+}
+static void opt_change(int i, int d)
+{
+    XOpt& o = s_opts[i];
+    const int n = (int)o.ch.size();
+    o.sel = (o.sel + d + n) % n;
+    opt_commit(i);
+}
+/* value-based access for the PC pages of the game's own options screen (r2_menurows.cpp) */
+extern "C" int pcx_opt_find(const char* ini)
+{
+    opts_init();
+    if (!ini) return -1;
+    for (size_t i = 0; i < s_opts.size(); i++) if (!strcmp(s_opts[i].ini, ini)) return (int)i;
+    return -1;
+}
+extern "C" int pcx_opt_value(int i, char* out, int n)
+{
+    opts_init();
+    if (i < 0 || i >= (int)s_opts.size() || n <= 0) return 0;
+    snprintf(out, n, "%s", s_opts[i].ch[s_opts[i].sel].value.c_str());
+    return 1;
+}
+extern "C" void pcx_opt_set_value(int i, const char* v)
+{
+    opts_init();
+    if (i < 0 || i >= (int)s_opts.size() || !v) return;
+    XOpt& o = s_opts[i];
+    for (size_t k = 0; k < o.ch.size(); k++)
+        if (!_stricmp(o.ch[k].value.c_str(), v)) {
+            if ((int)k != o.sel) { o.sel = (int)k; opt_commit(i); }
+            return;
+        }
 }
 static void pad_change(int i, int d)
 {
@@ -896,18 +1130,28 @@ static void menu_tick(int focused)
 
 /* ---- crosshair: a click-through colour-keyed window (or OSD layer) at the centre ---- */
 static HWND s_xh = NULL; static int s_xh_kind = -1;
+static unsigned s_xh_krgb = 0; static int s_xh_kscale = 0;    /* colour / size the marker was last drawn with */
+static int xh_px(void) { return (24 * s_xh_scale / 100 + 1) & ~1; }   /* canvas side: 24 px at 100 % */
 static void xh_draw(HDC dc, const RECT& rc)
 {
     HBRUSH k = CreateSolidBrush(RGB(255, 0, 255)); FillRect(dc, &rc, k); DeleteObject(k);
     const int c = rc.right / 2;
-    HBRUSH o = CreateSolidBrush(RGB(0, 0, 0)), f = CreateSolidBrush(RGB(240, 240, 240));
+    const double s = s_xh_scale / 100.0;
+    auto px = [&](double v) { return (int)floor(v * s + 0.5); };
+    const int ol = std::max(1, px(1));           /* dark outline width */
+    HBRUSH o = CreateSolidBrush(RGB(0, 0, 0)),
+           f = CreateSolidBrush(RGB((s_xh_rgb >> 16) & 255, (s_xh_rgb >> 8) & 255, s_xh_rgb & 255));
     if (s_xh_kind == 1) {
-        RECT a = { c - 3, c - 3, c + 3, c + 3 }; FillRect(dc, &a, o); RECT b = { c - 2, c - 2, c + 2, c + 2 }; FillRect(dc, &b, f);
+        const int h = std::max(2, px(3));
+        RECT a = { c - h, c - h, c + h, c + h }; FillRect(dc, &a, o);
+        RECT b = { c - h + ol, c - h + ol, c + h - ol, c + h - ol }; FillRect(dc, &b, f);
     } else {
-        RECT a = { c - 10, c - 2, c - 3, c + 2 }, b = { c + 3, c - 2, c + 10, c + 2 }, d = { c - 2, c - 10, c + 2, c - 3 }, e = { c - 2, c + 3, c + 2, c + 10 };
-        for (RECT* r : { &a, &b, &d, &e }) { FillRect(dc, r, o); RECT in = { r->left + 1, r->top + 1, r->right - 1, r->bottom - 1 }; FillRect(dc, &in, f); }
+        const int n = px(3), x = px(10), w = std::max(2, px(2));
+        RECT a = { c - x, c - w, c - n, c + w }, b = { c + n, c - w, c + x, c + w }, d = { c - w, c - x, c + w, c - n }, e = { c - w, c + n, c + w, c + x };
+        for (RECT* r : { &a, &b, &d, &e }) { FillRect(dc, r, o); RECT in = { r->left + ol, r->top + ol, r->right - ol, r->bottom - ol }; FillRect(dc, &in, f); }
     }
     DeleteObject(o); DeleteObject(f);
+    s_xh_krgb = s_xh_rgb; s_xh_kscale = s_xh_scale;
 }
 static LRESULT CALLBACK xh_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
@@ -924,17 +1168,18 @@ static void crosshair_tick(int show)
     if (!show) { if (s_xh && IsWindowVisible(s_xh)) ShowWindow(s_xh, SW_HIDE); r2rsx_osd_hide(POSD_XHAIR); return; }
     RECT rc; GetClientRect(s_game, &rc);
     const int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+    const int sz = xh_px(), changed = s_xh_kind != s_crosshair || s_xh_krgb != s_xh_rgb || s_xh_kscale != s_xh_scale;
     if (posd_on()) {
         if (s_xh && IsWindowVisible(s_xh)) ShowWindow(s_xh, SW_HIDE);
         static int kcw = 0, kch = 0;
-        if (s_xh_kind != s_crosshair || cw != kcw || ch != kch || !r2rsx_osd_visible(POSD_XHAIR)) {
+        if (changed || cw != kcw || ch != kch || !r2rsx_osd_visible(POSD_XHAIR)) {
             s_xh_kind = s_crosshair; kcw = cw; kch = ch;
             if (s_xh) InvalidateRect(s_xh, NULL, TRUE);
             PosdCanvas c;
-            if (!c.begin(24, 24)) return;
-            const RECT r = { 0, 0, 24, 24 };
+            if (!c.begin(sz, sz)) return;
+            const RECT r = { 0, 0, sz, sz };
             xh_draw(c.dc, r);
-            c.commit(POSD_XHAIR, cw / 2 - 12, ch / 2 - 12, cw, ch, 220 / 255.f, RGB(255, 0, 255));
+            c.commit(POSD_XHAIR, cw / 2 - sz / 2, ch / 2 - sz / 2, cw, ch, 220 / 255.f, RGB(255, 0, 255));
         }
         return;
     }
@@ -943,18 +1188,19 @@ static void crosshair_tick(int show)
         WNDCLASSEXW wc = { sizeof wc }; wc.lpfnWndProc = xh_proc; wc.hInstance = GetModuleHandleW(NULL); wc.lpszClassName = L"pcx_crosshair";
         RegisterClassExW(&wc);
         s_xh = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
-                               L"pcx_crosshair", L"", WS_POPUP, 0, 0, 24, 24, s_game, NULL, wc.hInstance, NULL);
+                               L"pcx_crosshair", L"", WS_POPUP, 0, 0, sz, sz, s_game, NULL, wc.hInstance, NULL);
         if (!s_xh) return;
         SetLayeredWindowAttributes(s_xh, RGB(255, 0, 255), 220, LWA_COLORKEY | LWA_ALPHA);
     }
-    if (s_xh_kind != s_crosshair) { s_xh_kind = s_crosshair; InvalidateRect(s_xh, NULL, TRUE); }
+    if (changed) { s_xh_kind = s_crosshair; s_xh_krgb = s_xh_rgb; s_xh_kscale = s_xh_scale; InvalidateRect(s_xh, NULL, TRUE); }
     POINT c = { cw / 2, ch / 2 }; ClientToScreen(s_game, &c);
-    SetWindowPos(s_xh, HWND_TOPMOST, c.x - 12, c.y - 12, 24, 24, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(s_xh, HWND_TOPMOST, c.x - sz / 2, c.y - sz / 2, sz, sz, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
-
 /* ======================================================================
  * The per-tick driver, called at the end of r2_pcport.cpp ui_tick */
-static int s_init = 0, s_disc_paused = 0, s_photo_ov = 0;
+static int s_init = 0, s_disc_paused = 0, s_photo_ov = 0, s_photo_hide = 0;
+/* R2_PHOTO_HIDE_HUD: 1 = enabled, 2 = enabled and photo mode on (VKR2FrameGen.cpp r2fg_photo_source) */
+extern "C" { volatile int g_port_photo_hud = 0; }
 static void init_once(void)
 {
     if (s_init) return;
@@ -962,6 +1208,8 @@ static void init_once(void)
     opts_init();
     for (auto& o : s_opts) if (o.live) o.live(o.ch[o.run].value);   /* apply the start-up values */
     s_photo_allowed = envi("PHOTO", 1) != 0;
+    s_photo_hide = s_photo_allowed && envi("PHOTO_HIDE_HUD", 1) != 0;
+    g_port_photo_hud = s_photo_hide ? 1 : 0;
     if (envi("DISCORD", 0)) { HANDLE t = CreateThread(NULL, 0, discord_thread, NULL, 0, NULL); if (t) CloseHandle(t); }
     s_bench = envi("BENCH", 0) != 0;
     if (s_bench) {
@@ -974,8 +1222,39 @@ static void init_once(void)
         s_bench_t0 = now_s() - since;            /* the script is timed from process start */
         LOG("benchmark mode: %zu steps, then %.0f s", s_bench_steps.size(), s_bench_secs);
     }
-    LOG("extras: F9 / PC menu -> More PC Options; photo mode %s (F7); cutscene skip %s; crosshair %d; pause on pad loss %s",
-        s_photo_allowed ? "on" : "off", s_cut_skip ? "on" : "off", s_crosshair, s_disc_pause_on ? "on" : "off");
+    LOG("extras: F9 / PC menu -> More PC Options; photo mode %s (F7);     cutscene skip %s (unwatched too: %s); crosshair %d; pause on pad loss %s",
+            s_photo_allowed ? "on" : "off", s_cut_skip ? "on" : "off", s_cut_skip_all ? "yes" : "no", s_crosshair, s_disc_pause_on ? "on" : "off");
+    if (skip_test_unseen()) LOG("PORT_SKIP_TEST_UNSEEN=1: test mode, every movie's skip check answers \"not watched\" (unless Skip unwatched movies overrides it)");
+}
+/* Skip unwatched movies. The game's movie update (func_002CAD1C) skips a movie when the skip
+ * button is pressed and is_fmv_seen(fmv_index(name)) (func_002AB8EC; profile bitfield, set by
+ * func_002AB968 when a movie ends) says it was watched. The hook in tools/hooks/r2.json passes
+ * that answer through here, at that one call only (the Cinematics menu's unlock list keeps the
+ * real bits). It is turned into "watched" only while the hold above is pulsing (so never in
+ * gameplay: the look guard applies) and both options are on. The game then takes its own skip
+ * path, the same one as for a watched movie, and marks the movie watched as it ends. */
+extern "C" uint64_t r2x_movie_seen(uint64_t seen)
+{
+    /* PORT_SKIP_TEST_UNSEEN=1 (test only): every movie answers "not watched" here, so the override
+     * below can be tested on a profile that has seen them all. Only this check's answer changes: the
+     * game still marks movies watched as before (func_002AB968). */
+    if (skip_test_unseen()) {
+        static ULONGLONG told = (ULONGLONG)-1;
+        if (told != s_movie_t0) { told = s_movie_t0; LOG("skip test: movie forced to unwatched (game said %s)", (seen & 0xFF) ? "watched" : "not watched"); }
+        seen = 0;
+    }
+    const ULONGLONG f = s_skip_fire_ms;
+    if (!s_cut_skip || s_movie_slot < 0 || !f || GetTickCount64() - f > 300) return seen;
+    if (seen & 0xFF) {
+        if (!s_skip_mech) { s_skip_mech = 1; LOG("movie skip: already watched, the game skips it"); }
+        return seen;
+    }
+    if (!s_cut_skip_all) {
+        if (s_skip_mech != -1) { s_skip_mech = -1; LOG("movie skip: not watched yet and Skip unwatched movies is off"); }
+        return seen;
+    }
+    if (s_skip_mech != 2) { s_skip_mech = 2; LOG("movie skip: not watched yet, watched-check overridden (func_002CAD1C @ 0x002CAFC8)"); }
+    return 1;
 }
 static int s_want_pause = 0;
 extern "C" int r2x_want_pause(void) { return s_want_pause; }
@@ -986,6 +1265,7 @@ extern "C" void r2x_ui_tick(void* hwnd_, int focused, int other_prompt)
     init_once();
     const ULONGLONG now = GetTickCount64();
     bench_tick(hwnd);
+    bench_key_tick(focused, other_prompt);
 
     /* F9: the extras menu directly; F10 -> More PC Options opens it from the PC menu */
     { static int was = 0; const int d = focused && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
@@ -1022,7 +1302,8 @@ extern "C" void r2x_ui_tick(void* hwnd_, int focused, int other_prompt)
                             ov_show(2); s_photo_ov = 1; LOG("photo mode on"); }
           else { r2pf_overlay_set(ov_was); ov_hide(); s_photo_ov = 0; s_release = 1; LOG("photo mode off"); }
       }
-      was = d; }
+      was = d;
+      if (s_photo_hide) g_port_photo_hud = s_photo_on ? 2 : 1; }
     /* the note fades after 2 s so it is not in the way (screenshots never include it) */
     { static ULONGLONG t_on = 0;
       if (s_photo_on && s_photo_ov) { if (!t_on) t_on = now; if (now - t_on > 2000) { ov_hide(); s_photo_ov = 0; } }
@@ -1040,21 +1321,43 @@ extern "C" void r2x_ui_tick(void* hwnd_, int focused, int other_prompt)
       }
       was_conn = conn; }
 
-    /* hold to skip a pre-rendered movie */
-    if (s_cut_skip && s_movie_slot >= 0 && !s_open) {
-        static ULONGLONG held_since = 0, told = 0;
+    /* hold to skip a pre-rendered movie (with PORT_MOVIE_TRACK on: never while the on-foot look code
+     * runs, so a leaked movie handle cannot turn a held A into Start presses in play) */
+    static ULONGLONG skip_held_since = 0;
+    if (s_cut_skip && s_movie_slot >= 0 && !s_open &&
+        !(movie_track() && g_r2_look_ms && now - g_r2_look_ms < 250)) {
+        static ULONGLONG told = 0;
+        ULONGLONG& held_since = skip_held_since;
         const WORD b = xi_raw(NULL);
         const int held = (focused && ((GetAsyncKeyState(VK_SPACE) & 0x8000) || (GetAsyncKeyState(VK_RETURN) & 0x8000))) ||
                          (b & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_START));
         if (told != s_movie_t0 && now - s_movie_t0 > 500) { told = s_movie_t0; if (skip_hint_on()) r2pf_hint("Cutscene", "Hold Space / A to skip", 4000); }
         if (!held) held_since = 0;
         else if (!held_since) held_since = now;
-        else if (now - held_since >= 1000 && (now - held_since) % 400 < 120) {
-            g_pad_inj_sticks = 0x80808080u;
-            g_pad_inj_btn = ((now - held_since) / 400) & 1 ? 0x4000u /* CROSS */ : 0x0008u /* START */;
-            g_pad_inj_until = now + 80;
+        else if (now - held_since >= 1000) {
+            s_skip_fire_ms = now;
+            /* issue #6: A = Cross and Menu = Start (and Space / Enter = Cross in menus) are the held
+             * button itself, so a pulse of the same button had no press edge. While skipping, Cross
+             * and Start read as released between pulses. PORT_SKIP_CLEAR=0: the old OR-only pulses. */
+            static int clear_on = -1;
+            if (clear_on < 0) { const char* e = getenv("PORT_SKIP_CLEAR"); clear_on = (e && *e) ? atoi(e) != 0 : 1; }
+            const int pulse = (now - held_since) % 400 < 120;
+            if (pulse || clear_on) {
+                g_pad_inj_sticks = 0x80808080u;
+                g_pad_inj_clear = clear_on ? 0x4008u /* CROSS | START */ : 0;
+                g_pad_inj_btn = !pulse ? 0 : ((now - held_since) / 400) & 1 ? 0x4000u /* CROSS */ : 0x0008u /* START */;
+                g_pad_inj_until = now + (pulse ? 80 : 30);
+            }
+            static ULONGLONG logged = 0;
+            if (logged != s_movie_t0) { logged = s_movie_t0; LOG("movie skip: held 1 s, pulsing Start / Cross"); }
+            /* the override was used but the movie is still open well after: say so (no other way to end it) */
+            static ULONGLONG warned = 0;
+            if (s_skip_mech == 2 && warned != s_movie_t0 && now - held_since > 5000) {
+                warned = s_movie_t0; LOG("movie skip: watched-check overridden 4 s ago, movie still open");
+            }
         }
     }
+    else if (movie_track()) skip_held_since = 0;   /* no movie / guard blocked: the next movie needs a fresh 1 s hold */
 
     const int on_foot = g_r2_look_ms && now - g_r2_look_ms < 250;
     crosshair_tick(s_crosshair && focused && on_foot && !s_open && !s_photo_on && !other_prompt);

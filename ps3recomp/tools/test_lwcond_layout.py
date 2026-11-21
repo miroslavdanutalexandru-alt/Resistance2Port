@@ -39,7 +39,20 @@ static void vm_write32(uint32_t a, uint32_t v) { for (int i = 0; i < 4; i++) mem
 static void vm_write64(uint32_t a, uint64_t v) { vm_write32(a, (uint32_t)(v >> 32)); vm_write32(a + 4, (uint32_t)v); }
 static uint32_t vm_read32(uint32_t a) { return (uint32_t)mem[a] << 24 | mem[a + 1] << 16 | mem[a + 2] << 8 | mem[a + 3]; }
 static uint64_t vm_read64(uint32_t a) { return (uint64_t)vm_read32(a) << 32 | vm_read32(a + 4); }
-struct ppu_context { uint64_t gpr[32]; uint32_t thread_id; };
+struct ppu_context { uint64_t gpr[32]; uint32_t thread_id; uint64_t lr; };
+/* Host primitives and wait statistics the wait body touches; inert here. */
+typedef long LONG;
+typedef void VOID;
+union LARGE_INTEGER { long long QuadPart; };
+static void QueryPerformanceCounter(LARGE_INTEGER* q) { q->QuadPart = 0; }
+static int WaitOnAddress(volatile VOID*, void*, unsigned long long, unsigned) { return 1; }
+struct ps3_waitstat { unsigned long long lwc_wait_n, lwc_wait_qpc; };
+static ps3_waitstat* ps3_waitstat_self() { return nullptr; }
+static void port_hitch_guest_wait(uint32_t, long long) {}
+static volatile LONG s_lwc_seq_stub;
+static volatile LONG* lwc_seq(uint32_t) { return &s_lwc_seq_stub; }
+static int lwc_wake_on() { return 0; }
+static unsigned lwc_wait_ms(uint64_t) { return 1; }
 /* The lwmutex side of sys_lwcond_wait: record which lwmutex it asked for and
  * hand back no semaphore, so the wait returns at once. */
 typedef void* HANDLE;
@@ -50,6 +63,7 @@ static uint32_t s_asked = 0xFFFFFFFFu;
 static HANDLE lwm_sem(uint32_t lwmutex) { s_asked = lwmutex; return nullptr; }
 static void ReleaseSemaphore(HANDLE, long, void*) {}
 static void Sleep(unsigned) {}
+static void port_sleep_1ms() {}
 static unsigned WaitForSingleObject(HANDLE, unsigned) { return 0; }
 %s
 %s

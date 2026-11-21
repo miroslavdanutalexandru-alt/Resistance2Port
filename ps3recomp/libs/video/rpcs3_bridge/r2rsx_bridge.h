@@ -37,6 +37,8 @@ void r2rsx_set_flip_mode(uint32_t mode);            /* CELL_GCM_DISPLAY_VSYNC = 
 uint32_t r2rsx_get_flip_status(void);               /* 0 = DONE */
 void r2rsx_set_flip_status(uint32_t status);
 uint64_t r2rsx_last_flip_time(void);
+/* Flip commands rsx::thread has executed (r2_hot occlusion fence); UINT64_MAX = no RPCS3 renderer (stub, or not up). */
+uint64_t r2rsx_flips_executed(void);
 uint64_t r2rsx_vblank_count(void);
 uint32_t r2rsx_current_display_buffer(void);
 

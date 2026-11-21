@@ -1,5 +1,47 @@
 {
  "funcs": {
+  "func_002CAD1C": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_002CAD1C(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" uint64_t r2x_movie_seen(uint64_t seen);   /* R2: Skip unwatched movies (project/r2_pcextra.cpp, R2_CUTSCENE_SKIP_ALL) */",
+     "void func_002CAD1C(ppu_context* ctx) {"
+    ]
+   },
+   {
+    "at": 208,
+    "ctx": "        ctx->gpr[3] = R_3 = ppc_rldicl(R_3, 0, 32);",
+    "rm": [
+     "        ctx->lr = R_lr = 0x002CAFCC; func_002AB8EC(ctx); DRAIN_TRAMPOLINE(ctx); _RCX_RL;"
+    ],
+    "add": [
+     "        ctx->lr = R_lr = 0x002CAFCC; func_002AB8EC(ctx); DRAIN_TRAMPOLINE(ctx); _RCX_RL;",
+     "        ctx->gpr[3] = R_3 = r2x_movie_seen(R_3);   /* R2: is_fmv_seen() of the movie skip check -> \"watched\" while the port's hold-to-skip fires */"
+    ]
+   }
+  ],
+  "func_002D23C4": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_002D23C4(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" int r2_menu_rows_cmd(ppu_context* ctx);   /* R2: PC settings pages of the options screen (r2_menurows.cpp) */",
+     "static void func_002D23C4_body(ppu_context* ctx);",
+     "void func_002D23C4(ppu_context* ctx) {",
+     "        if (r2_menu_rows_cmd(ctx)) return;",
+     "        func_002D23C4_body(ctx);",
+     "}",
+     "static void func_002D23C4_body(ppu_context* ctx) {"
+    ]
+   }
+  ],
   "func_0068AF40": [
    {
     "at": 0,
@@ -11,6 +53,20 @@
      "extern \"C\" void r2_text_patch(uint32_t file_obj);   /* R2: button glyphs -> key names (stubs.cpp) */",
      "void func_0068AF40(ppu_context* ctx) {",
      "        r2_text_patch((uint32_t)ctx->gpr[3]);"
+    ]
+   }
+  ],
+  "func_00769378": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_00769378(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" void r2_menu_rows_screen(ppu_context* ctx);   /* R2: main menu \"PC SETTINGS\" entry -> AVOptions on the PC pages (r2_menurows.cpp) */",
+     "void func_00769378(ppu_context* ctx) {",
+     "        r2_menu_rows_screen(ctx);"
     ]
    }
   ],
@@ -920,6 +976,76 @@
      "extern \"C\" int r2_hot_gstrcmp(ppu_context* ctx);   /* R2: native game strcmp (project/r2_hot.cpp, R2_HOT_NATIVE) */",
      "void func_006BB908(ppu_context* ctx) {",
      "        if (r2_hot_gstrcmp(ctx)) return;"
+    ]
+   }
+  ],
+  "func_0079F394": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_0079F394(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" int r2_hot_min6(ppu_context* ctx);   /* R2: native u16 min-of-6 (project/r2_hot.cpp, R2_HOT_NATIVE + R2_HOT_*) */",
+     "void func_0079F394(ppu_context* ctx) {",
+     "        if (r2_hot_min6(ctx)) return;"
+    ]
+   }
+  ],
+  "func_00AF2700": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_00AF2700(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" int r2_hot_bitscan(ppu_context* ctx);   /* R2: native bitmap scan (project/r2_hot.cpp, R2_HOT_NATIVE + R2_HOT_*) */",
+     "void func_00AF2700(ppu_context* ctx) {",
+     "        if (r2_hot_bitscan(ctx)) return;"
+    ]
+   }
+  ],
+  "func_00B15354": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_00B15354(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" int r2_hot_u16min(ppu_context* ctx);   /* R2: native u16 min (project/r2_hot.cpp, R2_HOT_NATIVE + R2_HOT_*) */",
+     "void func_00B15354(ppu_context* ctx) {",
+     "        if (r2_hot_u16min(ctx)) return;"
+    ]
+   }
+  ],
+  "func_00A92CDC": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_00A92CDC(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" int r2_hot_gcmtex(ppu_context* ctx);   /* R2: native gcm SET_TEXTURE (project/r2_hot.cpp, R2_HOT_NATIVE + R2_HOT_*) */",
+     "void func_00A92CDC(ppu_context* ctx) {",
+     "        if (r2_hot_gcmtex(ctx)) return;"
+    ]
+   }
+  ],
+  "func_00AD74F4": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_00AD74F4(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" int r2_hot_gcmvpc(ppu_context* ctx);   /* R2: native gcm constant load (project/r2_hot.cpp, R2_HOT_NATIVE + R2_HOT_*) */",
+     "void func_00AD74F4(ppu_context* ctx) {",
+     "        if (r2_hot_gcmvpc(ctx)) return;"
     ]
    }
   ]

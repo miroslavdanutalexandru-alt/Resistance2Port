@@ -12,6 +12,10 @@
 // A folder whose name starts with '_' or '-' is skipped (disabled). The overrides are listed in
 // the log at start-up.
 //
+// mods\order.txt (written by the launcher's Mods list, optional): one folder name per line, applied
+// in that order (a later line wins); "-Name" disables a mod, '#' starts a comment. Mods it does not
+// list follow, alphabetically (ps3emu/port_pc_extras.h pcx_mod_rank).
+//
 // Single members of a .psarc archive: a FOLDER named like the archive holds the members to
 // replace, by their path inside it, and single assets of a level .dat file by tuid
 // (mods_psarc.h, docs/MODDING.md):
@@ -21,6 +25,13 @@
 //
 // The game then opens a patched copy of the archive, built on first use and kept in
 // mods\.cache\ until the archive or a mod file changes.
+//
+// Built in (R2_MENU_ROWS, on unless =0, also without R2_MODS): the options screen movie
+// scaleform/avoptions.swf of packed/game/global_cached.psarc, patched with the PC settings pages
+// (r2_menurows.cpp), and with R2_MENU_ROWS=1 (the default) scaleform/mainmenu.swf, patched with an
+// Options > PC SETTINGS entry, and scaleform/pausemenu.swf, patched with a PAUSE > PC SETTINGS entry
+// (the pause menu's own options panel on the PC pages), written to mods\pc_menu\ and added to that archive's plan (before
+// the user's mods: a mod replacing the same member wins and that part is left out).
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
@@ -32,8 +43,17 @@
 #include <algorithm>
 #include <mutex>
 #include "mods_psarc.h"
+#include "ps3emu/port_pc_extras.h"
 
 extern "C" void (*volatile g_vfs_override_hook)(char* path, size_t cap);   // runtime/syscalls/sys_fs.c
+bool r2_menu_rows_enabled();                                                  // r2_menurows.cpp
+int r2_menu_rows_mode();
+void r2_menu_rows_set_entry(bool on);
+void r2_menu_rows_set_pages(bool on);
+void r2_menu_rows_set_pause_entry(bool on);
+bool r2_menu_rows_patch_swf(const std::vector<uint8_t>& in, std::vector<uint8_t>& out, std::string* why);
+bool r2_menu_rows_patch_mainmenu(const std::vector<uint8_t>& in, std::vector<uint8_t>& out, std::string* why);
+bool r2_menu_rows_patch_pausemenu(const std::vector<uint8_t>& in, std::vector<uint8_t>& out, std::string* why);
 
 namespace {
 
@@ -46,6 +66,7 @@ struct ArchivePlan {
     modpsarc::Plan plan;
     std::string built;   // patched copy, once made
     bool tried = false;
+    bool pc_menu = false;   // add the patched options movie (built in, r2_menurows.cpp)
 };
 std::map<std::string, ArchivePlan> s_archives;
 std::mutex s_archive_mtx;
@@ -80,11 +101,25 @@ void build_index(const std::string& root)
         do {
             if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
             if (fd.cFileName[0] == '.' || fd.cFileName[0] == '_' || fd.cFileName[0] == '-') continue;
+            if (!_stricmp(fd.cFileName, "pc_menu")) continue;   // built in, written by add_pc_menu
             mods.push_back(fd.cFileName);
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
-    std::sort(mods.begin(), mods.end(), [](const std::string& a, const std::string& b) { return _stricmp(a.c_str(), b.c_str()) < 0; });
+    std::string order;
+    if (FILE* f = fopen((root + "\\order.txt").c_str(), "rb")) {
+        char b[4096]; size_t n;
+        while ((n = fread(b, 1, sizeof b, f)) > 0) order.append(b, n);
+        fclose(f);
+    }
+    const auto rank = [&](const std::string& m) { const int r = pcx_mod_rank(order.c_str(), m.c_str()); return r == -2 ? 1 << 20 : r; };
+    mods.erase(std::remove_if(mods.begin(), mods.end(), [&](const std::string& m) {
+        if (rank(m) != -1) return false;
+        fprintf(stderr, "[mods] %s: disabled in order.txt\n", m.c_str());
+        return true; }), mods.end());
+    std::sort(mods.begin(), mods.end(), [&](const std::string& a, const std::string& b) {
+        const int ra = rank(a), rb = rank(b);
+        return ra != rb ? ra < rb : _stricmp(a.c_str(), b.c_str()) < 0; });
     for (const auto& m : mods) {
         std::map<std::string, std::string> files;
         scan(root + "\\" + m, "", files);
@@ -133,6 +168,109 @@ const char* game_rel(const char* p)
     return nullptr;
 }
 
+const char kPcMenuArchive[] = "usrdir/packed/game/global_cached.psarc";
+const char kPcMenuMember[] = "scaleform/avoptions.swf";
+const char kPcEntryMember[] = "scaleform/mainmenu.swf";
+const char kPcPauseMember[] = "scaleform/pausemenu.swf";
+
+bool write_if_changed(const std::string& path, const std::vector<uint8_t>& data)
+{
+    if (FILE* f = fopen(path.c_str(), "rb")) {
+        std::vector<uint8_t> old;
+        fseek(f, 0, SEEK_END); const long n = ftell(f); fseek(f, 0, SEEK_SET);
+        if (n > 0) { old.resize((size_t)n); if (fread(old.data(), 1, old.size(), f) != old.size()) old.clear(); }
+        fclose(f);
+        if (old == data) return true;   // unchanged: keeps its time, so the cached archive stays valid
+    }
+    for (size_t i = 0; i < path.size(); i++)
+        if (path[i] == '\\' && i > 2) CreateDirectoryA(path.substr(0, i).c_str(), nullptr);
+    const std::string tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    const bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
+    if (fclose(f) != 0 || !ok || !MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) { DeleteFileA(tmp.c_str()); return false; }
+    return true;
+}
+
+// R2_MENU_ROWS=1: the main menu's Options list gets a "PC SETTINGS" entry (mainmenu.swf patched
+// the same way). Without it the pages stay behind L1 / R1 on Options > Audio/Visual.
+void add_pc_entry(ArchivePlan& ap, const std::string& base)
+{
+    std::string why;
+    for (const auto& m : ap.plan.members)
+        if (m.member == kPcEntryMember) {
+            fprintf(stderr, "[menurows] PC SETTINGS entry: a mod replaces %s; the PC pages stay on Options > Audio/Visual (L1 / R1)\n", kPcEntryMember);
+            return;
+        }
+    std::vector<uint8_t> swf, out;
+    if (!modpsarc::read_member(base, kPcEntryMember, swf)) why = "cannot read " + std::string(kPcEntryMember) + " from " + base;
+    else if (!r2_menu_rows_patch_mainmenu(swf, out, &why)) why = "patch: " + why;
+    else {
+        std::string path = s_root + "\\pc_menu\\USRDIR\\packed\\game\\global_cached.psarc\\scaleform\\mainmenu.swf";
+        if (!write_if_changed(path, out)) why = "cannot write " + path;
+        else if (!modpsarc::plan_add(ap.plan, kPcEntryMember, path, &why)) why = "plan: " + why;
+        else {
+            r2_menu_rows_set_entry(true);
+            fprintf(stderr, "[menurows] main menu: Options > PC SETTINGS added (%zu -> %zu bytes)\n", swf.size(), out.size());
+            return;
+        }
+    }
+    fprintf(stderr, "[menurows] PC SETTINGS entry: %s; the PC pages stay on Options > Audio/Visual (L1 / R1)\n", why.c_str());
+}
+
+// R2_MENU_ROWS=1: the in-game pause menu gets a "PC SETTINGS" entry after OPTIONS (pausemenu.swf
+// patched); it opens the pause menu's own options panel on the PC category list and pages.
+void add_pc_pause(ArchivePlan& ap, const std::string& base)
+{
+    const char* const kFallback = "in game the PC settings stay on F10 / hold View + Menu";
+    for (const auto& m : ap.plan.members)
+        if (m.member == kPcPauseMember) {
+            fprintf(stderr, "[menurows] pause menu: a mod replaces %s, no PC SETTINGS entry; %s\n", kPcPauseMember, kFallback);
+            return;
+        }
+    std::string why;
+    std::vector<uint8_t> swf, out;
+    if (!modpsarc::read_member(base, kPcPauseMember, swf)) why = "cannot read " + std::string(kPcPauseMember) + " from " + base;
+    else if (!r2_menu_rows_patch_pausemenu(swf, out, &why)) why = "patch: " + why;
+    else {
+        std::string path = s_root + "\\pc_menu\\USRDIR\\packed\\game\\global_cached.psarc\\scaleform\\pausemenu.swf";
+        if (!write_if_changed(path, out)) why = "cannot write " + path;
+        else if (!modpsarc::plan_add(ap.plan, kPcPauseMember, path, &why)) why = "plan: " + why;
+        else {
+            r2_menu_rows_set_pause_entry(true);
+            fprintf(stderr, "[menurows] pause menu: PC SETTINGS added (after OPTIONS; the options panel on the PC pages) (%zu -> %zu bytes)\n", swf.size(), out.size());
+            return;
+        }
+    }
+    fprintf(stderr, "[menurows] pause menu PC SETTINGS entry: %s; %s\n", why.c_str(), kFallback);
+}
+
+// The PC settings pages: patch the archive's own avoptions.swf into mods\pc_menu\ and add it to the plan.
+void add_pc_menu(ArchivePlan& ap, const std::string& base)
+{
+    for (const auto& m : ap.plan.members)
+        if (m.member == kPcMenuMember) {
+            fprintf(stderr, "[menurows] a mod replaces %s: no PC settings pages on the options screen\n", kPcMenuMember);
+            return;
+        }
+    std::vector<uint8_t> swf, out;
+    std::string why;
+    if (!modpsarc::read_member(base, kPcMenuMember, swf)) why = "cannot read it from " + base;
+    else if (!r2_menu_rows_patch_swf(swf, out, &why)) why = "patch: " + why;
+    else {
+        std::string path = s_root + "\\pc_menu\\USRDIR\\packed\\game\\global_cached.psarc\\scaleform\\avoptions.swf";
+        if (!write_if_changed(path, out)) why = "cannot write " + path;
+        else if (!modpsarc::plan_add(ap.plan, kPcMenuMember, path, &why)) why = "plan: " + why;
+        else {
+            r2_menu_rows_set_pages(true);
+            fprintf(stderr, "[menurows] options screen: PC settings pages added (%s, %zu -> %zu bytes)\n", path.c_str(), swf.size(), out.size());
+            if (r2_menu_rows_mode() == 1) { add_pc_entry(ap, base); add_pc_pause(ap, base); }
+            return;
+        }
+    }
+    fprintf(stderr, "[menurows] %s: %s; the options screen stays as it is\n", kPcMenuMember, why.c_str());
+}
+
 // The patched copy of archive `key` (base: the resolved game path, or a whole-file override).
 const std::string* archive_copy(const std::string& key, const std::string& base)
 {
@@ -142,6 +280,8 @@ const std::string* archive_copy(const std::string& key, const std::string& base)
     ArchivePlan& ap = it->second;
     if (!ap.tried) {
         ap.tried = true;
+        if (ap.pc_menu) add_pc_menu(ap, base);
+        if (ap.plan.empty()) return nullptr;
         std::string name = key;
         for (auto& c : name) if (c == '/' || c == ':') c = '_';
         const std::string dir = s_root + "\\.cache";
@@ -214,21 +354,28 @@ struct ModsInit {
     ModsInit()
     {
         const char* e = getenv("R2_MODS");
-        if (!e || !*e || *e == '0' || !_stricmp(e, "off")) return;
+        const bool mods = e && *e && *e != '0' && _stricmp(e, "off");
+        const bool pc_menu = r2_menu_rows_enabled();
+        if (!mods && !pc_menu) return;
         std::string root;
-        if (!strcmp(e, "1") || !_stricmp(e, "on")) {
+        if (!mods || !strcmp(e, "1") || !_stricmp(e, "on")) {
             // next to the exe, or its parent (build\Resistance2.exe with mods\ in the port folder)
             const std::string d = exe_dir();
             root = d + "\\mods";
             if (GetFileAttributesA(root.c_str()) == INVALID_FILE_ATTRIBUTES) root = d + "\\..\\mods";
             if (GetFileAttributesA(root.c_str()) == INVALID_FILE_ATTRIBUTES) root = "mods";
         } else root = e;
+        if (!mods && GetFileAttributesA(root.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            root = exe_dir() + "\\mods";   // only the built-in PC pages: create it next to the exe
+            CreateDirectoryA(root.c_str(), nullptr);
+        }
         if (GetFileAttributesA(root.c_str()) == INVALID_FILE_ATTRIBUTES) {
-            fprintf(stderr, "[mods] R2_MODS=%s: folder %s not found, no mods\n", e, root.c_str());
+            fprintf(stderr, "[mods] R2_MODS=%s: folder %s not found, no mods\n", mods ? e : "0", root.c_str());
             return;
         }
         s_root = root;
-        build_index(root);
+        if (mods) build_index(root);
+        if (pc_menu) s_archives[kPcMenuArchive].pc_menu = true;   // patched on first use (archive_copy)
         if (!s_index.empty() || !s_archives.empty()) g_vfs_override_hook = override_hook;
     }
 } s_mods_init;

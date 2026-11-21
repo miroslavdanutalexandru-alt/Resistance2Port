@@ -77,11 +77,16 @@ message(STATUS "Lifted sources:  ${RECOMP_SOURCE_COUNT} file(s)")
 # ---------------------------------------------------------------------------
 # Resistance port: CPU build options (build_cpu.bat; README "CPU build options")
 # ---------------------------------------------------------------------------
-#   PORT_ARCH=AVX2      runtime + hand-written code with /arch:AVX2 as well (the
-#                       lifted PPU/SPU code already is: PORT_PPU_V3/PORT_SPU_AVX2)
-#   PORT_ARCH=baseline  no AVX anywhere (x86-64 + SSE4.1 runtime) for older CPUs;
+#   PORT_ARCH=AVX2      (build_cpu.bat) x86-64-v3 everywhere: the runtime and the
+#                       hand-written code with -march=x86-64-v3 as well (the lifted
+#                       PPU/SPU code already is: PORT_PPU_V3/PORT_SPU_AVX2). FMA
+#                       contraction stays off (-ffp-contract=off) in all of it.
+#   PORT_ARCH=mixed     (default, also "") AVX2 lifted code, x86-64 + SSE4.1 runtime and
+#                       hand-written code (build.bat)
+#   PORT_ARCH=baseline  no AVX anywhere (x86-64 + SSE4.1, lifted code too) for older CPUs;
 #                       forces PORT_PPU_V3=OFF and PORT_SPU_AVX2=OFF
-#   PORT_ARCH=""        (default) the shipped mix, unchanged
+#                       (build_cpu.bat baseline -> build_baseline\, run.bat picks it
+#                       when the launcher finds no AVX2)
 #   PORT_LTO=ON         ThinLTO (clang-cl -flto=thin + lld-link) for the runtime,
 #                       the hand-written and the lifted SPU code. PORT_LTO_PPU=ON
 #                       adds the 1.3 GB of lifted PPU code (hours of link).
@@ -91,12 +96,52 @@ message(STATUS "Lifted sources:  ${RECOMP_SOURCE_COUNT} file(s)")
 #   PORT_PPU_PREBUILT_OBJ_DIR=<dir>  link ppu_recomp_NNN.cpp.obj from <dir>
 #                       instead of compiling the lifted PPU code (they must be
 #                       built from the same lift with the same PPU flags).
-set(PORT_ARCH "" CACHE STRING "CPU target: empty (shipped mix) | AVX2 | baseline")
+set(PORT_ARCH "" CACHE STRING "CPU target: mixed (default when empty) | AVX2 (x86-64-v3) | baseline")
+if(PORT_ARCH STREQUAL "")
+    set(PORT_ARCH mixed)
+endif()
+if(NOT PORT_ARCH MATCHES "^(AVX2|mixed|baseline)$")
+    message(FATAL_ERROR "PORT_ARCH must be AVX2, mixed or baseline (got '${PORT_ARCH}')")
+endif()
 option(PORT_LTO "ThinLTO for runtime, hand-written and lifted SPU code" OFF)
 option(PORT_LTO_PPU "ThinLTO for the lifted PPU code too" OFF)
 set(PORT_PGO "off" CACHE STRING "Profile-guided optimisation: off | gen | use")
 set(PORT_PGO_PROFILE "" CACHE FILEPATH "Merged .profdata for PORT_PGO=use")
 option(PORT_PGO_PPU "PGO for the lifted PPU code too" OFF)
+# Short spellings (scratch/lto_pgo.md), all default OFF/empty = the default build:
+#   PORT_THINLTO=ON          = PORT_LTO=ON + PORT_LTO_PPU=ON (runtime and all lifted code),
+#                              plus /Gw. PORT_THINLTO_SCOPE=nopu leaves the lifted PPU code
+#                              out; =hot puts only the PPU files named in PORT_LTO_PPU_ONLY in.
+#   PORT_LTO_JOBS=N          lld-link ThinLTO backend threads (default: all without the PPU
+#                              code, else the RAM-based PPU job pool size: each backend of a
+#                              lifted PPU module needs as much RAM as its compile).
+#   PORT_LTO_CACHE=OFF       no /lldltocache (default ON: <build>/lto_cache).
+#   PORT_LINK_ICF=ON         /OPT:SAFEICF as well as /OPT:REF.
+#   PORT_PGO_GEN=ON          = PORT_PGO=gen;  PORT_PGO_USE=<.profdata> = PORT_PGO=use.
+option(PORT_THINLTO "ThinLTO for the runtime and the lifted code (PORT_THINLTO_SCOPE)" OFF)
+set(PORT_THINLTO_SCOPE "all" CACHE STRING "PORT_THINLTO scope: all | nopu | hot")
+set(PORT_LTO_PPU_ONLY "" CACHE STRING "PPU LTO only for these ppu_recomp_NNN names (PORT_THINLTO_SCOPE=hot)")
+set(PORT_LTO_JOBS "" CACHE STRING "lld-link ThinLTO backend threads (empty: automatic)")
+option(PORT_LTO_CACHE "ThinLTO incremental cache (/lldltocache)" ON)
+option(PORT_LINK_ICF "Link with /OPT:SAFEICF too" OFF)
+option(PORT_PGO_GEN "Instrumented PGO build (= PORT_PGO=gen)" OFF)
+set(PORT_PGO_USE "" CACHE FILEPATH "Merged .profdata: PGO-optimised build (= PORT_PGO=use)")
+if(PORT_THINLTO)
+    set(PORT_LTO ON)
+    if(PORT_THINLTO_SCOPE STREQUAL "all" OR PORT_THINLTO_SCOPE STREQUAL "hot")
+        set(PORT_LTO_PPU ON)
+    elseif(NOT PORT_THINLTO_SCOPE STREQUAL "nopu")
+        message(FATAL_ERROR "PORT_THINLTO_SCOPE must be all, nopu or hot (got '${PORT_THINLTO_SCOPE}')")
+    endif()
+endif()
+if(PORT_PGO_GEN AND PORT_PGO_USE)
+    message(FATAL_ERROR "PORT_PGO_GEN and PORT_PGO_USE are exclusive")
+elseif(PORT_PGO_GEN)
+    set(PORT_PGO gen)
+elseif(PORT_PGO_USE)
+    set(PORT_PGO use)
+    set(PORT_PGO_PROFILE "${PORT_PGO_USE}")
+endif()
 set(PORT_PPU_PREBUILT_OBJ_DIR "" CACHE PATH "Link prebuilt lifted PPU objects from this directory")
 if(PORT_ARCH STREQUAL "baseline")
     set(PORT_PPU_V3 OFF)
@@ -233,6 +278,19 @@ elseif(PORT_ENABLE_SPU)
                 message(STATUS "  (no ${gen} -- not registered)")
             endif()
         endforeach()
+        # Edge zlib inflate_fast emulation, called by r2_native_jobs_kern.c (kernel edge_zlib).
+        list(APPEND SPU_SOURCES "${PS3RECOMP_DIR}/runtime/spu/native_edge_zlib.c")
+        # R2_NATIVE_AUDIO: native synth-job kernels for the jobmod_a8d79dd61f50/5e0b41a9ea8c hooks
+        # (tools\hooks\spu\r2_jobmod_*.json); off unless R2_NATIVE_AUDIO_JOB=1. Built with the
+        # lifted sources' flags on purpose: bit-exactness relies on identical spu_helpers.h codegen.
+        list(APPEND SPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/r2_native_audio.c"
+                                "${CMAKE_CURRENT_SOURCE_DIR}/r2_native_audio_kern.c")
+        # R2_NATIVE_JOBS: native SPU job kernels (dd413 0x4030 xform, spuelf0 0x8240 Edge zlib,
+        # opt-in 7db0 0x9440/0xAC48 + 4154 0x81C0 water kernels) behind the hooks in
+        # tools\hooks\spu\r2_jobmod_{dd413431e518_e1970,7db0447de77b_eD748,41541a94f5a5_e6848}.json / r2_spuelf0.json;
+        # default on with a sampled self-check. Same flags as the lifted code (bit-exactness).
+        list(APPEND SPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/r2_native_jobs.c"
+                                "${CMAKE_CURRENT_SOURCE_DIR}/r2_native_jobs_kern.c")
     else()
         message(STATUS "Lifted SPU:      none found in ${SPU_DIR}")
     endif()
@@ -241,6 +299,7 @@ endif()
 add_executable(${PROJECT_NAME}
     main.cpp
     stubs.cpp
+    port_hitchcatch.cpp   # PORT_HITCHCATCH=<ms>: key-thread stacks on frame hitches (off by default)
     r2_native_aa.cpp
     r2_pcport.cpp
     r2_patches.cpp
@@ -252,6 +311,8 @@ add_executable(${PROJECT_NAME}
     mods_psarc.cpp
     r2_pcextra.cpp
     r2_cheats.cpp
+    r2_menurows.cpp
+    r2_swfpatch.cpp
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
     ${RECOMP_SOURCES}
@@ -301,6 +362,20 @@ if(SPU_SOURCES)
     if(PORT_SPU_INLINE_CH)
         list(APPEND _spu_defs SPU_INLINE_CH)
     endif()
+    # Resistance port: SPU_XF_RZ_TRUST drops the +-FLT_MAX output clamp of every
+    # lifted float op (an identity under RZ, which the runtime then forces in
+    # spu_thread_fp_init; 240M-op equivalence test in spu_native_1115.md).
+    option(PORT_SPU_XF_RZ_TRUST "Lifted SPU float ops: rely on RZ for saturation" ON)
+    if(PORT_SPU_FAST AND PORT_SPU_XF_RZ_TRUST)
+        list(APPEND _spu_defs SPU_XF_RZ_TRUST)
+        target_compile_definitions(ps3recomp_runtime PRIVATE SPU_XF_RZ_TRUST)
+    endif()
+    # Resistance port: SPU_W0()/SPU_H0() preferred-slot reads (tools/spu_w0.py) keep each
+    # register local in one xmm instead of an SROA-split i32 + <3 x i32>. OFF = plain field read.
+    option(PORT_SPU_W0_VEC "Lifted SPU code: vector preferred-slot reads" ON)
+    if(NOT PORT_SPU_W0_VEC)
+        list(APPEND _spu_defs SPU_W0_SCALAR)
+    endif()
     set_source_files_properties(${SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
         COMPILE_DEFINITIONS "${_spu_defs}")
@@ -308,14 +383,16 @@ if(SPU_SOURCES)
         # Resistance port: the SPU helpers have SSE4.1/AVX2 paths (pshufb shufb,
         # vector float ops) that the default x86-64 baseline compiled out --
         # shufb alone was ~20% of the SPU job thread as a byte loop.
-        # -DPORT_SPU_AVX2=OFF builds the old baseline.
+        # -DPORT_SPU_AVX2=OFF builds the SSE4.1 baseline (the runtime needs SSE4.1 anyway).
         option(PORT_SPU_AVX2 "Build lifted SPU code with AVX2" OFF)
         if(PORT_SPU_AVX2 AND MSVC)
-            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;/arch:AVX2;/GS-")
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;/arch:AVX2;/GS-;/clang:-ffp-contract=off")
         elseif(PORT_SPU_AVX2)
-            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;-mavx2")
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;-mavx2;-ffp-contract=off")
+        elseif(MSVC)
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;/clang:-msse4.1;/clang:-ffp-contract=off")
         else()
-            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2")
+            set_source_files_properties(${SPU_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;-msse4.1;-ffp-contract=off")
         endif()
     endif()
 endif()
@@ -387,14 +464,31 @@ if(WIN32)
         # backend has multi-MB frames; rpcs3.exe links with 8 MB.
         target_link_options(${PROJECT_NAME} PRIVATE /STACK:8388608,1048576)
         message(STATUS "RSX:             RPCS3 core linked (${_r})")
+        # build_rpcs3's code generation (ps3recomp/third_party/rpcs3/CMakeLists.txt RPCS3_RSX_*): ThinLTO
+        # bitcode and PGO instrumentation need matching link options, applied in the CPU options block below.
+        set(_rsx_cg_lto OFF)
+        set(_rsx_cg_pgo off)
+        if(EXISTS "${_r}/rpcs3_rsx_codegen.txt")
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_r}/rpcs3_rsx_codegen.txt")
+            file(STRINGS "${_r}/rpcs3_rsx_codegen.txt" _rsx_cg)
+            foreach(_l IN LISTS _rsx_cg)
+                if(_l MATCHES "^LTO=(ON|1|TRUE)$")
+                    set(_rsx_cg_lto ON)
+                elseif(_l MATCHES "^PGO=(gen|use)$")
+                    set(_rsx_cg_pgo "${CMAKE_MATCH_1}")
+                endif()
+            endforeach()
+            message(STATUS "RSX codegen:     ${_rsx_cg}")
+        endif()
     endif()
 endif()
 
-# mods_psarc.cpp (mods folder: PSARC member / asset overrides) uses miniz. rpcs3_rsx.lib
+# mods_psarc.cpp (mods folder: PSARC member / asset overrides) and r2_swfpatch.cpp (compressed
+# Scaleform movies) use miniz. rpcs3_rsx.lib
 # already contains it (r2_fossilize); without that library compile it here. The include
-# directory is set on this one file so the other TUs keep their compile commands.
+# directory is set on these files so the other TUs keep their compile commands.
 set(PORT_MINIZ_DIR "${PS3RECOMP_DIR}/third_party/fossilize/miniz")
-set_source_files_properties(mods_psarc.cpp PROPERTIES INCLUDE_DIRECTORIES "${PORT_MINIZ_DIR}")
+set_source_files_properties(mods_psarc.cpp r2_swfpatch.cpp PROPERTIES INCLUDE_DIRECTORIES "${PORT_MINIZ_DIR}")
 if(NOT (DEFINED R2_RPCS3_RSX_BUILD AND EXISTS "${R2_RPCS3_RSX_BUILD}/rpcs3_rsx.lib"))
     target_sources(${PROJECT_NAME} PRIVATE "${PORT_MINIZ_DIR}/miniz.c")
     set_source_files_properties("${PORT_MINIZ_DIR}/miniz.c" PROPERTIES COMPILE_OPTIONS "-w")
@@ -455,12 +549,20 @@ option(PORT_PPU_FIXED "Lifted PPU code: constant VM bounds + preserve_most slow 
 if(PORT_PPU_FIXED)
     set_source_files_properties(${RECOMP_SOURCES} PROPERTIES COMPILE_DEFINITIONS "PPU_FIXED_BOUNDS")
 endif()
+# The lifted TUs' only thread_local (g_trampoline_fn, constant-initialised in
+# ppu_loader.cpp) otherwise gets an on-demand TLS init guard at every trampoline
+# drain. -DPORT_PPU_TLS_NOGUARD=OFF restores the guards.
+option(PORT_PPU_TLS_NOGUARD "Lifted PPU code: no TLS init guards" ON)
+set(_ppu_tlsg "")
+if(MSVC AND PORT_PPU_TLS_NOGUARD)
+    set(_ppu_tlsg ";/Zc:tlsGuards-")
+endif()
 if(MSVC AND PORT_PPU_V3)
     set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
-        COMPILE_OPTIONS "/w;/bigobj;/clang:-O2;/clang:-march=x86-64-v3;/clang:-ffp-contract=off;/clang:-fno-math-errno")
+        COMPILE_OPTIONS "/w;/bigobj;/clang:-O2;/clang:-march=x86-64-v3;/clang:-ffp-contract=off;/clang:-fno-math-errno${_ppu_tlsg}")
 elseif(MSVC)
     set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
-        COMPILE_OPTIONS "/w;/bigobj;/clang:-O2")
+        COMPILE_OPTIONS "/w;/bigobj;/clang:-O2;/clang:-msse4.1;/clang:-ffp-contract=off${_ppu_tlsg}")
 else()
     set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
         COMPILE_OPTIONS "-w;-ffp-contract=off")
@@ -506,10 +608,10 @@ endif()
 # laps) and "RSX flip" frame marks; see port_tracy.h / port_tracy.cpp.
 # ---------------------------------------------------------------------------
 option(PORT_TRACY "Build with Tracy profiler zones (connect the Tracy viewer)" OFF)
-set(PORT_TRACY_DIR "D:/Games/refs/tracy" CACHE PATH "Tracy source checkout")
+set(PORT_TRACY_DIR "$ENV{PORT_TRACY_DIR}" CACHE PATH "Tracy source checkout (v0.15; default: the PORT_TRACY_DIR environment variable)")
 if(PORT_TRACY)
-    if(NOT EXISTS "${PORT_TRACY_DIR}/CMakeLists.txt")
-        message(FATAL_ERROR "PORT_TRACY=ON: no Tracy checkout at PORT_TRACY_DIR=${PORT_TRACY_DIR}")
+    if(NOT PORT_TRACY_DIR OR NOT EXISTS "${PORT_TRACY_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR "PORT_TRACY=ON: no Tracy checkout at PORT_TRACY_DIR='${PORT_TRACY_DIR}' (set PORT_TRACY_DIR to a Tracy v0.15 source folder)")
     endif()
     set(TRACY_ENABLE ON CACHE BOOL "" FORCE)
     set(TRACY_ON_DEMAND ON CACHE BOOL "" FORCE)
@@ -522,6 +624,17 @@ if(PORT_TRACY)
     target_compile_definitions(${PROJECT_NAME} PRIVATE PORT_TRACY)
     target_compile_definitions(ps3recomp_runtime PRIVATE PORT_TRACY)
     message(STATUS "Tracy:           ON (${PORT_TRACY_DIR}, on-demand, no crash handler)")
+endif()
+
+# Resistance port: an AVX2 build (anything but PORT_ARCH=baseline) needs x86-64-v3;
+# port_cpucheck.h (included by main.cpp) then refuses older CPUs with a clear message
+# instead of an illegal-instruction crash.
+option(PORT_CPU_CHECK "Startup check for the CPU features the build needs: AVX2, or SSE4.1 for PORT_ARCH=baseline (port_cpucheck.h)" ON)
+if(PORT_CPU_CHECK AND (PORT_PPU_V3 OR PORT_SPU_AVX2 OR PORT_ARCH STREQUAL "AVX2"))
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PORT_REQUIRE_X86_64_V3=1)
+elseif(PORT_CPU_CHECK)
+    # baseline: the runtime and the lifted code are built with -msse4.1
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PORT_REQUIRE_SSE41=1)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -571,29 +684,101 @@ if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         target_compile_options(ps3recomp_runtime PRIVATE $<$<COMPILE_LANGUAGE:C>:/Zc:tlsGuards->)
         target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANGUAGE:C>:/Zc:tlsGuards->)
     endif()
+    # /GS- drops clang-cl's stack-cookie checks (on by default) from the runtime and the hand-written code;
+    # /Gw gives data its own COMDATs for /OPT:REF. No float or other semantic change. The lifted SPU code
+    # already builds with /GS-; the lifted PPU code is not touched here (its objects are not recompiled).
+    option(PORT_GS_OFF "/GS- and /Gw for the runtime and the hand-written code" ON)
+    if(PORT_GS_OFF)
+        target_compile_options(ps3recomp_runtime PRIVATE /GS- /Gw)
+        set_property(SOURCE ${_hand_srcs} APPEND PROPERTY COMPILE_OPTIONS "/GS-;/Gw")
+    endif()
+    # rpcs3_rsx.lib built as ThinLTO bitcode (RPCS3_RSX_LTO, see the RSX block above): lld-link runs its
+    # ThinLTO backends at every exe link; the cache keeps a relink after a small change to the modules that
+    # changed. PORT_LTO adds the same options for its own LTO below.
+    if(_rsx_cg_lto AND NOT PORT_LTO)
+        target_link_options(${PROJECT_NAME} PRIVATE /INCREMENTAL:NO)
+        if(PORT_LTO_CACHE)
+            target_link_options(${PROJECT_NAME} PRIVATE "/lldltocache:${CMAKE_BINARY_DIR}/lto_cache")
+        endif()
+        if(NOT "${PORT_LTO_JOBS}" STREQUAL "")
+            target_link_options(${PROJECT_NAME} PRIVATE /opt:lldltojobs=${PORT_LTO_JOBS})
+        endif()
+        message(STATUS "LTO:             rpcs3_rsx.lib is ThinLTO bitcode (RPCS3_RSX_LTO); the rest of the exe is not")
+    endif()
+    # An instrumented rpcs3_rsx.lib (RPCS3_RSX_PGO=gen) needs the profile runtime even when the exe is not
+    # instrumented itself.
+    if(_rsx_cg_pgo STREQUAL "gen" AND NOT PORT_PGO STREQUAL "gen")
+        get_filename_component(_llvm_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+        file(GLOB _prof_rt "${_llvm_bin}/../lib/clang/*/lib/windows/clang_rt.profile-x86_64.lib")
+        if(NOT _prof_rt)
+            message(FATAL_ERROR "instrumented rpcs3_rsx.lib: clang_rt.profile-x86_64.lib not found under ${_llvm_bin}/../lib/clang")
+        endif()
+        list(GET _prof_rt 0 _prof_rt)
+        target_link_libraries(${PROJECT_NAME} PRIVATE "${_prof_rt}")
+        message(WARNING "rpcs3_rsx.lib is PGO-instrumented but PORT_PGO is not gen: counters are only written at exit")
+    endif()
 
     if(PORT_ARCH STREQUAL "AVX2")
-        # Contraction stays off: the runtime's float paths were validated without FMA.
-        target_compile_options(ps3recomp_runtime PRIVATE /arch:AVX2 /clang:-ffp-contract=off)
-        set_property(SOURCE ${_hand_srcs} APPEND PROPERTY COMPILE_OPTIONS "/arch:AVX2;/clang:-ffp-contract=off")
-        message(STATUS "CPU target:      AVX2 (runtime + hand-written + lifted)")
+        # x86-64-v3 = what the lifted PPU code and port_cpucheck.h use. Contraction stays
+        # off: the runtime's float paths were validated without FMA, and a fused a*b+c
+        # rounds differently from the PS3's separate multiply and add.
+        target_compile_options(ps3recomp_runtime PRIVATE /clang:-march=x86-64-v3 /clang:-ffp-contract=off)
+        set_property(SOURCE ${_hand_srcs} APPEND PROPERTY COMPILE_OPTIONS "/clang:-march=x86-64-v3;/clang:-ffp-contract=off")
+        message(STATUS "CPU target:      AVX2 / x86-64-v3 (runtime + hand-written + lifted)")
+    elseif(PORT_ARCH STREQUAL "mixed")
+        message(STATUS "CPU target:      mixed (AVX2 lifted code, x86-64 + SSE4.1 runtime and hand-written code)")
     elseif(PORT_ARCH STREQUAL "baseline")
-        message(STATUS "CPU target:      baseline x86-64 (no AVX; PORT_PPU_V3/PORT_SPU_AVX2 off)")
+        message(STATUS "CPU target:      baseline x86-64 + SSE4.1 (no AVX; PORT_PPU_V3/PORT_SPU_AVX2 off)")
     endif()
 
     set(_opt_srcs ${_hand_srcs} ${SPU_SOURCES})
     if(PORT_LTO)
         set(_lto_srcs ${_opt_srcs})
+        set(_lto_ppu "")
         if(PORT_LTO_PPU)
-            list(APPEND _lto_srcs ${_ppu_srcs})
+            set(_lto_ppu ${_ppu_srcs})
+            if(PORT_THINLTO AND PORT_THINLTO_SCOPE STREQUAL "hot")
+                set(_lto_ppu "")
+                foreach(s IN LISTS _ppu_srcs)
+                    get_filename_component(_n "${s}" NAME_WE)
+                    if(_n IN_LIST PORT_LTO_PPU_ONLY)
+                        list(APPEND _lto_ppu "${s}")
+                    endif()
+                endforeach()
+            endif()
+            list(APPEND _lto_srcs ${_lto_ppu})
         endif()
+        list(LENGTH _lto_ppu _lto_nppu)
         target_compile_options(ps3recomp_runtime PRIVATE -flto=thin)
         set_property(SOURCE ${_lto_srcs} APPEND PROPERTY COMPILE_OPTIONS "-flto=thin")
-        # lld-link runs the ThinLTO backends; cache them so a relink after a
-        # small change only re-optimises the modules that changed.
-        target_link_options(${PROJECT_NAME} PRIVATE /opt:lldltojobs=all
-            "/lldltocache:${CMAKE_BINARY_DIR}/lto_cache" /INCREMENTAL:NO)
-        message(STATUS "LTO:             ThinLTO (runtime, hand-written, SPU; lifted PPU: ${PORT_LTO_PPU})")
+        if(PORT_THINLTO)
+            # Per-variable COMDATs so /OPT:REF can drop dead data in the non-LTO objects too.
+            target_compile_options(${PROJECT_NAME} PRIVATE /Gw)
+            target_compile_options(ps3recomp_runtime PRIVATE /Gw)
+        endif()
+        # lld-link runs the ThinLTO backends; a backend of a lifted PPU module
+        # needs about as much RAM as compiling it, so with PPU modules in LTO
+        # the thread count defaults to the RAM-based PPU job pool size.
+        if(NOT "${PORT_LTO_JOBS}" STREQUAL "")
+            set(_lto_jobs "${PORT_LTO_JOBS}")
+        elseif(_lto_nppu GREATER 0)
+            cmake_host_system_information(RESULT _ram_mb QUERY TOTAL_PHYSICAL_MEMORY)
+            math(EXPR _lto_jobs "(${_ram_mb} / 1024 - 6) / 8")
+            if(_lto_jobs LESS 1)
+                set(_lto_jobs 1)
+            endif()
+        else()
+            set(_lto_jobs all)
+        endif()
+        target_link_options(${PROJECT_NAME} PRIVATE /opt:lldltojobs=${_lto_jobs} /INCREMENTAL:NO)
+        # The cache lets a relink after a small change re-optimise only the modules that changed.
+        if(PORT_LTO_CACHE)
+            target_link_options(${PROJECT_NAME} PRIVATE "/lldltocache:${CMAKE_BINARY_DIR}/lto_cache")
+        endif()
+        message(STATUS "LTO:             ThinLTO (runtime, hand-written, SPU; lifted PPU files: ${_lto_nppu}; backend jobs: ${_lto_jobs})")
+    endif()
+    if(PORT_LINK_ICF)
+        target_link_options(${PROJECT_NAME} PRIVATE /OPT:SAFEICF)
     endif()
 
     if(PORT_PGO STREQUAL "gen" OR PORT_PGO STREQUAL "use")
@@ -623,6 +808,23 @@ if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         endif()
         target_compile_options(ps3recomp_runtime PRIVATE ${_pgo_flag})
         set_property(SOURCE ${_pgo_srcs} APPEND PROPERTY COMPILE_OPTIONS "${_pgo_flag}")
+        if(PORT_PGO STREQUAL "use")
+            # The profile is an input of every PGO object: a re-merged .profdata must recompile them
+            # (Ninja does not track it otherwise). The runtime's sources live in another directory scope.
+            set_property(SOURCE ${_pgo_srcs} APPEND PROPERTY OBJECT_DEPENDS "${PORT_PGO_PROFILE}")
+            get_target_property(_rt_srcs ps3recomp_runtime SOURCES)
+            get_target_property(_rt_dir ps3recomp_runtime SOURCE_DIR)
+            set(_rt_abs "")
+            foreach(s IN LISTS _rt_srcs)
+                if(s MATCHES "\\.(c|cc|cpp|cxx)$" AND NOT s MATCHES "^\\$<")
+                    if(NOT IS_ABSOLUTE "${s}")
+                        set(s "${_rt_dir}/${s}")
+                    endif()
+                    list(APPEND _rt_abs "${s}")
+                endif()
+            endforeach()
+            set_property(SOURCE ${_rt_abs} TARGET_DIRECTORY ps3recomp_runtime APPEND PROPERTY OBJECT_DEPENDS "${PORT_PGO_PROFILE}")
+        endif()
     endif()
 endif()
 

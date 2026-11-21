@@ -182,6 +182,11 @@ def build_programs(args, registry_writer):
                 program['diagnostics'] = diagnostics
                 if diagnostics['unsupported']:
                     raise ValueError('unsupported instructions emitted by lifter')
+                # The lifter compiles invalid encodings to a run-time
+                # spu_invalid_insn stop; an executable range holding data is
+                # not a clean lift, so it is not auto-registered.
+                if diagnostics.get('invalid_words'):
+                    raise ValueError('invalid encodings (data) in executable ranges')
                 starts = {s for s, _ in diagnostics['functions']}
                 if info['entry'] not in starts:
                     raise ValueError('lifter did not generate the ELF entry')

@@ -108,13 +108,14 @@ static HWND s_vk_hwnd;
 
 /* Threads, condition variables and atomics (the pipeline compiler pool, the
  * submission and present threads). */
+#include "../../runtime/platform/port_hires_sleep.h"   /* port_sleep_1ms (perf final pass) */
 #ifdef _WIN32
 typedef CONDITION_VARIABLE vk_cond;
 #define vk_cond_init(c)       InitializeConditionVariable(c)
 #define vk_cond_wait(c, m)    SleepConditionVariableSRW((c), (m), INFINITE, 0)
 #define vk_cond_signal(c)     WakeConditionVariable(c)
 #define vk_cond_broadcast(c)  WakeAllConditionVariable(c)
-#define vk_async_yield()      Sleep(1)
+#define vk_async_yield()      port_sleep_1ms()   /* hi-res; PORT_HIRES_SLEEP=0: Sleep(1) */
 typedef HANDLE vk_thread_t;
 typedef volatile LONG vk_atomic;
 #define VK_AT_LOAD(p)      InterlockedCompareExchange((p), 0, 0)

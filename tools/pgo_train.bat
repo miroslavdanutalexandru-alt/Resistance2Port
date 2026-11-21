@@ -7,7 +7,7 @@ rem (roughly 10-30%); that does not matter for the profile. Counters are written
 rem PORT_PGO_DUMP_S seconds (default 30) and when the game exits, to pgo\raw\r2-<pid>.profraw
 rem (a level hand-off to a new process writes a second file; all of them are merged).
 rem Several sessions are fine: run this again and everything in pgo\raw is merged.
-rem Then: tools\pgo_merge.bat, then build_cpu.bat pgo-use.
+rem Then: powershell -File scripts\pgo_merge_and_build.ps1 (merge + build_cpu.bat pgo-use; or tools\pgo_merge.bat + build_cpu.bat pgo-use).
 setlocal
 cd /d "%~dp0.."
 if not exist build_pgo_gen\Resistance2.exe (echo build_pgo_gen\Resistance2.exe not found - run build_cpu.bat pgo-gen first. & pause & exit /b 1)
@@ -19,5 +19,5 @@ echo Recording a PGO profile with build_pgo_gen\Resistance2.exe -> pgo\raw\
 call run.bat
 echo.
 dir /b pgo\raw\*.profraw 2>nul || echo No .profraw written - check logs\run.log for the "[pgo]" line.
-echo Next: tools\pgo_merge.bat
+echo Next: powershell -ExecutionPolicy Bypass -File scripts\pgo_merge_and_build.ps1
 pause

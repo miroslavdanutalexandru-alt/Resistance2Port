@@ -83,17 +83,22 @@ renderer). `PORT_PPU_GB` changes Setup's RAM estimate per big file. The CMake op
 - **Uninstall:** in Setup, click **Uninstall...**. It deletes the build output, the generated code, the downloaded
   SDKs and the shortcuts. It asks before deleting the game files (`gamefiles\`, default: keep). It **keeps** your
   saves (`gamedata\`), settings (`settings.ini`, `controls.txt`, `mouselook.cfg`), `%USERPROFILE%\Saved Games\Resistance 2`,
-  screenshots and logs. The build tools stay installed (remove them in Windows *Settings → Apps* if you like). Then
-  delete the port folder if you want it gone completely.
+  screenshots and logs. Then it asks whether to remove the build tools Setup installed
+  ([Removing the build tools](#removing-the-build-tools); tools that were on the PC before are never touched).
+  Then delete the port folder if you want it gone completely.
 
 ## Build tools
 
-Setup checks for and installs only what the build needs:
+The release cannot contain the compiled game (that would be the game's own code), so the port is compiled on your PC
+from your copy, and that needs a compiler and its helpers. Setup checks which of these are missing and **asks before it
+installs anything**: it lists each missing tool, what it is for, where it comes from and its size, then offers
+**system-wide** (winget / the official installers, recommended), **portable** (experimental, see below) or **no**.
+Tools already on the PC are used as they are. Nothing else is installed:
 
 | Tool | Why | winget ID |
 |---|---|---|
 | Visual Studio 2022 Build Tools (C++ tools + Windows SDK) | linker, Windows headers, resource compiler | `Microsoft.VisualStudio.2022.BuildTools` |
-| LLVM (clang-cl 18 or newer) | the compiler | `LLVM.LLVM` |
+| LLVM (clang-cl 22 or newer; the committed PGO profile needs it) | the compiler | `LLVM.LLVM` |
 | CMake 4.2 or newer | build files (the per-file memory queue needs 4.2) | `Kitware.CMake` |
 | Ninja | runs the build | `Ninja-build.Ninja` |
 | Python 3.10 or newer | the code generator and decryption | `Python.Python.3.12` |
@@ -103,6 +108,58 @@ No Vulkan SDK is needed (only a GPU driver with Vulkan). The checks and installs
 `tools\installer\prereqs.ps1`, which you can run yourself:
 `powershell -ExecutionPolicy Bypass -File tools\installer\prereqs.ps1 -Check`, or
 `... -Install -Ids LLVM.LLVM,Kitware.CMake -DryRun` to see the commands without running them.
+
+**Python and IDLE.** The Python installer from python.org also adds *IDLE*, Python's small editor, to the Start menu:
+it is part of Python, not something extra. Python runs the port's own scripts (decrypting your `EBOOT.BIN` and
+generating the game code); Setup adds one Python package, `pycryptodome`, with pip. Everything comes from the
+official sources: winget's packages from Microsoft's winget repository (Python from python.org, LLVM from llvm.org,
+CMake from Kitware, Ninja from its GitHub releases, Git from git-scm.com, Visual Studio from Microsoft), or, without winget, the
+pinned installers from those sites, checked against their SHA-256 hash (Visual Studio: Microsoft's signature). Git is only needed by the ports that build RPCS3's renderer from source.
+
+### Removing the build tools
+
+Setup records everything it installs or changes in `tools_cache\installed_by_setup.txt`: the winget / installer
+packages it installed (only when they were not on the PC before: a tool that was already there, even an older CMake or LLVM that winget updated, stays yours and is never removed; when winget cannot tell, e.g. on a PC without winget, the tool is not recorded either), the `pycryptodome` package, a Git
+`safe.directory` entry if the RPCS3 download needed one, and the portable tools. Once the game is built, the
+tools are only needed again to update or rebuild the port (Setup installs them again then). To remove exactly what
+Setup installed:
+
+- at the end of `Setup.bat` (it asks), or `Setup.bat -RemoveTools` any time (`Setup.bat -RemoveTools -CheckOnly`
+  only lists them);
+- in Setup.exe: **Uninstall...** asks about them after the build files;
+- the Inno uninstaller asks too.
+
+Removing system-wide tools needs one administrator prompt. A tool that cannot be removed stays in the list, and you
+can remove it in Windows *Settings → Apps*. The game itself keeps working without the tools.
+
+### Portable build tools (experimental)
+
+If you would rather not install anything system-wide, answer **P** in `Setup.bat` (or **No** in Setup.exe's question,
+or run `Setup.bat -PortableTools`). Setup then downloads the tools into `tools_cache\` inside the port folder: no
+installer runs, no administrator rights are needed, nothing is added to Windows, the PATH or the Start menu, and
+deleting the folder removes them.
+
+| Tool | Portable download (pinned version, checked against its hash) |
+|---|---|
+| Python 3.12 | the official NuGet `python` package (python.org's build, with pip) |
+| LLVM (clang-cl, lld-link, llvm-rc, llvm-mt) | LLVM's GitHub release archive (only `bin` and the clang headers are kept) |
+| CMake | Kitware's Windows zip |
+| Ninja | the Ninja zip from its GitHub release |
+| Git | MinGit from Git for Windows |
+| MSVC C/C++ libraries + Windows SDK | [xwin](https://github.com/Jake-Shadle/xwin), which downloads them from Microsoft's own servers |
+
+The MSVC libraries and the Windows SDK are Microsoft's: before xwin downloads them, Setup shows Microsoft's licence
+(<https://go.microsoft.com/fwlink/?LinkId=2086102>) and asks you to accept it (`-AcceptMicrosoftLicense` for an
+unattended setup). xwin downloads about 1 GB; with LLVM (~900 MB download) everything takes about 4 GB in `tools_cache\`. LLVM's own
+linker, resource compiler and manifest tool replace Microsoft's (`tools_cache\shims\`).
+
+`build.bat` picks the portable tools up automatically (`tools\toolchain_env.bat`): when `tools_cache\msvc` is complete
+it uses them instead of Visual Studio. Set `PORT_TOOLCHAIN=system` to ignore `tools_cache\` and use the installed
+tools. After switching between the two, delete the `build*` folders once (CMake remembers the compiler).
+
+This mode is **experimental**: Microsoft's tools are what the port is tested with. If a portable build fails, run
+`Setup.bat` again and answer **S**, or report it ([REPORTING.md](REPORTING.md), attach `logs\portable_tools.log` and
+`logs\build.log`).
 
 ## Troubleshooting
 
@@ -148,6 +205,20 @@ above yourself, then run Setup again.
 Restart the PC (Visual Studio's installer sometimes needs that) and click **Resume**. Details are in
 `logs\prereqs.log`. If it keeps failing, install the tool yourself from its website and run Setup again.
 
+### "Could not download or patch the RPCS3 source"
+
+The renderer is built from RPCS3's source, which `tools\fetch_rpcs3.ps1` downloads with Git (once, ~1 GB). It retries
+with a pause, then fetches the parts one by one without the shallow shortcut (some networks and mirrors refuse
+it), and as a last resort downloads GitHub's source archives of the same pinned versions. When it still stops, it
+prints git's own error and what to do; everything is in `logs\fetch_rpcs3.log`. Common causes:
+
+- **The port folder is on an exFAT / FAT32 or network drive.** Git cannot work reliably there (no file ownership,
+  no symbolic links). Move the whole port folder to an NTFS drive (most internal drives), then run Setup again.
+- **"dubious ownership" / `safe.directory`:** Setup adds a `safe.directory` entry for this one folder by itself
+  (recorded, so [Removing the build tools](#removing-the-build-tools) takes it out again).
+- **No connection to github.com:** a proxy, a firewall, an antivirus or a VPN. Allow Git and PowerShell, or try
+  another network. A half-finished download is cleaned up and resumed on the next run.
+
 ### The game copy is not accepted
 
 See the README, *If your game copy is not accepted*. Only the version listed there is supported.
@@ -165,7 +236,10 @@ say what went wrong. To report a problem, see [REPORTING.md](REPORTING.md) (it e
    See the README for details.
 
 Useful `setup.ps1` options: `-Game <path>`, `-GameCopyMode Copy|Move`, `-AcceptSdkLicenses` / `-NoOptionalSdks`,
-`-Unattended` (no questions; the log goes to `logs\setup_script.log`).
+`-Unattended` (no questions; the log goes to `logs\setup_script.log`; it installs no build tools unless `-InstallTools` or `-PortableTools` is given - it stops and lists the missing ones; if you chose the portable tools before, it fetches missing ones into `tools_cache\` again. Updates run Setup this way),
+`-InstallTools` (install the missing build tools system-wide without asking), `-PortableTools [-AcceptMicrosoftLicense]`
+(experimental portable tools in `tools_cache\`), `-RemoveTools` (remove the build tools Setup installed; with
+`-CheckOnly` only list them). `-CheckOnly` lists what would be installed, changed or removed, without doing it.
 
 ## Building Setup.exe yourself
 

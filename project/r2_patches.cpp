@@ -24,9 +24,12 @@
 // Graphics quality (all off by default, see README "Graphics enhancements"):
 //   R2_PATCH_FULLRES=1      no dynamic resolution: the scene stays at the
 //                           game's native 1280x704 (never drops to 1152x640).
-//   R2_PATCH_NO_LOADSHED=1  no GPU-time load shedding at all (resolution,
-//                           LOD distance x0.75, effect budgets).
+//   R2_PATCH_NO_LOADSHED    no GPU-time load shedding at all (resolution,
+//                           LOD distance x0.75, effect budgets). Default on
+//                           (host GPU times tripped the PS3 budget: viewport
+//                           drops inside the DLSS input, LOD pops); =0 = game.
 //   R2_PATCH_LOD_SCALE=<x>  LOD distance multiplier 1.0..4.0 (hook in r2.json).
+//   R2_GOVERNOR_MS=<ms>|off CPU-time detail cut threshold (game: 36.6 ms).
 //   R2_FOV_SAFE=0           old FOV patch (constant poke, misaligned shadows);
 //                           default: FOV widened on the scene camera only.
 #include <cstdio>
@@ -118,7 +121,7 @@ extern "C" void r2_patches_apply(void)
      * switch "-no_dynares" (argument parser func_002EB404) clears it, and
      * nothing else reads it. Clearing it keeps every frame at 1280x704; no
      * buffer is resized, so nothing can be cut off. */
-    const int noshed = env_flag("R2_PATCH_NO_LOADSHED");
+    const int noshed = env_flag("R2_PATCH_NO_LOADSHED") != 0 ? 1 : 0;   /* default on; =0 restores the governor */
     const int fullres = env_flag("R2_PATCH_FULLRES");
     if (fullres == 1 || noshed == 1) {
         if (poke32("fullres", 0x00DF7FDCu, 1u, 0u))
@@ -133,12 +136,37 @@ extern "C" void r2_patches_apply(void)
      * scales x0.5/x0.25/x0.05 and the resolution drop. The 2000.0 constant
      * (pool 0x00D5A510-0x7F0C) is read only by func_002C3780; making it huge
      * means no frame ever counts as over budget. The CPU-time path
-     * (0.0366 s) is left alone. Implies R2_PATCH_FULLRES. */
+     * (0.0366 s) is left alone (R2_GOVERNOR_MS, below). Implies R2_PATCH_FULLRES. */
     if (noshed == 1) {
         if (poke32("no_loadshed", 0x00D52604u, f2u(2000.0f), f2u(1.0e20f)))
             fprintf(stderr, "[patch] no GPU load shedding: on\n");
     } else {
-        fprintf(stderr, "[patch] no GPU load shedding (R2_PATCH_NO_LOADSHED): off\n");
+        fprintf(stderr, "[patch] no GPU load shedding (R2_PATCH_NO_LOADSHED=0): off (game governor)\n");
+    }
+
+    /* CPU-time detail cut, same governor (func_002C3780, 0x002C3B58..): the
+     * previous frame's CPU time (ticks * k) above 0.0366 s (bef32 0x00D525F0,
+     * pool -0x7F20) sets bit 0x8 of the flags word at [pool-0x7FF0]+0x44,
+     * which cuts detail; it is cleared again below 0.03 s (0x00D525F8,
+     * -0x7F18). Both constants are read only there (checked over every
+     * function that loads this pool). R2_GOVERNOR_MS=<ms> (opt-in, 20..200)
+     * moves the threshold; the clear level keeps the game's 0.03/0.0366 ratio.
+     * R2_GOVERNOR_MS=off never cuts. Unset = the game's 36.6 ms. */
+    const char* g = getenv("R2_GOVERNOR_MS");
+    if (g && *g) {
+        const bool off = !_stricmp(g, "off") || !strcmp(g, "0");
+        const double ms = off ? 0.0 : atof(g);
+        if (!off && (ms < 20.0 || ms > 200.0)) {
+            fprintf(stderr, "[patch] R2_GOVERNOR_MS=%s out of range 20..200 (or off), CPU governor left at 36.6 ms\n", g);
+        } else {
+            const float on_s  = off ? 1.0e20f : (float)(ms / 1000.0);
+            const float clr_s = off ? 1.0e20f : (float)(ms / 1000.0 * (0.03 / 0.0366));
+            if (poke32("governor_ms", 0x00D525F0u, 0x3D15E9E2u, f2u(on_s)) &&
+                poke32("governor_ms", 0x00D525F8u, 0x3CF5C28Fu, f2u(clr_s)))
+                fprintf(stderr, off ? "[patch] CPU-time detail governor: off\n"
+                                    : "[patch] CPU-time detail governor: cut above %.1f ms, restore below %.1f ms\n",
+                        ms, ms * (0.03 / 0.0366));
+        }
     }
 
     const double lod = r2_lod_scale();

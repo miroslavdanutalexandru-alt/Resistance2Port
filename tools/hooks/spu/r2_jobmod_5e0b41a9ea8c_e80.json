@@ -1,0 +1,46 @@
+{
+"pre": {},
+"post": {
+"jobmod_5e0b41a9ea8c_e80_spu_func_0000DC08": [
+{
+"at": 1,
+"ctx": "void jobmod_5e0b41a9ea8c_e80_spu_func_0000DC08(spu_context* ctx) {",
+"rm": [],
+"add": [
+"        { extern int r2na_gate(spu_context*, int, void (*)(spu_context*)); if (r2na_gate(ctx, 5, jobmod_5e0b41a9ea8c_e80_spu_func_0000DC08)) SPU_RET(ctx); }  /* R2_NATIVE_AUDIO hook */"
+]
+}
+],
+"jobmod_5e0b41a9ea8c_e80_spu_func_0000DD60": [
+{
+"at": 1,
+"ctx": "void jobmod_5e0b41a9ea8c_e80_spu_func_0000DD60(spu_context* ctx) {",
+"rm": [],
+"add": [
+"        { extern int r2na_gate(spu_context*, int, void (*)(spu_context*)); if (r2na_gate(ctx, 6, jobmod_5e0b41a9ea8c_e80_spu_func_0000DD60)) SPU_RET(ctx); }  /* R2_NATIVE_AUDIO hook */"
+]
+}
+],
+"jobmod_5e0b41a9ea8c_e80_spu_func_00005E08": [
+{
+"at": 1,
+"ctx": "void jobmod_5e0b41a9ea8c_e80_spu_func_00005E08(spu_context* ctx) {",
+"rm": [],
+"add": [
+"        { extern int r2na_gate(spu_context*, int, void (*)(spu_context*)); if (r2na_gate(ctx, 7, jobmod_5e0b41a9ea8c_e80_spu_func_00005E08)) SPU_RET(ctx); }  /* R2_NATIVE_AUDIO hook */"
+]
+}
+],
+"jobmod_5e0b41a9ea8c_e80_spu_func_00006150": [
+{
+"at": 1,
+"ctx": "void jobmod_5e0b41a9ea8c_e80_spu_func_00006150(spu_context* ctx) {",
+"rm": [],
+"add": [
+"        { extern int r2na_gate(spu_context*, int, void (*)(spu_context*)); if (r2na_gate(ctx, 8, jobmod_5e0b41a9ea8c_e80_spu_func_00006150)) SPU_RET(ctx); }  /* R2_NATIVE_AUDIO hook */"
+]
+}
+]
+},
+"preamble": []
+}

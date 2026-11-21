@@ -25,6 +25,7 @@ typedef struct AudioOutConfig {
     unsigned target_frames;  /* desired buffered audio (PORT_AUDIO_BUFFER_MS) */
     double   threshold;      /* stretch below this fraction of the target (PORT_AUDIO_STRETCH_THRESHOLD/100) */
     double   min_tempo;      /* slowest playback (PORT_AUDIO_STRETCH_MIN) */
+    unsigned curve;          /* 1 = tempo follows fill/threshold, 2 = its square (PORT_AUDIO_STRETCH_CURVE) */
     unsigned fade_frames;    /* underrun fade-out / resume fade-in length (PORT_AUDIO_FADE_MS) */
     unsigned guard_frames;   /* conceal when the device holds less than this and nothing is ready */
     unsigned resume_frames;  /* after an underrun, resume once this much is ready */
@@ -54,6 +55,9 @@ void audio_out_env_config(AudioOutConfig* cfg, unsigned device_period_frames);
 AudioOut* audio_out_create(const AudioOutConfig* cfg);
 void      audio_out_destroy(AudioOut* ao);
 const AudioOutConfig* audio_out_config(const AudioOut* ao);
+/* Change the target buffer at run time (PORT_AUDIO_ADAPTIVE); clamped to half the ring.
+ * Returns the target applied, frames. Size ring_frames for the largest target at create. */
+unsigned  audio_out_set_target(AudioOut* ao, unsigned target_frames);
 
 /* Producer side: append mixed stereo frames. Returns frames stored. */
 unsigned audio_out_push(AudioOut* ao, const float* stereo, unsigned frames);

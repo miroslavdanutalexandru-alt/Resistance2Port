@@ -1,0 +1,1 @@
+{"preamble":[],"pre":{},"post":{"jobmod_029d48175a74_e1A6D8_spu_func_0001DF90":[{"add":["        { extern int r2nj_gate(spu_context*, int, void (*)(spu_context*)); if (r2nj_gate(ctx, 6, jobmod_029d48175a74_e1A6D8_spu_func_0001DF90)) SPU_RET(ctx); }  /* R2_NATIVE_JOBS hook */"],"ctx":"void jobmod_029d48175a74_e1A6D8_spu_func_0001DF90(spu_context* ctx) {","rm":[],"at":1}]}}

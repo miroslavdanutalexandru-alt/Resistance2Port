@@ -7,6 +7,7 @@
  */
 
 #include "sysPrxForUser.h"
+#include "../video/rsx_featcov.h"   /* rsx_featcov_dump on the fast exit */
 #include "../../runtime/memory/vm.h"
 #include <ps3emu/guest_call.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32: translate + byte-swap */
@@ -193,6 +194,23 @@ void sys_process_exit(s32 exitcode)
             Sleep(1000);
 #else
             struct timespec ts = {1,0}; nanosleep(&ts,0);
+#endif
+        }
+    }
+    {
+        /* exit() runs the CRT's atexit handlers and static destructors while the
+         * RSX, Vulkan and SPU threads are still running: heap corruption
+         * (0xC0000374) and a crash report on a clean guest exit (seen in R3).
+         * Leave the way the window-close path does (main.cpp ExitProcess).
+         * PS3_EXIT_CRT=1: the old exit(). */
+        const char* ec = getenv("PS3_EXIT_CRT");
+        if (!(ec && *ec && *ec != '0')) {
+            rsx_featcov_dump("exit");
+            fflush(NULL);
+#ifdef _WIN32
+            ExitProcess((UINT)exitcode);
+#else
+            _exit(exitcode);
 #endif
         }
     }

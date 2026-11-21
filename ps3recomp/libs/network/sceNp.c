@@ -225,6 +225,21 @@ s32 sceNpGetMyLanguages(SceNpMyLanguages* langs)
 static SceNpManagerCallback s_npmgr_cb = NULL;
 static void*                s_npmgr_cb_arg = NULL;
 
+/* PORT_ONLINE (port_online.c): signed in with RPCN credentials. */
+int (*g_np_signed_in_hook)(void) = NULL;
+
+static int np_manager_online(void)
+{
+    return np_psnr_enabled() || (g_np_signed_in_hook && g_np_signed_in_hook());
+}
+
+/* Guest callback + arg for events raised elsewhere (GOT_TICKET). */
+void np_manager_get_callback(uint32_t* cb, uint32_t* arg)
+{
+    *cb  = (uint32_t)(uintptr_t)s_npmgr_cb;
+    *arg = (uint32_t)(uintptr_t)s_npmgr_cb_arg;
+}
+
 s32 sceNpManagerGetStatus(s32* status)
 {
     if (!s_np_initialized)
@@ -236,7 +251,7 @@ s32 sceNpManagerGetStatus(s32* status)
      * writes to whatever host address shares that number. Same trap as
      * cellGcmSys had. Tokyo Jungle calls this during its online init. */
     /* Signed in when there is a psnr server to be signed in to. */
-    s32 st = np_psnr_enabled() ? SCE_NP_MANAGER_STATUS_ONLINE : SCE_NP_MANAGER_STATUS_OFFLINE;
+    s32 st = np_manager_online() ? SCE_NP_MANAGER_STATUS_ONLINE : SCE_NP_MANAGER_STATUS_OFFLINE;
     vm_write32((uint32_t)(uintptr_t)status, (uint32_t)st);
     { static s32 last = -2;
       if (st != last) printf("[sceNp] ManagerGetStatus() -> %s\n", st < 0 ? "OFFLINE" : "ONLINE");
@@ -253,7 +268,7 @@ s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg)
     printf("[sceNp] ManagerRegisterCallback()\n");
     /* Online: tell the title it is signed in, as the console does once the
      * manager reaches ONLINE. Delivered on its next cellSysutilCheckCallback. */
-    if (np_psnr_enabled() && callback) {
+    if (np_manager_online() && callback) {
         const u64 args[8] = { (u64)(u32)SCE_NP_MANAGER_STATUS_ONLINE, 0,
                               (u64)(u32)(uintptr_t)arg, 0, 0, 0, 0, 0 };
         cellSysutilQueueGuestCallbackArgs((u32)(uintptr_t)callback, args);

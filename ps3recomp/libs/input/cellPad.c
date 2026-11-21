@@ -19,6 +19,9 @@
 #include "../../runtime/platform/win32_compat.h"   /* GetTickCount64 on POSIX */
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
 #include "ps3emu/log_first.h"
+#include "ps3emu/port_pc_extras.h"   /* rumble / stick / hold-toggle / background-input logic */
+#include "kbm_stick.h"                 /* mouse -> stick: deadzone-aware, sub-step carry */
+#include "pad_squircle.h"              /* PAD_SQUIRCLE: round gate -> DS3-like square range */
 #include "ps3emu/port_hitch.h"
 #include "../../runtime/ps3_log.h"   /* ps3_diag_enabled (R2_DIAG) */
 
@@ -101,8 +104,10 @@ typedef struct {
     u8   press_l1;
     u8   press_r1;
 } PadHostState;
+#include "pad_merge.h"   /* PAD_MERGE: all controllers -> player 1 */
 volatile unsigned long long g_pad_inj_until = 0;
 volatile u32 g_pad_inj_btn = 0, g_pad_inj_sticks = 0x80808080u;
+volatile u32 g_pad_inj_clear = 0;   /* buttons forced up while injecting (movie skip: a held Cross/Start hid the pulse) */
 
 static int           s_pad_initialized = 0;
 static u32           s_max_connect = 0;
@@ -180,14 +185,19 @@ static int pad_sdl3_glyphs(void)
     static int said = -2;
     const int sl = s_port_slot[s_coop_p2kb ? 1 : 0];
     const int t = (sl >= 0 && sl < PADX_SLOTS && s_sdl_snap[sl].connected) ? s_sdl_snap[sl].type : PADX_TYPE_NONE;
-    const int m = t == PADX_TYPE_PS ? 0 : t == PADX_TYPE_XBOX ? 2 :
-                  t == PADX_TYPE_NINTENDO ? (s_pad_nswap > 0 ? 2 : 0) : -1;
+    const int m = t == PADX_TYPE_PS ? 0 : t == PADX_TYPE_XBOX ? 2 : t == PADX_TYPE_NINTENDO ? 3 : -1;
     if (m != said && t != PADX_TYPE_NONE) {
         said = m;
         printf("[cellPad] controller prompts: %s (player 1: %s)\n",
-               m == 0 ? "PlayStation" : m == 2 ? "Xbox" : "by Sony-controller check", s_sdl_snap[sl].name);
+               m == 0 ? "PlayStation" : m == 2 ? "Xbox" : m == 3 ? "Nintendo" : "by Sony-controller check", s_sdl_snap[sl].name);
     }
     return m;
+}
+/* stubs.cpp: Nintendo prompts show A for Cross when the face buttons are swapped by label */
+int cellpad_nintendo_swap(void)
+{
+    if (s_pad_nswap < 0) { const char* e = getenv("PAD_NINTENDO_SWAP"); return e && *e && *e != '0'; }
+    return s_pad_nswap > 0;
 }
 
 /* Gyro aiming (SDL3; DualShock 4, DualSense, Switch Pro, Joy-Con)
@@ -228,6 +238,8 @@ static void pad_gyro_init(void)
            s_gyro_inv ? ", inverted Y" : "", s_gyro_space ? "player" : "local",
            s_gyro_cal ? ", calibrates at connect" : "");
 }
+#else
+int cellpad_nintendo_swap(void) { return 0; }
 #endif
 
 #if PAD_BACKEND_SDL2
@@ -260,11 +272,17 @@ static PadRumble s_rumble[PAD_MAX_HOST_PORTS];
 
 static unsigned long long pad_now_ms(void);
 
-/* The two host motor levels (0-65535) for a PS3 actuator request. */
+/* The two host motor levels (0-65535) for a PS3 actuator request, scaled by PAD_RUMBLE=<0..100|off>
+ * (percent, default 100; also the F9 menu, cellpad_set_pad_opt "PAD_RUMBLE"). */
+static volatile int s_pad_rumble_pct = -1;
 static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
 {
-    *lo = (u16)(large * 257u);
-    *hi = small_on ? 0xFFFFu : 0u;
+    if (s_pad_rumble_pct < 0) {
+        s_pad_rumble_pct = pcx_parse_pct(getenv("PAD_RUMBLE"), 100, 0, 100);
+        if (s_pad_rumble_pct != 100) printf("[cellPad] rumble strength %d%%\n", s_pad_rumble_pct);
+    }
+    *lo = pcx_rumble_scale((u16)(large * 257u), s_pad_rumble_pct);
+    *hi = pcx_rumble_scale(small_on ? 0xFFFFu : 0u, s_pad_rumble_pct);
 }
 
 /* ---------------------------------------------------------------------------
@@ -276,6 +294,7 @@ static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
 /* Deadzone for analog sticks (same as XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE) */
 #define PAD_STICK_DEADZONE  7849
 #define PAD_TRIGGER_THRESHOLD 30
+#define PAD_TRIGGER_RELEASE   20
 
 static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
 {
@@ -462,6 +481,28 @@ volatile int g_ml_invert_y = 0;
 volatile double g_ml_sens_y = 1.0;
 static double s_pad_dz = -1.0, s_pad_curve = 1.0;
 static int s_pad_aim_toggle = 0, s_pad_feat_init = 0;
+/* More PC options (ps3emu/port_pc_extras.h; the launcher and the F9 menu write them):
+ *   PAD_OUTER_DEADZONE=<0..50>   % of the stick's edge that already reads full deflection
+ *   PAD_ANTI_DEADZONE=<0..50>    % the output jumps to just past the deadzone (games with their own deadzone)
+ *   PAD_TRIGGER_DEADZONE=<0..90> % of trigger travel ignored
+ *   PAD_TURN_BOOST=<deg/s>       extra turn speed while the right stick is held at the edge (not while aiming)
+ *   PAD_CROUCH_MODE / PAD_SPRINT_MODE = game | toggle | hold   (see pad_hold_toggle)
+ *   PAD_BACKGROUND_INPUT=auto|1|0  controllers while the window is in the background
+ *                                  (auto: only when R2_BACKGROUND=run / mute keeps the game running) */
+static double s_pad_outer = 0.0, s_pad_anti = 0.0;
+static volatile int s_pad_trig_dz = 0, s_pad_turn_boost = 0, s_pad_crouch_mode = 0, s_pad_sprint_mode = 0;
+static volatile int s_pad_bg_mode = -1, s_pad_bg_run = 0;
+/* PS3_ENTER_BUTTON=circle: keyboard Enter / Esc / Backspace keep meaning confirm / back in menus */
+static u16 pad_kb_confirm(u16 m)
+{
+    static int enter = -1;
+    if (enter < 0) enter = pcx_enter_button(getenv("PS3_ENTER_BUTTON"));
+    return (u16)pcx_swap_confirm(m, CELL_PAD_CTRL_CROSS, CELL_PAD_CTRL_CIRCLE, enter);
+}
+/* this game's crouch and sprint button: both L2 in Resistance 2 (tap = crouch, hold while running = sprint).
+ * PAD_CROUCH_MODE changes both; with it at "game", PAD_SPRINT_MODE=toggle keeps a sprint going (see pad_hold_toggle) */
+#define PAD_CROUCH_BTN CELL_PAD_CTRL_L2
+#define PAD_SPRINT_BTN CELL_PAD_CTRL_L2
 static void pad_feat_init(void)
 {
     if (s_pad_feat_init) return;
@@ -471,6 +512,19 @@ static void pad_feat_init(void)
     if ((e = getenv("PAD_DEADZONE")) && *e) { double v = atof(e); if (v >= 0.0 && v <= 0.9) s_pad_dz = v; }
     if ((e = getenv("PAD_CURVE")) && *e) { double v = atof(e); if (v >= 0.5 && v <= 3.0) { s_pad_curve = v; if (s_pad_dz < 0.0) s_pad_dz = 7849.0 / 32767.0; } }
     if ((e = getenv("PAD_AIM_TOGGLE")) && *e && *e != '0') s_pad_aim_toggle = 1;
+    s_pad_outer = pcx_parse_pct(getenv("PAD_OUTER_DEADZONE"), 0, 0, 50) / 100.0;
+    s_pad_anti = pcx_parse_pct(getenv("PAD_ANTI_DEADZONE"), 0, 0, 50) / 100.0;
+    s_pad_trig_dz = pcx_parse_pct(getenv("PAD_TRIGGER_DEADZONE"), 0, 0, 90);
+    s_pad_turn_boost = pcx_parse_pct(getenv("PAD_TURN_BOOST"), 0, 0, 360);
+    s_pad_crouch_mode = pcx_btn_mode(getenv("PAD_CROUCH_MODE"));
+    s_pad_sprint_mode = pcx_btn_mode(getenv("PAD_SPRINT_MODE"));
+    s_pad_bg_mode = pcx_bg_mode(getenv("PAD_BACKGROUND_INPUT"));
+    s_pad_bg_run = pcx_bg_keeps_running(getenv("R2_BACKGROUND"));   /* "run" and "mute" keep the game running */
+    if ((s_pad_outer > 0.0 || s_pad_anti > 0.0) && s_pad_dz < 0.0) s_pad_dz = 7849.0 / 32767.0;
+    if (s_pad_outer > 0.0 || s_pad_anti > 0.0 || s_pad_trig_dz || s_pad_turn_boost || s_pad_crouch_mode || s_pad_sprint_mode || s_pad_bg_mode >= 0)
+        printf("[controls] PC options: outer deadzone %.0f%%, anti-deadzone %.0f%%, trigger deadzone %d%%, turn boost %d deg/s, "
+               "crouch %d sprint %d (0 game, 1 toggle, 2 hold), background input %d\n", s_pad_outer * 100.0, s_pad_anti * 100.0,
+               s_pad_trig_dz, s_pad_turn_boost, s_pad_crouch_mode, s_pad_sprint_mode, s_pad_bg_mode);
     printf("[controls] PC options: vertical mouse x%.2f, stick deadzone %s%.2f, curve %.2f, aim %s\n", g_ml_sens_y,
            s_pad_dz < 0.0 ? "per-axis " : "radial ", s_pad_dz < 0.0 ? 7849.0 / 32767.0 : s_pad_dz, s_pad_curve,
            s_pad_aim_toggle ? "toggle" : "hold");
@@ -487,6 +541,43 @@ static u16 pad_aim_toggle(int src, u16 btns, int reset)
     if (down && !prev[src]) on[src] = !on[src];
     prev[src] = down;
     return (u16)(on[src] ? (btns | CELL_PAD_CTRL_L1) : (btns & ~CELL_PAD_CTRL_L1));
+}
+/* PAD_CROUCH_MODE / PAD_SPRINT_MODE: "toggle" latches the button (press = on, press again = off) for
+ * a game that wants it held; "hold" sends one tap when it goes down and one when it comes up, for a
+ * game that toggles on a tap -- so holding crouches / sprints and letting go stops. Keyboard (src 0)
+ * and controller (src 1); menus (reset) pass the button through and drop any latch.
+ * One button for both (Resistance 2 L2: tap = crouch, hold while moving = sprint): PAD_SPRINT_MODE=toggle
+ * keeps a started sprint going after the button is let go (pcx_sprint_latch; `moving` = the left stick /
+ * movement keys are deflected) and "hold" is the game's own behaviour. */
+static u16 pad_hold_toggle(int src, u16 btns, int reset, int moving)
+{
+    static PcxBtnConv conv[2][2];
+    static PcxSprintLatch sprint[2];
+    pad_feat_init();
+    const int modes[2] = { s_pad_crouch_mode, s_pad_sprint_mode };
+    const u16 masks[2] = { PAD_CROUCH_BTN, PAD_SPRINT_BTN };
+    if (!modes[0] && !modes[1]) return btns;
+    const unsigned long long now = GetTickCount64();
+    u16 out = btns;
+    for (int k = 0; k < 2; k++) {
+        if (!modes[k] || (k == 1 && masks[1] == masks[0] && modes[0])) continue;   /* one button: crouch wins */
+        if (k == 1 && masks[1] == masks[0]) {
+            if (modes[1] != PCX_BTN_TOGGLE) continue;
+            const int on = pcx_sprint_latch(&sprint[src], (btns & masks[1]) != 0, moving, now, reset);
+            out = (u16)(on ? (out | masks[1]) : (out & ~masks[1]));
+            continue;
+        }
+        const int on = pcx_btn_conv(&conv[src][k], modes[k], (btns & masks[k]) != 0, now, reset);
+        out = (u16)(on ? (out | masks[k]) : (out & ~masks[k]));
+    }
+    return out;
+}
+/* PAD_BACKGROUND_INPUT: may the controllers drive the game while another window has the focus? */
+static int pad_bg_input_ok(void)
+{
+    pad_feat_init();
+    if (s_pad_bg_mode == 1 || (s_pad_bg_mode < 0 && s_pad_bg_run)) return 1;
+    return pad_host_window_focused();
 }
 volatile int g_ml_fed_rx = 0, g_ml_fed_ry = 0;   /* last stick deflection fed (-127..127) */
 volatile long g_kbm_ml_dx = 0, g_kbm_ml_dy = 0;  /* mouse counts for the direct look */
@@ -508,6 +599,7 @@ static int s_menu_mouse = 1; static long s_menu_step = 150;   /* v160 */
  * button (NONE = as on PS3). */
 volatile unsigned long long g_kbm_mouse_abs = 0;     /* total mouse travel, counts */
 volatile unsigned long long g_port_play_ms = 0;   /* v162: last tick the in-play look code ran (stubs.cpp) */
+volatile long g_port_frame_no = 0;   /* game frames (the title's limiter hook counts them; 0 = not counted) */
 volatile int g_port_pause_ui = 0;   /* v162c: the pause menu loaded its text (stubs.cpp); cleared when play resumes */
 volatile double g_port_view_fov = 82.0;   /* v190e: the player's view FOV (stubs.cpp port_fov_note) */
 volatile int g_port_space_start = 0;   /* v160v: set by stubs.cpp while a level intro card waits for Start */
@@ -581,17 +673,12 @@ static void kbm_load(void)
            s_kbm_n, s_kbm_sens, s_kbm_dz, g_ml_mode ? "direct" : "stick", g_ml_deg_per_count);
 }
 
-static u8 kbm_mouse_axis(double v)
+static u8 kbm_mouse_axis(double v, kbm_stick_carry* carry)
 {
-    /* v: deflection fraction, signed. Past the deadzone, linear to full. */
-    double a = fabs(v);
-    if (a < 0.002) return 128;
-    if (a > 1.0) a = 1.0;
-    double o = s_kbm_dz + (1.0 - s_kbm_dz) * a;
-    if (o > 1.0) o = 1.0;
-    int iv = 128 + (int)((v < 0 ? -o : o) * 127.0);
-    if (iv < 0) iv = 0; if (iv > 255) iv = 255;
-    return (u8)iv;
+    /* v: deflection fraction, signed. Past the deadzone, linear to full, with the
+     * fraction of a stick step carried to the next poll (kbm_stick.h): vehicle and
+     * turret aiming with the mouse turns smoothly instead of in steps. */
+    return (u8)kbm_stick_axis(v, s_kbm_dz, carry);
 }
 
 /* v152: the game's controller screen lets the player swap which button does
@@ -756,9 +843,14 @@ static void pad_poll_keyboard(void)
      * ~2500 counts/s (a brisk flick at 800 dpi) is full deflection. */
     static ULONGLONG last = 0; static double vx = 0, vy = 0;
     ULONGLONG now = GetTickCount64();
-    double dt = last ? (double)(now - last) / 1000.0 : 0.016;
-    if (dt < 0.001) dt = 0.001; if (dt > 0.1) dt = 0.1;
-    last = now;
+    /* the poll interval from the performance counter: the 15.6 ms system tick made it jump
+     * between 0 (read as 1 ms: a 16x speed spike), 16 and 31 ms -- turret jitter */
+    static LARGE_INTEGER qf, ql;
+    LARGE_INTEGER qn; QueryPerformanceCounter(&qn);
+    if (!qf.QuadPart) QueryPerformanceFrequency(&qf);
+    double dt = (last && ql.QuadPart && qf.QuadPart > 0) ? (double)(qn.QuadPart - ql.QuadPart) / (double)qf.QuadPart : 0.016;
+    if (dt < 0.0002) dt = 0.0002; if (dt > 0.1) dt = 0.1;
+    last = now; ql = qn;
     long mdx = InterlockedExchange(&g_kbm_mouse_dx, 0), mdy = InterlockedExchange(&g_kbm_mouse_dy, 0);
     if (!g_kbm_capture) mdx = mdy = 0;
     g_kbm_mouse_abs += (unsigned long long)(labs(mdx) + labs(mdy));   /* v159: grab escape meter */
@@ -801,7 +893,7 @@ static void pad_poll_keyboard(void)
         if (KD(VK_RIGHT) || KD('D')) m |= CELL_PAD_CTRL_RIGHT;
         #undef KD
         if (ph == 1) m |= ph_btn;
-        btns = m; lx = ly = krx = kry = 0; interact = 0;
+        btns = pad_kb_confirm(m); lx = ly = krx = kry = 0; interact = 0;
         mdx = mdy = 0;                       /* the mouse is the highlight here, not a stick */
       } }
     double ix = (double)mdx / dt, iy = (double)mdy / dt;
@@ -825,7 +917,19 @@ static void pad_poll_keyboard(void)
        * held, and for 300 ms after, it is gameplay, not a menu. */
       static ULONGLONG s_r2_ms = 0;
       if (btns & CELL_PAD_CTRL_R2) s_r2_ms = now;
-      const int menu = fe2 && g_port_play_ms && now - g_port_play_ms > 200 && (!s_r2_ms || now - s_r2_ms > 300);
+      /* A hitch (shader compile, streaming) also stops the look code for > 200 ms;
+       * then WASD pressed the d-pad raw, without the controls-screen swap (crouch
+       * <-> d-pad up): a random crouch. A menu also needs >= 3 game frames
+       * without the look code (when the title counts frames, g_port_frame_no). */
+      static unsigned long long s_play_seen = 0;
+      static long s_play_frame = 0;
+      const long fno = g_port_frame_no;
+      if (g_port_play_ms != s_play_seen) { s_play_seen = g_port_play_ms; s_play_frame = fno; }
+      /* PAD_MENU_FRAMES=0: old behaviour (no frame-count guard, the 200 ms test alone) */
+      static int s_menu_frames = -1;
+      if (s_menu_frames < 0) { const char* e = getenv("PAD_MENU_FRAMES"); s_menu_frames = !(e && *e == '0'); }
+      const int frames_ok = !s_menu_frames || !fno || fno - s_play_frame >= 3;
+      const int menu = fe2 && g_port_play_ms && now - g_port_play_ms > 200 && frames_ok && (!s_r2_ms || now - s_r2_ms > 300);
       { static int was = -1;
         if (menu != was) { was = menu; static int n = 0;
           if (ps3_diag_enabled() && n++ < 200) { FILE* f = fopen("logs\\menumode.txt", n == 1 ? "w" : "a");
@@ -838,15 +942,17 @@ static void pad_poll_keyboard(void)
         if (KD(VK_DOWN) || KD('S')) btns |= CELL_PAD_CTRL_DOWN;
         if (KD(VK_LEFT) || KD('A')) btns |= CELL_PAD_CTRL_LEFT;
         if (KD(VK_RIGHT) || KD('D')) btns |= CELL_PAD_CTRL_RIGHT;
-        if (KD(VK_RETURN)) btns |= CELL_PAD_CTRL_CROSS;
-        if (KD(VK_BACK)) btns |= CELL_PAD_CTRL_CIRCLE;
+        u16 kc = 0;   /* keyboard confirm / back (pad_kb_confirm) */
+        if (KD(VK_RETURN)) kc |= CELL_PAD_CTRL_CROSS;
+        if (KD(VK_BACK)) kc |= CELL_PAD_CTRL_CIRCLE;
         /* v162c: in the pause menu Esc = back (O), like G; on the top page O also resumes.
          * The Esc press that opened the pause must be let go first. */
         if (!KD(VK_ESCAPE)) s_esc_armed = 1;
         if (g_port_pause_ui) {
             btns &= (u16)~CELL_PAD_CTRL_START;
-            if (s_esc_armed && KD(VK_ESCAPE)) btns |= CELL_PAD_CTRL_CIRCLE;
+            if (s_esc_armed && KD(VK_ESCAPE)) kc |= CELL_PAD_CTRL_CIRCLE;
         }
+        btns |= pad_kb_confirm(kc);
         #undef KD
         lx = ly = 0;   /* the stick would fight the d-pad on some screens */
         menu_raw = 1;  /* v162b: menus read raw buttons -- the controller-screen swap (e.g. crouch <-> d-pad up) must not apply */
@@ -861,6 +967,7 @@ static void pad_poll_keyboard(void)
                      fe3 = _stricmp(b, "PortFrontEnd.exe") ? 0 : 1; }
       if (fe3 && (GetAsyncKeyState(VK_SPACE) & 0x8000)) btns |= CELL_PAD_CTRL_START; }
     btns = pad_aim_toggle(0, btns, menu_raw);
+    btns = pad_hold_toggle(0, btns, menu_raw, lx || ly);
     hs->buttons   = menu_raw ? btns : kbm_unswap(btns);   /* v152: undo the in-game button swaps for the keyboard */
     g_port_use_kbm = interact;
     hs->connected = 1;
@@ -870,8 +977,9 @@ static void pad_poll_keyboard(void)
         hs->analog_rx = (u8)(krx < 0 ? 0 : krx > 0 ? 255 : 128);
         hs->analog_ry = (u8)(kry < 0 ? 0 : kry > 0 ? 255 : 128);
     } else {
-        hs->analog_rx = kbm_mouse_axis(fx);
-        hs->analog_ry = kbm_mouse_axis(fy);
+        static kbm_stick_carry carry_x, carry_y;   /* sub-step carry per axis (kbm_stick.h) */
+        hs->analog_rx = kbm_mouse_axis(fx, &carry_x);
+        hs->analog_ry = kbm_mouse_axis(fy, &carry_y);
     }
     g_ml_fed_rx = (int)hs->analog_rx - 128; g_ml_fed_ry = (int)hs->analog_ry - 128;
     g_ml_rs_keys = (krx || kry); g_ml_kbm_ms = GetTickCount64();
@@ -907,7 +1015,7 @@ static void pad_poll_keyboard(void)
 #include <setupapi.h>
 #pragma comment(lib, "setupapi.lib")
 volatile int g_port_ui_modal = 0;     /* set by project/r2_pcport.cpp: game input blocked, cursor free */
-volatile int g_port_input_mode = 1;   /* 0 PS3 buttons, 1 keyboard & mouse, 2 Xbox buttons */
+volatile int g_port_input_mode = 1;   /* 0 PS3 buttons, 1 keyboard & mouse, 2 Xbox buttons, 3 Nintendo buttons */
 extern volatile int g_port_intro_movie;   /* sys_fs.c */
 static int pad_sony_hid_present(void)
 {
@@ -935,6 +1043,7 @@ static int pad_glyph_pref_of(const char* e)
     if (!e || !*e || !_stricmp(e, "auto")) return 0;
     if (!_stricmp(e, "ps") || !_stricmp(e, "playstation")) return 1;
     if (!_stricmp(e, "keys") || !_stricmp(e, "keyboard")) return 3;
+    if (!_stricmp(e, "nintendo") || !_stricmp(e, "switch")) return 4;
     return 2;
 }
 static int pad_glyph_mode(int recheck)
@@ -953,8 +1062,13 @@ static int pad_glyph_mode(int recheck)
     if (pref == 0 && recheck) {
         sony = pad_sony_hid_present();
         printf("[cellPad] controller prompts: %s\n", sony ? "PlayStation (Sony controller found)" : "Xbox");
+#if !PAD_HAVE_SDL3
+        if (sony)
+            printf("[cellPad] WARNING: this build has no SDL3 pad backend (ps3recomp/third_party/SDL3/lib/SDL3-static.lib "
+                   "was missing at build time): a DualSense / DualShock 4 only works through Steam Input or DS4Windows\n");
+#endif
     }
-    return pref == 1 ? 0 : pref == 2 ? 2 : pref == 3 ? 1 : (sony ? 0 : 2);
+    return pref == 1 ? 0 : pref == 2 ? 2 : pref == 3 ? 1 : pref == 4 ? 3 : (sony ? 0 : 2);
 }
 /* PC port (project/r2_pcport.cpp, the in-game PC menu): live changes. */
 void cellpad_set_glyph_pref(const char* v) { s_glyph_pref = pad_glyph_pref_of(v); }
@@ -1060,10 +1174,9 @@ static void pad_stick_radial(short rx, short ry, u8* ox, u8* oy)
     const double m = sqrt(x * x + y * y);
     double sx = 0.0, sy = 0.0;
     if (m > s_pad_dz && m > 1e-6) {
-        double t = (m - s_pad_dz) / (1.0 - s_pad_dz);
-        if (t > 1.0) t = 1.0;
-        t = pow(t, s_pad_curve);
+        const double t = pcx_stick_mag((float)m, (float)s_pad_dz, (float)s_pad_outer, (float)s_pad_anti, (float)s_pad_curve);
         sx = x / m * t; sy = y / m * t;
+        pad_squircle(&sx, &sy, pad_squircle_factor());   /* PAD_SQUIRCLE=0: off */
     }
     int vx = (int)(sx * 127.0) + 128, vy = (int)(sy * 127.0) + 128;
     vx = vx < 0 ? 0 : vx > 255 ? 255 : vx; vy = vy < 0 ? 0 : vy > 255 ? 255 : vy;
@@ -1073,6 +1186,13 @@ static void pad_stick_radial(short rx, short ry, u8* ox, u8* oy)
 static void pad_map_slots(const PadHostState* xs, int nslots)
 {
     pad_coop_init();
+    PadHostState merged[PAD_MAX_SLOTS];
+    if (pad_merge_enabled()) {   /* PAD_MERGE=1: every controller is slot 0 -> player 1 */
+        if (nslots > PAD_MAX_SLOTS) nslots = PAD_MAX_SLOTS;
+        memset(merged, 0, sizeof merged);
+        pad_merge_states(xs, nslots, &merged[0]);
+        xs = merged;
+    }
     const int first = s_coop_p2kb ? 1 : 0;              /* player 1's controller port */
     const int nports = s_coop_on ? PAD_MAX_HOST_PORTS : 1;
     int used[PAD_MAX_SLOTS] = { 0 }, reserved[PAD_MAX_SLOTS] = { 0 };
@@ -1109,8 +1229,23 @@ static void pad_map_slots(const PadHostState* xs, int nslots)
         else { memset(hs, 0, sizeof *hs); hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128; }
     }
     PadHostState* p1 = &s_host_state[first];
+    if (!pad_bg_input_ok())                              /* PAD_BACKGROUND_INPUT: neutral pads while unfocused */
+        for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
+            PadHostState* hs = &s_host_state[p];
+            if (!hs->connected) continue;
+            memset(hs, 0, sizeof *hs);
+            hs->connected = 1;
+            hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
+        }
     if (p1->connected) {
-        p1->buttons = pad_aim_toggle(1, p1->buttons, g_port_play_ms == 0 || GetTickCount64() - g_port_play_ms > 500);
+        const int menu = g_port_play_ms == 0 || GetTickCount64() - g_port_play_ms > 500;
+        p1->buttons = pad_aim_toggle(1, p1->buttons, menu);
+        { const u16 was = p1->buttons;
+          const int moving = abs((int)p1->analog_lx - 128) > 40 || abs((int)p1->analog_ly - 128) > 40;
+          p1->buttons = pad_hold_toggle(1, p1->buttons, menu, moving);
+          const u16 ch = (u16)(was ^ p1->buttons);
+          if (ch & CELL_PAD_CTRL_CIRCLE) p1->press_circle = (p1->buttons & CELL_PAD_CTRL_CIRCLE) ? 255 : 0;
+          if (ch & CELL_PAD_CTRL_L2) p1->trigger_l2 = (p1->buttons & CELL_PAD_CTRL_L2) ? 255 : 0; }
         p1->press_l1 = (p1->buttons & CELL_PAD_CTRL_L1) ? 255 : 0;
         if (first == 0) g_port_pad_btns0 = p1->buttons;
     }
@@ -1132,8 +1267,34 @@ static void pad_xgp_to_state(int i, XINPUT_GAMEPAD* gp, PadHostState* x)
     if (gp->wButtons & XINPUT_GAMEPAD_DPAD_RIGHT)     btns |= CELL_PAD_CTRL_RIGHT;
     if (gp->wButtons & XINPUT_GAMEPAD_DPAD_DOWN)      btns |= CELL_PAD_CTRL_DOWN;
     if (gp->wButtons & XINPUT_GAMEPAD_DPAD_LEFT)      btns |= CELL_PAD_CTRL_LEFT;
-    if (gp->bLeftTrigger > PAD_TRIGGER_THRESHOLD)     btns |= CELL_PAD_CTRL_L2;
-    if (gp->bRightTrigger > PAD_TRIGGER_THRESHOLD)    btns |= CELL_PAD_CTRL_R2;
+    {
+        /* Triggers: press above PAD_TRIGGER_THRESHOLD, release only below
+         * PAD_TRIGGER_RELEASE. A resting or half-held trigger hovering around
+         * one threshold toggled L2 every few frames, and R2 binds crouch to a
+         * toggle on L2 ("randomly puts me into crouch"). The analog value is
+         * also cut to 0 while the button is up, so the pressure never says
+         * "pressed" when the digital bit does not. PAD_TRIGGER_HYST=0: old
+         * single threshold and raw pressure. */
+        static int hyst = -1;
+        static u8 on[8][2];
+        if (hyst < 0) { const char* e = getenv("PAD_TRIGGER_HYST"); hyst = !(e && *e == '0'); }
+        pad_feat_init();
+        if (s_pad_trig_dz > 0) {                         /* PAD_TRIGGER_DEADZONE */
+            gp->bLeftTrigger = (u8)pcx_trigger_dz(gp->bLeftTrigger, s_pad_trig_dz);
+            gp->bRightTrigger = (u8)pcx_trigger_dz(gp->bRightTrigger, s_pad_trig_dz);
+        }
+        const int s = i >= 0 && i < 8 ? i : 0;
+        const u8 t[2] = { gp->bLeftTrigger, gp->bRightTrigger };
+        for (int k = 0; k < 2; k++) {
+            if (!hyst) on[s][k] = t[k] > PAD_TRIGGER_THRESHOLD;
+            else if (on[s][k]) on[s][k] = t[k] >= PAD_TRIGGER_RELEASE;
+            else on[s][k] = t[k] > PAD_TRIGGER_THRESHOLD;
+        }
+        if (on[s][0]) btns |= CELL_PAD_CTRL_L2;
+        if (on[s][1]) btns |= CELL_PAD_CTRL_R2;
+        x->trigger_l2 = (hyst && !on[s][0]) ? 0 : gp->bLeftTrigger;
+        x->trigger_r2 = (hyst && !on[s][1]) ? 0 : gp->bRightTrigger;
+    }
     if (gp->wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER)  btns |= CELL_PAD_CTRL_L1;
     if (gp->wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) btns |= CELL_PAD_CTRL_R1;
     if (gp->wButtons & XINPUT_GAMEPAD_Y)              btns |= CELL_PAD_CTRL_TRIANGLE;
@@ -1151,6 +1312,11 @@ static void pad_xgp_to_state(int i, XINPUT_GAMEPAD* gp, PadHostState* x)
     if (s_pad_dz >= 0.0) {
         pad_stick_radial(gp->sThumbLX, gp->sThumbLY, &x->analog_lx, &x->analog_ly);
         pad_stick_radial(gp->sThumbRX, gp->sThumbRY, &x->analog_rx, &x->analog_ry);
+    } else if (pad_squircle_factor() > 0) {
+        /* PAD_SQUIRCLE (default 4000): round deadzone + squircle, as RPCS3 and the
+         * GoW: Ascension recomp do; PAD_SQUIRCLE=0 = the per-axis conversion below. */
+        pad_stick_squircle_u8(gp->sThumbLX, gp->sThumbLY, PAD_STICK_DEADZONE / 32767.0, pad_squircle_factor(), &x->analog_lx, &x->analog_ly);
+        pad_stick_squircle_u8(gp->sThumbRX, gp->sThumbRY, PAD_STICK_DEADZONE / 32767.0, pad_squircle_factor(), &x->analog_rx, &x->analog_ry);
     } else {
     x->analog_lx = pad_xinput_stick_to_u8(gp->sThumbLX, PAD_STICK_DEADZONE);
     x->analog_ly = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbLY, PAD_STICK_DEADZONE));
@@ -1158,9 +1324,7 @@ static void pad_xgp_to_state(int i, XINPUT_GAMEPAD* gp, PadHostState* x)
     x->analog_ry = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbRY, PAD_STICK_DEADZONE));
     }
 
-    /* Triggers */
-    x->trigger_l2 = gp->bLeftTrigger;
-    x->trigger_r2 = gp->bRightTrigger;
+    /* Triggers: set with the L2/R2 buttons above */
 
     /* Pressure-sensitive buttons: XInput has digital only, so 0 or 255 */
     x->press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
@@ -1211,7 +1375,7 @@ static void pad_poll_xinput(void)
  * with Aim held; never under the PC menus.) */
 static int pad_gyro_gate(int p)
 {
-    if (g_port_ui_modal || s_gyro_mode <= 0) return 0;
+    if (g_port_ui_modal || s_gyro_mode <= 0 || !pad_bg_input_ok()) return 0;   /* PAD_BACKGROUND_INPUT */
     if (s_gyro_mode == 2 && !(s_host_state[p].buttons & CELL_PAD_CTRL_L1)) return 0;
     return 1;
 }
@@ -1348,6 +1512,30 @@ unsigned cellpad_menu_buttons(int* any_connected)
     return last;
 }
 
+/* PAD_TURN_BOOST=<deg/s>: the right stick held at the edge (not aiming) ramps in extra turn speed
+ * over 0.35 s, through the gyro path below (the look code adds it to the camera like gyro turning). */
+static int pad_turn_boost_on(void)
+{
+    pad_feat_init();
+    if (s_pad_turn_boost <= 0 || g_port_ui_modal) return 0;
+    const u32 p = pad_host_port(0);
+    if (p >= PAD_MAX_HOST_PORTS || (p == 0 && g_port_input_kbm) || s_port_slot[p] < 0) return 0;
+    return s_host_state[p].connected;
+}
+static int pad_turn_boost_take(double* yaw_deg)
+{
+    static PcxTurnBoost tb; static unsigned long long last;
+    if (!pad_turn_boost_on()) { tb.held_ms = 0; last = 0; return 0; }
+    const unsigned long long now = GetTickCount64();
+    const unsigned dt = (last && now - last < 150) ? (unsigned)(now - last) : 0;
+    last = now;
+    const PadHostState* hs = &s_host_state[pad_host_port(0)];
+    const float x = ((int)hs->analog_rx - 128) / 127.0f;
+    const int aiming = (hs->buttons & CELL_PAD_CTRL_L1) != 0;
+    const float f = pcx_turn_boost(&tb, aiming ? 0.0f : x, dt, 1.0f, 350);
+    if (f > 0.0f && dt) *yaw_deg += (x < 0 ? -1.0 : 1.0) * f * s_pad_turn_boost * dt / 1000.0;
+    return 1;
+}
 /* Gyro for the direct look code (project/stubs.cpp, like the mouse): the
  * camera turn in degrees since the last call for guest port 0's controller
  * (+ = right / down). Returns 1 while gyro aiming is on for that controller --
@@ -1355,6 +1543,7 @@ unsigned cellpad_menu_buttons(int* any_connected)
  * -- 0 when there is none (SDL3 off, no gyro, keyboard in use). */
 int cellpad_gyro_active(void)
 {
+    if (pad_turn_boost_on()) return 1;
 #if PAD_HAVE_SDL3
     if (s_backend != 1 || s_gyro_mode <= 0) return 0;
     const u32 p = pad_host_port(0);
@@ -1368,10 +1557,14 @@ int cellpad_gyro_active(void)
 int cellpad_gyro_take(double* yaw_deg, double* pitch_deg)
 {
     *yaw_deg = *pitch_deg = 0.0;
+    const int boost = pad_turn_boost_take(yaw_deg);
 #if PAD_HAVE_SDL3
-    if (!cellpad_gyro_active()) return 0;
+    if (s_backend != 1 || s_gyro_mode <= 0) return boost;
+    {
     const u32 p = pad_host_port(0);
-    const int sl = s_port_slot[p];
+    if (p == 0 && g_port_input_kbm) return boost;
+    const int sl = p < PAD_MAX_HOST_PORTS ? s_port_slot[p] : -1;
+    if (!(sl >= 0 && sl < PADX_SLOTS && s_sdl_snap[sl].connected && s_sdl_snap[sl].has_gyro)) return boost;
     const unsigned long long now = GetTickCount64();
     s_gyro_direct_ms = now;
     double y, pt;
@@ -1380,10 +1573,11 @@ int cellpad_gyro_take(double* yaw_deg, double* pitch_deg)
     const int stale = now - s_gyro_take_ms > 150;
     s_gyro_take_ms = now;
     if (stale || !pad_gyro_gate((int)p)) return 1;
-    *yaw_deg = y; *pitch_deg = pt;
+    *yaw_deg += y; *pitch_deg = pt;
     return 1;
+    }
 #else
-    return 0;
+    return boost;
 #endif
 }
 /* In-game PC menu: live changes to the gyro / light bar / Nintendo options
@@ -1391,9 +1585,24 @@ int cellpad_gyro_take(double* yaw_deg, double* pitch_deg)
  * lightbar, nswap). */
 void cellpad_set_pad_opt(const char* key, const char* v)
 {
+    if (!v) v = "";
+    pad_feat_init();
+    /* PC extras (ps3emu/port_pc_extras.h): keys as the env names */
+    if (!_stricmp(key, "PAD_RUMBLE")) { s_pad_rumble_pct = pcx_parse_pct(v, 100, 0, 100); return; }
+    if (!_stricmp(key, "PAD_TRIGGER_DEADZONE")) { s_pad_trig_dz = pcx_parse_pct(v, 0, 0, 90); return; }
+    if (!_stricmp(key, "PAD_TURN_BOOST")) { s_pad_turn_boost = pcx_parse_pct(v, 0, 0, 360); return; }
+    if (!_stricmp(key, "PAD_CROUCH_MODE")) { s_pad_crouch_mode = pcx_btn_mode(v); return; }
+    if (!_stricmp(key, "PAD_SPRINT_MODE")) { s_pad_sprint_mode = pcx_btn_mode(v); return; }
+    if (!_stricmp(key, "PAD_BACKGROUND_INPUT")) { s_pad_bg_mode = pcx_bg_mode(v); return; }
+    if (!_stricmp(key, "R2_BACKGROUND")) { s_pad_bg_run = pcx_bg_keeps_running(v); return; }
+    if (!_stricmp(key, "PAD_OUTER_DEADZONE") || !_stricmp(key, "PAD_ANTI_DEADZONE")) {
+        const double d = pcx_parse_pct(v, 0, 0, 50) / 100.0;
+        if (!_stricmp(key, "PAD_OUTER_DEADZONE")) s_pad_outer = d; else s_pad_anti = d;
+        if ((s_pad_outer > 0.0 || s_pad_anti > 0.0) && s_pad_dz < 0.0) s_pad_dz = 7849.0 / 32767.0;
+        return;
+    }
 #if PAD_HAVE_SDL3
     pad_gyro_init();
-    if (!v) v = "";
     if (!_stricmp(key, "gyro")) s_gyro_mode = padl_gyro_mode(v);
     else if (!_stricmp(key, "gyrosens")) { const double d = atof(v); s_gyro_sens = (d >= 0.05 && d <= 20.0) ? d : 2.0; }
     else if (!_stricmp(key, "gyroinvy")) s_gyro_inv = (*v && *v != '0');
@@ -1687,9 +1896,12 @@ void cellPad_poll(void)
 
 volatile u32 g_pad_data_ea0 = 0;   /* v147: guest address of port 0's last GetData buffer (pad watch) */
 static s32 pad_get_data_impl(u32 port_no, CellPadData* data_guest);
+/* Set by the renderer (VKR2PcExtras.cpp) while NVIDIA Reflex latency markers are on: INPUT_SAMPLE marker */
+void (*volatile g_pad_input_hook)(void) = 0;
 s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 {
     const uint64_t ht = port_hitch_t0();   /* [hitch] pad time */
+    if (port_no == 0) { void (*hook)(void) = g_pad_input_hook; if (hook) hook(); }
     const s32 r = pad_get_data_impl(port_no, data_guest);
     port_hitch_end(PH_PAD, ht);
     return r;
@@ -1769,11 +1981,11 @@ skip_inject: ;
     /* Resistance port: remote control from the debug console ("pad ..."):
      * buttons and both sticks held until a deadline, on port 0. */
     PadHostState inj;
-    { extern volatile unsigned long long g_pad_inj_until; extern volatile u32 g_pad_inj_btn, g_pad_inj_sticks;
+    { extern volatile unsigned long long g_pad_inj_until; extern volatile u32 g_pad_inj_btn, g_pad_inj_sticks, g_pad_inj_clear;
       extern unsigned long long ps3_ms_now(void);
       if (port_no == 0 && g_pad_inj_until && ps3_ms_now() < g_pad_inj_until) {
           inj = *hs; const u32 st = g_pad_inj_sticks;
-          inj.buttons |= (u16)g_pad_inj_btn; inj.connected = 1;
+          inj.buttons = (u16)((inj.buttons & ~g_pad_inj_clear) | g_pad_inj_btn); inj.connected = 1;
           inj.analog_lx = (u8)(st >> 24); inj.analog_ly = (u8)(st >> 16);
           inj.analog_rx = (u8)(st >> 8);  inj.analog_ry = (u8)st;
           hs = &inj;

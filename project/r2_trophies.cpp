@@ -5,7 +5,9 @@
 //   - name the trophy from the game's own TROPHY.TRP (read from the user's game files at run
 //     time: gamefiles\PS3_GAME\TROPDIR\<comm id>_00\TROPHY.TRP),
 //   - mirror the unlock list to %USERPROFILE%\Saved Games\Resistance 2\trophies.json,
-//   - show a toast in the game window (R2_TROPHY_TOAST=0 turns it off),
+//   - show a PS3-style trophy pop-up in the game window (port_trophy_popup.h, with the trophy's own
+//     icon from TROPHY.TRP; PORT_TROPHY_STYLE=old or R2_TROPHY_STYLE=old: the port's older toast;
+//     R2_TROPHY_TOAST=0 turns it off; PORT_TROPHY_TEST=1 shows one pop-up per grade at start-up),
 //   - award the platinum once every trophy that counts towards it is unlocked (the HLE has no
 //     grade data of its own).
 // The launcher's Trophies page shows the same list.
@@ -19,6 +21,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include "port_trophy_popup.h"
 #include "r2_trophy_data.h"
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -26,6 +29,7 @@
 extern "C" int (*volatile g_trophy_unlock_hook)(const char* comm_id, int trophy_id, const unsigned char* unlocked, unsigned count);
 extern "C" const char* ppu_vfs_root;
 extern "C" void r2pf_toast(const char* title, const char* text, char badge);
+extern "C" void r2pf_trophy(const char* line1, const char* name, char grade, const char* trp, int trophy_id);
 
 namespace {
 
@@ -34,6 +38,7 @@ std::string s_loaded_comm;
 std::vector<r2t::Trophy> s_list;
 std::string s_title;
 std::vector<int> s_saved;   // ids in the Saved Games record (announced before)
+std::string s_trp;          // the TROPHY.TRP read (its icons go in the pop-ups)
 
 std::string saved_games_dir()
 {
@@ -57,6 +62,7 @@ void load(const char* comm)
     std::string trp = root + "/PS3_GAME/TROPDIR/" + comm + "_00/TROPHY.TRP";
     if (GetFileAttributesA(trp.c_str()) == INVALID_FILE_ATTRIBUTES)
         trp = std::string("gamefiles/PS3_GAME/TROPDIR/") + comm + "_00/TROPHY.TRP";
+    s_trp = trp;
     if (r2t::load_trp(trp.c_str(), s_list, &s_title))
         fprintf(stderr, "[trophy] %zu trophies (%s) from %s\n", s_list.size(), s_title.c_str(), trp.c_str());
     else
@@ -112,7 +118,10 @@ int hook(const char* comm_id, int id, const unsigned char* unlocked, unsigned co
         std::string body = tr ? tr->name : "Trophy #" + std::to_string(tid);
         if (tr && !tr->detail.empty()) body += " \xE2\x80\x94 " + tr->detail;
         fprintf(stderr, "[trophy] unlocked #%d %s\n", tid, tr ? tr->name.c_str() : "");
-        if (toast) r2pf_toast(head, body.c_str(), tr ? tr->grade : 'B');
+        if (!toast) return;
+        if (ptp::style_old("R2")) r2pf_toast(head, body.c_str(), tr ? tr->grade : 'B');
+        else r2pf_trophy("You have earned a trophy.", tr ? tr->name.c_str() : body.c_str(), tr ? tr->grade : 'B',
+                         tr && !s_trp.empty() ? s_trp.c_str() : nullptr, tid);
     };
     if (earned) fprintf(stderr, "[trophy] #%d already earned (Saved Games record), not announced again\n", id);
     else show(t, id);
@@ -124,8 +133,44 @@ int hook(const char* comm_id, int id, const unsigned char* unlocked, unsigned co
     return plat;
 }
 
+// PORT_TROPHY_TEST=1: a few seconds after start-up, one pop-up per grade (the game's first bronze,
+// silver, gold and platinum trophy from TROPHY.TRP, or placeholders) to check the look in game.
+DWORD WINAPI test_thread(void*)
+{
+    Sleep(5000);
+    std::string trp;
+    for (const char* root : { ppu_vfs_root && *ppu_vfs_root ? ppu_vfs_root : "gamefiles", "gamefiles" }) {
+        WIN32_FIND_DATAA fd;
+        const std::string dir = std::string(root) + "/PS3_GAME/TROPDIR/";
+        HANDLE h = FindFirstFileA((dir + "*_00").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        do {
+            const std::string p = dir + fd.cFileName + "/TROPHY.TRP";
+            if (GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES) { trp = p; break; }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+        if (!trp.empty()) break;
+    }
+    std::vector<r2t::Trophy> list;
+    if (!trp.empty()) r2t::load_trp(trp.c_str(), list, nullptr);
+    fprintf(stderr, "[trophy] PORT_TROPHY_TEST: sample pop-ups (%s)\n", trp.empty() ? "no TROPHY.TRP: placeholders" : trp.c_str());
+    for (char g : { 'B', 'S', 'G', 'P' }) {
+        const r2t::Trophy* t = nullptr;
+        for (auto& x : list) if (x.grade == g) { t = &x; break; }
+        const std::string name = t ? t->name : std::string(r2t::grade_name(g)) + " trophy (test)";
+        if (ptp::style_old("R2")) r2pf_toast((std::string(r2t::grade_name(g)) + " trophy unlocked").c_str(), name.c_str(), g);
+        else r2pf_trophy("You have earned a trophy.", name.c_str(), g, t ? trp.c_str() : nullptr, t ? t->id : -1);
+    }
+    return 0;
+}
+
 struct TrophyInit {
-    TrophyInit() { g_trophy_unlock_hook = hook; }
+    TrophyInit()
+    {
+        g_trophy_unlock_hook = hook;
+        if (ptp::test_on())
+            if (HANDLE h = CreateThread(nullptr, 0, test_thread, nullptr, 0, nullptr)) CloseHandle(h);
+    }
 } s_init;
 
 } // namespace

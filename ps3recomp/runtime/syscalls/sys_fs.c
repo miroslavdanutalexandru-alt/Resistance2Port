@@ -4,6 +4,7 @@
 
 #include "sys_fs.h"
 #include "../../libs/filesystem/edat.h"
+#include "../../libs/system/lang_fallback.h"
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdio.h>
@@ -40,11 +41,64 @@ volatile int    g_port_intro_movie = 0;
 void (*volatile g_port_file_open_cb)(int slot, const char* path) = 0;
 void (*volatile g_port_file_close_cb)(int slot) = 0;
 
+/* The fd table is shared by every guest thread. Unlocked, two opens could
+ * claim the same slot, and a close could fclose a FILE* another thread was
+ * still reading (UCRT invalid parameter 0xC0000417, see ppu_fs.cpp). Lookups
+ * take a reference under s_fd_lock and do their I/O outside it; a close
+ * unlinks the fd (active = 0) and the stream is closed by whoever drops the
+ * last reference. A slot is reusable once it is inactive with no stream left.
+ * Directory handles are rare: one lock held for the whole call. */
+#ifdef _WIN32
+static SRWLOCK s_fd_lock = SRWLOCK_INIT;
+static SRWLOCK s_dir_lock = SRWLOCK_INIT;
+static void sys_fs_fd_lock(void)    { AcquireSRWLockExclusive(&s_fd_lock); }
+static void sys_fs_fd_unlock(void)  { ReleaseSRWLockExclusive(&s_fd_lock); }
+static void sys_fs_dir_lock(void)   { AcquireSRWLockExclusive(&s_dir_lock); }
+static void sys_fs_dir_unlock(void) { ReleaseSRWLockExclusive(&s_dir_lock); }
+#else
+#include <pthread.h>
+static pthread_mutex_t s_fd_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t s_dir_lock = PTHREAD_MUTEX_INITIALIZER;
+static void sys_fs_fd_lock(void)    { pthread_mutex_lock(&s_fd_lock); }
+static void sys_fs_fd_unlock(void)  { pthread_mutex_unlock(&s_fd_lock); }
+static void sys_fs_dir_lock(void)   { pthread_mutex_lock(&s_dir_lock); }
+static void sys_fs_dir_unlock(void) { pthread_mutex_unlock(&s_dir_lock); }
+#endif
+static int s_fd_refs[SYS_FS_FD_MAX];   /* in-flight operations per slot */
+/* Bink voice-track ids rewritten on read, per slot (lang_fallback.h). */
+static LfBinkPlan s_bink_plan[SYS_FS_FD_MAX];
+/* Per language: does the disc dub it anywhere (0 = not looked yet, 1 yes, 2 no). */
+static volatile int s_disc_lang[20];
+
+/* The open slot for fd with a reference taken, or NULL (bad / closed fd). */
+static sys_fs_fd_info* sys_fs_fd_get(int32_t fd)
+{
+    const int slot = fd - 3;
+    if (slot < 0 || slot >= SYS_FS_FD_MAX) return NULL;
+    sys_fs_fd_info* f = NULL;
+    sys_fs_fd_lock();
+    if (g_sys_fs_fds[slot].active && g_sys_fs_fds[slot].fp) { f = &g_sys_fs_fds[slot]; s_fd_refs[slot]++; }
+    sys_fs_fd_unlock();
+    return f;
+}
+static void sys_fs_fd_put(sys_fs_fd_info* f)
+{
+    if (!f) return;
+    const int slot = (int)(f - g_sys_fs_fds);
+    FILE* dead = NULL;
+    sys_fs_fd_lock();
+    if (--s_fd_refs[slot] == 0 && !f->active) { dead = f->fp; f->fp = NULL; }
+    sys_fs_fd_unlock();
+    if (dead) fclose(dead);
+}
+
 /* PC port: push every open file's buffered writes to disk (quit path). */
 void sys_fs_flush_all(void)
 {
+    sys_fs_fd_lock();
     for (int i = 0; i < SYS_FS_FD_MAX; i++)
         if (g_sys_fs_fds[i].active && g_sys_fs_fds[i].fp) fflush(g_sys_fs_fds[i].fp);
+    sys_fs_fd_unlock();
 }
 
 static void write_be32(uint32_t addr, uint32_t val)
@@ -381,14 +435,6 @@ int64_t sys_fs_open(ppu_context* ctx)
       const char* use = edat_resolve(host_path, dec_path, sizeof dec_path);
       if (use != host_path) snprintf(host_path, sizeof host_path, "%s", use); }
 
-    /* Find free fd slot */
-    int slot = -1;
-    for (int i = 0; i < SYS_FS_FD_MAX; i++) {
-        if (!g_sys_fs_fds[i].active) { slot = i; break; }
-    }
-    if (slot < 0)
-        return (int64_t)(int32_t)CELL_ENOMEM;
-
     /* Determine fopen mode from PS3 flags */
     const char* mode;
     int access = flags & CELL_FS_O_ACCMODE;
@@ -469,6 +515,21 @@ int64_t sys_fs_open(ppu_context* ctx)
         fp = fopen(host_path, "w+b");
     }
 
+    /* PC port: speech the disc has no copy of in the system language (UK
+     * English on a disc with one English voice-over) -> the English file. */
+    if (!fp && access == CELL_FS_O_RDONLY && !(flags & (CELL_FS_O_CREAT | CELL_FS_O_TRUNC)) &&
+        lf_voice_policy(lf_system_language()) == 1 && lf_guest_path_ok(ps3_path)) {
+        char alt[1024];
+        for (int i = 0; !fp && lf_voice_candidate(host_path, i, alt, sizeof alt); i++) {
+            if ((fp = fopen(alt, mode)) != NULL) {
+                static int said;
+                if (!said++) fprintf(stderr, "[lang] %s is not on the disc, using %s (PS3_LANG_VOICE_FALLBACK=0 off)\n",
+                                     host_path, alt);
+                snprintf(host_path, sizeof host_path, "%s", alt);
+            }
+        }
+    }
+
     /* A DIRECTORY open is not a failure. fopen() cannot open one on Windows,
      * but real cellFsOpen answers CELL_EISDIR and titles branch on it -- flOw
      * opens Data/Titles/ (its localisation XML dir) and a generic ENOENT tells
@@ -492,12 +553,58 @@ int64_t sys_fs_open(ppu_context* ctx)
 
     fprintf(stderr, "[sys_fs] open OK: %s\n", host_path);
 
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    f->active = 1;
-    f->fp     = fp;
-    f->flags  = flags;
-    strncpy(f->path, host_path, sizeof(f->path) - 1);
-    f->path[sizeof(f->path) - 1] = '\0';
+    /* PC port: a Bink movie without a voice track in the system language
+     * plays its English one (lang_fallback.h). */
+    LfBinkPlan bplan;
+    bplan.n = 0;
+    if (access == CELL_FS_O_RDONLY && lf_is_bink(host_path)) {
+        const int lang = lf_system_language();
+        int pol = lf_voice_policy(lang);
+        if (pol) {
+            uint8_t hdr[2048];
+            const size_t got = fread(hdr, 1, sizeof hdr, fp);
+            fseek(fp, 0, SEEK_SET);
+            if (lf_bink_plan(hdr, got, lang, &bplan) && pol == 2) {
+                /* not an English variant: only when the disc has no dub for it at all */
+                if (!s_disc_lang[lang]) {
+                    const int d = lf_disc_voice_lang(host_path, lang);
+                    s_disc_lang[lang] = d == 0 ? 2 : 1;
+                    fprintf(stderr, "[lang] system language %d: %s on this disc%s\n", lang,
+                            d == 0 ? "no voice-over" : d == 1 ? "dubbed" : "voice-over unknown",
+                            d == 0 ? ", movies play the English voice" : ", movies left as they are");
+                }
+                if (s_disc_lang[lang] != 2) bplan.n = 0;
+            }
+            if (bplan.n) {
+                static int said;
+                if (!said++) fprintf(stderr, "[lang] %s has no voice track for system language %d, "
+                                             "playing the English one (PS3_LANG_VOICE_FALLBACK=0 off)\n", host_path, lang);
+            }
+        }
+    }
+
+    /* Claim a free slot (inactive, stream already closed) only now, under the
+     * lock: the slot is published with its stream in one step. */
+    int slot = -1;
+    sys_fs_fd_lock();
+    for (int i = 0; i < SYS_FS_FD_MAX; i++) {
+        sys_fs_fd_info* c = &g_sys_fs_fds[i];
+        if (!c->active && !c->fp && !s_fd_refs[i]) {
+            slot = i;
+            s_bink_plan[i] = bplan;
+            c->active = 1;
+            c->fp     = fp;
+            c->flags  = flags;
+            strncpy(c->path, host_path, sizeof(c->path) - 1);
+            c->path[sizeof(c->path) - 1] = '\0';
+            break;
+        }
+    }
+    sys_fs_fd_unlock();
+    if (slot < 0) {
+        fclose(fp);
+        return (int64_t)(int32_t)CELL_ENOMEM;
+    }
     if (strstr(host_path, "c00_insom_fmv"))
         g_port_intro_movie = slot + 1;
     { void (*cb)(int, const char*) = g_port_file_open_cb; if (cb) cb(slot, host_path); }
@@ -524,12 +631,8 @@ int64_t sys_fs_read(ppu_context* ctx)
     uint64_t size       = LV2_ARG_U64(ctx, 2);
     uint32_t nread_addr = LV2_ARG_PTR(ctx, 3);
 
-    int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
+    sys_fs_fd_info* f = sys_fs_fd_get(fd);
+    if (!f)
         return (int64_t)(int32_t)CELL_EBADF;
 
     void* buf = vm_to_host(buf_addr);
@@ -558,6 +661,8 @@ int64_t sys_fs_read(ppu_context* ctx)
             free(bounce);
         }
     }
+    { const LfBinkPlan* bp = &s_bink_plan[f - g_sys_fs_fds];
+      if (bp->n && nread && pos_before >= 0) lf_bink_apply(bp, (uint64_t)pos_before, (uint8_t*)buf, nread); }
 
     /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.
      *
@@ -593,6 +698,7 @@ int64_t sys_fs_read(ppu_context* ctx)
                 (uint32_t)ctx->lr);
       } }
 
+    sys_fs_fd_put(f);
     return CELL_OK;
 }
 
@@ -611,16 +717,9 @@ int64_t sys_fs_write(ppu_context* ctx)
     uint64_t size         = LV2_ARG_U64(ctx, 2);
     uint32_t nwritten_addr = LV2_ARG_PTR(ctx, 3);
 
-    int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX) {
+    sys_fs_fd_info* f = sys_fs_fd_get(fd);
+    if (!f) {
         /* Invalid fd — pretend write succeeded (CRT stdio uses corrupted fds) */
-        if (nwritten_addr != 0)
-            write_be64(nwritten_addr, size);
-        return CELL_OK;
-    }
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp) {
         if (nwritten_addr != 0)
             write_be64(nwritten_addr, size);
         return CELL_OK;
@@ -629,6 +728,7 @@ int64_t sys_fs_write(ppu_context* ctx)
     const void* buf = vm_to_host(buf_addr);
     size_t nwritten = fwrite(buf, 1, (size_t)size, f->fp);
     fflush(f->fp);
+    sys_fs_fd_put(f);
 
     if (nwritten_addr != 0) {
         write_be64(nwritten_addr, (uint64_t)nwritten);
@@ -651,15 +751,18 @@ int64_t sys_fs_close(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EBADF;
 
     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active)
+    FILE* dead = NULL;
+    sys_fs_fd_lock();
+    if (!f->active) {
+        sys_fs_fd_unlock();
         return (int64_t)(int32_t)CELL_EBADF;
-
-    if (f->fp) {
-        fclose(f->fp);
-        f->fp = NULL;
     }
     f->active = 0;
     if (g_port_intro_movie == slot + 1) g_port_intro_movie = 0;
+    /* In-flight reads keep the stream; the last sys_fs_fd_put closes it. */
+    if (s_fd_refs[slot] == 0) { dead = f->fp; f->fp = NULL; }
+    sys_fs_fd_unlock();
+    if (dead) fclose(dead);
     { void (*cb)(int) = g_port_file_close_cb; if (cb) cb(slot); }
 
     return CELL_OK;
@@ -680,28 +783,25 @@ int64_t sys_fs_lseek(ppu_context* ctx)
     int32_t  whence    = LV2_ARG_S32(ctx, 2);
     uint32_t pos_addr  = LV2_ARG_PTR(ctx, 3);
 
-    int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX) {
+    int origin;
+    switch (whence) {
+        case CELL_FS_SEEK_SET: origin = SEEK_SET; break;
+        case CELL_FS_SEEK_CUR: origin = SEEK_CUR; break;
+        case CELL_FS_SEEK_END: origin = SEEK_END; break;
+        default: origin = -1; break;
+    }
+
+    sys_fs_fd_info* f = sys_fs_fd_get(fd);
+    if (!f) {
         /* Invalid fd — return position 0 instead of EBADF.
          * The CRT may call lseek on uninitialized FILE structures. */
         if (pos_addr)
             write_be64(pos_addr, 0);
         return 0;
     }
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp) {
-        if (pos_addr)
-            write_be64(pos_addr, 0);
-        return 0;
-    }
-
-    int origin;
-    switch (whence) {
-        case CELL_FS_SEEK_SET: origin = SEEK_SET; break;
-        case CELL_FS_SEEK_CUR: origin = SEEK_CUR; break;
-        case CELL_FS_SEEK_END: origin = SEEK_END; break;
-        default: return (int64_t)(int32_t)CELL_EINVAL;
+    if (origin < 0) {
+        sys_fs_fd_put(f);
+        return (int64_t)(int32_t)CELL_EINVAL;
     }
 
 #ifdef _WIN32
@@ -711,6 +811,7 @@ int64_t sys_fs_lseek(ppu_context* ctx)
     fseeko(f->fp, (off_t)offset, origin);
     int64_t pos = (int64_t)ftello(f->fp);
 #endif
+    sys_fs_fd_put(f);
 
     if (pos_addr != 0) {
         write_be64(pos_addr, (uint64_t)pos);
@@ -800,25 +901,21 @@ int64_t sys_fs_fstat(ppu_context* ctx)
     int32_t  fd        = LV2_ARG_S32(ctx, 0);
     uint32_t stat_addr = LV2_ARG_PTR(ctx, 1);
 
-    int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
+    sys_fs_fd_info* f = sys_fs_fd_get(fd);
+    if (!f)
         return (int64_t)(int32_t)CELL_EBADF;
 
     struct stat st;
 #ifdef _WIN32
     int fno = _fileno(f->fp);
-    if (_fstat64(fno, (struct _stat64*)&st) != 0)
+    int bad = _fstat64(fno, (struct _stat64*)&st) != 0;
 #else
     int fno = fileno(f->fp);
-    if (fstat(fno, &st) != 0)
+    int bad = fstat(fno, &st) != 0;
 #endif
-    {
+    sys_fs_fd_put(f);
+    if (bad)
         return (int64_t)(int32_t)CELL_EBADF;
-    }
 
     fill_cell_stat(stat_addr, &st);
     return CELL_OK;
@@ -843,11 +940,14 @@ int64_t sys_fs_opendir(ppu_context* ctx)
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
     int slot = -1;
+    sys_fs_dir_lock();
     for (int i = 0; i < SYS_FS_DIR_MAX; i++) {
         if (!g_sys_fs_dirs[i].active) { slot = i; break; }
     }
-    if (slot < 0)
+    if (slot < 0) {
+        sys_fs_dir_unlock();
         return (int64_t)(int32_t)CELL_ENOMEM;
+    }
 
     sys_fs_dir_info* d = &g_sys_fs_dirs[slot];
     memset(d, 0, sizeof(*d));
@@ -856,17 +956,22 @@ int64_t sys_fs_opendir(ppu_context* ctx)
     char search_path[1024];
     snprintf(search_path, sizeof(search_path), "%s\\*", host_path);
     d->find_handle = FindFirstFileA(search_path, &d->find_data);
-    if (d->find_handle == INVALID_HANDLE_VALUE)
+    if (d->find_handle == INVALID_HANDLE_VALUE) {
+        sys_fs_dir_unlock();
         return (int64_t)(int32_t)CELL_ENOENT;
+    }
     d->first_read = 1;
 #else
     d->dp = opendir(host_path);
-    if (!d->dp)
+    if (!d->dp) {
+        sys_fs_dir_unlock();
         return (int64_t)(int32_t)CELL_ENOENT;
+    }
 #endif
 
     d->active = 1;
     strncpy(d->path, host_path, sizeof(d->path) - 1);
+    sys_fs_dir_unlock();
 
     int32_t dir_fd = slot + 1;
     write_be32(fd_out, (uint32_t)dir_fd);
@@ -892,8 +997,11 @@ int64_t sys_fs_readdir(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EBADF;
 
     sys_fs_dir_info* d = &g_sys_fs_dirs[dir_fd - 1];
-    if (!d->active)
+    sys_fs_dir_lock();
+    if (!d->active) {
+        sys_fs_dir_unlock();
         return (int64_t)(int32_t)CELL_EBADF;
+    }
 
     const char* name = NULL;
     int is_dir = 0;
@@ -906,6 +1014,7 @@ int64_t sys_fs_readdir(ppu_context* ctx)
     } else {
         if (!FindNextFileA(d->find_handle, &d->find_data)) {
             /* End of directory */
+            sys_fs_dir_unlock();
             if (nread_addr != 0) write_be64(nread_addr, 0);
             return CELL_OK;
         }
@@ -915,6 +1024,7 @@ int64_t sys_fs_readdir(ppu_context* ctx)
 #else
     struct dirent* entry = readdir(d->dp);
     if (!entry) {
+        sys_fs_dir_unlock();
         if (nread_addr != 0) write_be64(nread_addr, 0);
         return CELL_OK;
     }
@@ -938,6 +1048,7 @@ int64_t sys_fs_readdir(ppu_context* ctx)
         write_be64(nread_addr, (uint64_t)(name ? strlen(name) + 2 : 0));
     }
 
+    sys_fs_dir_unlock();
     return CELL_OK;
 }
 
@@ -954,8 +1065,11 @@ int64_t sys_fs_closedir(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EBADF;
 
     sys_fs_dir_info* d = &g_sys_fs_dirs[dir_fd - 1];
-    if (!d->active)
+    sys_fs_dir_lock();
+    if (!d->active) {
+        sys_fs_dir_unlock();
         return (int64_t)(int32_t)CELL_EBADF;
+    }
 
 #ifdef _WIN32
     if (d->find_handle != INVALID_HANDLE_VALUE)
@@ -965,6 +1079,7 @@ int64_t sys_fs_closedir(ppu_context* ctx)
 #endif
 
     d->active = 0;
+    sys_fs_dir_unlock();
     return CELL_OK;
 }
 
@@ -1097,25 +1212,22 @@ int64_t sys_fs_ftruncate(ppu_context* ctx)
     int32_t  fd   = LV2_ARG_S32(ctx, 0);
     uint64_t size = LV2_ARG_U64(ctx, 1);
 
-    int slot = fd - 3;
-    if (slot < 0 || slot >= SYS_FS_FD_MAX)
-        return (int64_t)(int32_t)CELL_EBADF;
-
-    sys_fs_fd_info* f = &g_sys_fs_fds[slot];
-    if (!f->active || !f->fp)
+    sys_fs_fd_info* f = sys_fs_fd_get(fd);
+    if (!f)
         return (int64_t)(int32_t)CELL_EBADF;
 
     fflush(f->fp);
 
 #ifdef _WIN32
     int fno = _fileno(f->fp);
-    if (_chsize_s(fno, (long long)size) != 0)
-        return (int64_t)(int32_t)CELL_EINVAL;
+    int bad = _chsize_s(fno, (long long)size) != 0;
 #else
     int fno = fileno(f->fp);
-    if (ftruncate(fno, (off_t)size) != 0)
-        return (int64_t)(int32_t)CELL_EINVAL;
+    int bad = ftruncate(fno, (off_t)size) != 0;
 #endif
+    sys_fs_fd_put(f);
+    if (bad)
+        return (int64_t)(int32_t)CELL_EINVAL;
 
     return CELL_OK;
 }
@@ -1127,6 +1239,7 @@ void sys_fs_init(lv2_syscall_table* tbl)
 {
     memset(g_sys_fs_fds,  0, sizeof(g_sys_fs_fds));
     memset(g_sys_fs_dirs, 0, sizeof(g_sys_fs_dirs));
+    memset(s_fd_refs, 0, sizeof(s_fd_refs));
 
     lv2_syscall_register(tbl, SYS_FS_OPEN,      sys_fs_open);
     lv2_syscall_register(tbl, SYS_FS_READ,       sys_fs_read);

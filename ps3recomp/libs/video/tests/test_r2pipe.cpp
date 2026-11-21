@@ -151,6 +151,140 @@ static void test_env()
 	CHECK(r2pipe::env_int("R2PIPE_TEST_INT", 42) == 42);
 }
 
+// Issue #10: MSAA filter, AMD thread default, breadcrumb round trip, crash report key
+static void test_preload_safety()
+{
+	CHECK(r2pipe::preload_keep_samples(1, false, false));
+	CHECK(!r2pipe::preload_keep_samples(2, false, false));
+	CHECK(!r2pipe::preload_keep_samples(4, false, false));
+	CHECK(r2pipe::preload_keep_samples(2, true, false));
+	CHECK(r2pipe::preload_keep_samples(4, false, true));
+
+	_putenv("PORT_PRELOAD_THREADS=");
+	_putenv("R2_PRELOAD_THREADS=");
+	CHECK(r2pipe::preload_bg_threads(16, 0x1002) == 1);
+	CHECK(r2pipe::preload_bg_threads(16, 0x10DE) == 4);
+	CHECK(r2pipe::preload_bg_threads(8, 0x10DE) == 2);
+	CHECK(r2pipe::preload_bg_threads(2, 0x8086) == 1);
+	_putenv("R2_PRELOAD_THREADS=3");
+	CHECK(r2pipe::preload_bg_threads(16, 0x1002) == 3);
+	_putenv("PORT_PRELOAD_THREADS=6");
+	CHECK(r2pipe::preload_bg_threads(16, 0x1002) == 6);
+	_putenv("PORT_PRELOAD_THREADS=99");
+	CHECK(r2pipe::preload_bg_threads(16, 0x10DE) == 16);
+	_putenv("PORT_PRELOAD_THREADS=");
+	_putenv("R2_PRELOAD_THREADS=");
+
+	std::string file(r2pipe::inflight_slots * r2pipe::inflight_slot_bytes, 'x');
+	for (size_t i = 0; i < r2pipe::inflight_slots; ++i)
+		r2pipe::inflight_format(&file[i * r2pipe::inflight_slot_bytes], 0, nullptr);
+	CHECK(r2pipe::inflight_parse(file).empty());
+	r2pipe::inflight_format(&file[0], 1234, "AAAA+BBBB+CCCC+DDDD.bin");
+	r2pipe::inflight_format(&file[3 * r2pipe::inflight_slot_bytes], 77, "EEEE.bin");
+	r2pipe::inflight_format(&file[0], 1234, "A.bin"); // shorter key over a longer one
+	const auto parsed = r2pipe::inflight_parse(file);
+	CHECK(parsed.size() == 2);
+	CHECK(parsed.size() == 2 && parsed[0].tid == 1234 && parsed[0].key == "A.bin");
+	CHECK(parsed.size() == 2 && parsed[1].tid == 77 && parsed[1].key == "EEEE.bin");
+	r2pipe::inflight_format(&file[0], 0, nullptr);
+	CHECK(r2pipe::inflight_parse(file).size() == 1);
+	const std::string longkey(300, 'k');
+	r2pipe::inflight_format(&file[0], 5, longkey.c_str()); // truncated, never runs into the next slot
+	CHECK(file[r2pipe::inflight_slot_bytes - 1] == '\n');
+	CHECK(r2pipe::inflight_parse(file).size() == 2);
+
+	CHECK(r2pipe::crash_preload_key("x\npreload faulting: K1+K2.bin\nthread 5\n") == "K1+K2.bin");
+	CHECK(r2pipe::crash_preload_key("preload faulting: K3.bin\r\n") == "K3.bin");
+	CHECK(r2pipe::crash_preload_key("no preload here\n").empty());
+	CHECK(r2pipe::crash_preload_key("note: preload faulting: X\n").empty());
+}
+
+static void test_pcache_file()
+{
+	uint8_t uuid[16];
+	for (int i = 0; i < 16; ++i) uuid[i] = static_cast<uint8_t>(0xA0 + i);
+	std::vector<uint8_t> blob(4096);
+	for (size_t i = 0; i < blob.size(); ++i) blob[i] = static_cast<uint8_t>(i * 7);
+	const uint32_t hdr[4] = { 32, 1, 0x10DE, 0x2684 };
+	std::memcpy(blob.data(), hdr, sizeof(hdr));
+	std::memcpy(blob.data() + 16, uuid, 16);
+	const std::string st = "vendor=10de device=2684 driver=1";
+	size_t n = 99;
+
+	const auto file = r2pipe::pcache_wrap(blob.data(), blob.size());
+	CHECK(file.size() == blob.size() + r2pipe::pcache_trailer_bytes);
+	CHECK(r2pipe::pcache_check(file.data(), file.size(), n, 0x10DE, 0x2684, uuid, st, st) == r2pipe::pcache_verdict::use);
+	CHECK(n == blob.size() && std::memcmp(file.data(), blob.data(), n) == 0);
+	CHECK(r2pipe::pcache_check(file.data(), file.size(), n, 0x10DE, 0x2684, uuid, "", st) == r2pipe::pcache_verdict::use);
+	// legacy file (no trailer): header check only
+	CHECK(r2pipe::pcache_check(blob.data(), blob.size(), n, 0x10DE, 0x2684, uuid, st, st) == r2pipe::pcache_verdict::use_legacy);
+	CHECK(n == blob.size());
+
+	auto bad = file;
+	bad[1000] ^= 0x01; // body bit flip
+	CHECK(r2pipe::pcache_check(bad.data(), bad.size(), n, 0x10DE, 0x2684, uuid, st, st) == r2pipe::pcache_verdict::corrupt);
+	CHECK(n == 0);
+	bad = file;
+	bad[bad.size() - 1] ^= 0x80; // checksum flip
+	CHECK(r2pipe::pcache_check(bad.data(), bad.size(), n, 0x10DE, 0x2684, uuid, st, st) == r2pipe::pcache_verdict::corrupt);
+	bad = file;
+	bad.erase(bad.begin() + 100); // short write in the middle: size field no longer matches
+	CHECK(r2pipe::pcache_check(bad.data(), bad.size(), n, 0x10DE, 0x2684, uuid, st, st) == r2pipe::pcache_verdict::corrupt);
+	// truncated (trailer cut off): legacy path, header still parses -> only the driver's own check; a header-only
+	// truncation is refused
+	CHECK(r2pipe::pcache_check(file.data(), 31, n, 0x10DE, 0x2684, uuid, st, st) == r2pipe::pcache_verdict::other_gpu);
+	CHECK(r2pipe::pcache_check(file.data(), 0, n, 0x10DE, 0x2684, uuid, st, st) == r2pipe::pcache_verdict::empty);
+	CHECK(r2pipe::pcache_check(nullptr, 0, n, 0x10DE, 0x2684, uuid, st, st) == r2pipe::pcache_verdict::empty);
+	CHECK(r2pipe::pcache_check(file.data(), r2pipe::pcache_max_bytes, n, 0x10DE, 0x2684, uuid, st, st) == r2pipe::pcache_verdict::too_large);
+
+	// mismatches
+	CHECK(r2pipe::pcache_check(file.data(), file.size(), n, 0x1002, 0x2684, uuid, st, st) == r2pipe::pcache_verdict::other_gpu);
+	CHECK(r2pipe::pcache_check(file.data(), file.size(), n, 0x10DE, 0x2204, uuid, st, st) == r2pipe::pcache_verdict::other_gpu);
+	uint8_t uuid2[16];
+	std::memcpy(uuid2, uuid, 16);
+	uuid2[15] ^= 1;
+	CHECK(r2pipe::pcache_check(file.data(), file.size(), n, 0x10DE, 0x2684, uuid2, st, st) == r2pipe::pcache_verdict::other_gpu);
+	CHECK(r2pipe::pcache_check(file.data(), file.size(), n, 0x10DE, 0x2684, uuid, st, "vendor=10de device=2684 driver=2") ==
+		r2pipe::pcache_verdict::gpu_changed);
+	CHECK(n == 0);
+	auto v2 = blob;
+	v2[4] = 2; // header version
+	const auto f2 = r2pipe::pcache_wrap(v2.data(), v2.size());
+	CHECK(r2pipe::pcache_check(f2.data(), f2.size(), n, 0x10DE, 0x2684, uuid, st, st) == r2pipe::pcache_verdict::other_gpu);
+	CHECK(std::strcmp(r2pipe::pcache_verdict_text(r2pipe::pcache_verdict::corrupt), "corrupt (checksum)") == 0);
+
+	CHECK(r2pipe::preload_boot_default(true) == -1);
+	CHECK(r2pipe::preload_boot_default(false) == 0);
+}
+
+// Issue #10: preload off = no preload at all unless R2_PRELOAD_BOOT is set; AMD serialisation; Fossilize entry names
+static void test_preload_off_and_serial()
+{
+	CHECK(r2pipe::preload_enabled(true, false));
+	CHECK(!r2pipe::preload_enabled(false, false));
+	CHECK(r2pipe::preload_enabled(false, true));
+	CHECK(r2pipe::boot_count(5000, r2pipe::preload_boot_default(false)) == 0);
+
+	_putenv("PORT_PIPE_SERIAL=");
+	CHECK(r2pipe::pipe_serialize(0x1002));
+	CHECK(!r2pipe::pipe_serialize(0x10DE));
+	CHECK(!r2pipe::pipe_serialize(0x8086));
+	_putenv("PORT_PIPE_SERIAL=0");
+	CHECK(!r2pipe::pipe_serialize(0x1002));
+	_putenv("PORT_PIPE_SERIAL=1");
+	CHECK(r2pipe::pipe_serialize(0x10DE));
+	_putenv("PORT_PIPE_SERIAL=");
+
+	CHECK(r2pipe::foz_entry_name(0x0123456789ABCDEFull) == "foz_0123456789abcdef");
+	CHECK(r2pipe::foz_entry_name(1) == "foz_0000000000000001");
+	// A replay entry round-trips through the breadcrumb and the crash report like a cache file name
+	std::string slot(r2pipe::inflight_slot_bytes, 0);
+	r2pipe::inflight_format(&slot[0], 9, r2pipe::foz_entry_name(42).c_str());
+	const auto parsed = r2pipe::inflight_parse(slot);
+	CHECK(parsed.size() == 1 && parsed[0].key == "foz_000000000000002a");
+	CHECK(r2pipe::crash_preload_key("preload faulting: " + r2pipe::foz_entry_name(42) + "\n") == "foz_000000000000002a");
+}
+
 int main()
 {
 	test_buckets();
@@ -161,6 +295,9 @@ int main()
 	test_queue();
 	test_foz_mode();
 	test_env();
+	test_preload_safety();
+	test_pcache_file();
+	test_preload_off_and_serial();
 	std::printf("%s\n", g_fail ? "test_r2pipe: FAIL" : "test_r2pipe: PASS");
 	return g_fail;
 }
