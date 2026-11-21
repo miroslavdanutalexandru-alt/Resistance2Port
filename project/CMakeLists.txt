@@ -310,6 +310,7 @@ add_executable(${PROJECT_NAME}
     r2_mods.cpp
     mods_psarc.cpp
     r2_pcextra.cpp
+    r2_cheats.cpp
     r2_menurows.cpp
     r2_swfpatch.cpp
     ${PS3RECOMP_SCAFFOLD}

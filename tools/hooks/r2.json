@@ -128,8 +128,10 @@
      "void func_00635D28(ppu_context* ctx) {"
     ],
     "add": [
+     "extern \"C\" void r2_cheats_frame(ppu_context* ctx);   /* R2: cheats, once per frame (r2_cheats.cpp) */",
      "extern \"C\" double r2_frame_period(double f1);   /* R2: frame-rate target (stubs.cpp) */",
-     "void func_00635D28(ppu_context* ctx) {"
+     "void func_00635D28(ppu_context* ctx) {",
+     "        r2_cheats_frame(ctx);"
     ]
    },
    {
