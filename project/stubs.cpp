@@ -1295,6 +1295,22 @@ extern "C" double r2_fps_target(void)
     return fps;
 }
 
+/* R2_DISPLAY_SYNC fixed-refresh pacing (RPCS3 VKPresent.cpp pds_frame, render thread): the frame limit
+ * becomes refresh / k (/ the frame-generation multiplier), e.g. 55 or 41.25 at 165 Hz, and the next
+ * deadline follows the vblank phase lock (r2_pacing_correction_ms); 0 = back to R2_FPS. With R2_FPS=30
+ * the frame-time floors are patched while it is on (as for R2_FPS != 30) and restored after. */
+static volatile double s_pace_fps = 0.0;
+extern "C" void r2_fps_pacing_set(double fps)
+{
+    if (!(fps > 0.0)) fps = 0.0;
+    s_pace_fps = fps;
+    if (fps > 0.0) fprintf(stderr, "[fps] frame limit %.4g fps (fixed-refresh pacing)\n", fps);
+    else fprintf(stderr, "[fps] frame limit back to R2_FPS (%.4g)\n", r2_fps_target());
+}
+extern "C" double r2_pacing_correction_ms(void);   /* VKPresent.cpp (0 without the RPCS3 renderer) */
+extern "C" double r2_pacing_correction_ms_default(void) { return 0.0; }
+#pragma comment(linker, "/alternatename:r2_pacing_correction_ms=r2_pacing_correction_ms_default")
+
 /* Sleep until `deadline` (timebase ticks) on a high-resolution waitable timer,
  * in chunks of at most 2 ms so pending GCM handlers keep being pumped, then
  * spin the last R2_PACE_SPIN_US (default 500) on the clock. Sleep(n) and
@@ -1367,25 +1383,44 @@ extern "C" double r2_frame_period(double f1)
     static int init = 0;
     static double fps = 30.0;
     static int precise = 1;
+    static int floors = 0;   /* the frame-time floors are patched (host pacing) */
+    static uint32_t floor_o0 = 0, floor_o1 = 0;
+    const float floor_c = 0.0001f; uint32_t floor_w; memcpy(&floor_w, &floor_c, 4);
     if (!init) {
         init = 1;
         fps = r2_fps_target();
         { const char* e = getenv("R2_PACE"); precise = !(e && *e == '0'); }
+        floor_o0 = vm_read32(0x00D529D8u); floor_o1 = vm_read32(0x00D69EB8u);
         if (fps != 30.0) {
-            const float c = 0.0001f; uint32_t w; memcpy(&w, &c, 4);
-            if (vm_read32(0x00D529D8u) == 0x3D088889u) vm_write32(0x00D529D8u, w);
+            floors = 1;
+            if (vm_read32(0x00D529D8u) == 0x3D088889u) vm_write32(0x00D529D8u, floor_w);
             { const uint32_t o = vm_read32(0x00D69EB8u); float f; memcpy(&f, &o, 4);
-              if (f > 0.013f && f < 0.0135f) vm_write32(0x00D69EB8u, w); }
+              if (f > 0.013f && f < 0.0135f) vm_write32(0x00D69EB8u, floor_w); }
         }
         fprintf(stderr, "[fps] target %.3f%s (floors %08x %08x)\n", fps, fps > 0.0 ? "" : " (uncapped)",
                 vm_read32(0x00D529D8u), vm_read32(0x00D69EB8u));
     }
+    const double pace_fps = s_pace_fps;   /* fixed-refresh pacing (R2_DISPLAY_SYNC), 0 = off */
+    if (fps == 30.0 && (pace_fps > 0.0) != (floors != 0)) {   /* R2_FPS=30: host pacing only while it is on */
+        floors = pace_fps > 0.0;
+        if (floors) {
+            if (vm_read32(0x00D529D8u) == 0x3D088889u) vm_write32(0x00D529D8u, floor_w);
+            { const uint32_t o = vm_read32(0x00D69EB8u); float f; memcpy(&f, &o, 4);
+              if (f > 0.013f && f < 0.0135f) vm_write32(0x00D69EB8u, floor_w); }
+        } else {
+            if (vm_read32(0x00D529D8u) == floor_w) vm_write32(0x00D529D8u, floor_o0);
+            if (vm_read32(0x00D69EB8u) == floor_w) vm_write32(0x00D69EB8u, floor_o1);
+        }
+        fprintf(stderr, "[fps] frame-time floors %s (%08x %08x)\n", floors ? "patched for fixed-refresh pacing" : "restored (the game's own 30 fps limiter)",
+                vm_read32(0x00D529D8u), vm_read32(0x00D69EB8u));
+    }
+    const double eff = pace_fps > 0.0 ? pace_fps : fps;
     if (r2_diag()) {
         static double seen[8]; static int ns;
         int k = 0; while (k < ns && seen[k] != f1) k++;
         if (k == ns && ns < 8) { seen[ns++] = f1; fprintf(stderr, "[fps] limiter period %.5f\n", f1); }
     }
-    if (fps == 30.0) {
+    if (!floors) {
         static uint64_t t0 = 0; static unsigned n = 0;
         const uint64_t now = ppu_timebase_now();
         if (!t0) t0 = now;
@@ -1408,8 +1443,8 @@ extern "C" double r2_frame_period(double f1)
      * fractional ticks so 59.94 or 144 do not drift. */
     static double next = 0.0;
     uint64_t now = ppu_timebase_now();
-    if (fps > 0.0) {
-        const double step = 79800000.0 / fps;
+    if (eff > 0.0) {
+        const double step = 79800000.0 / eff;
         if (next > 0.0 && (double)now < next) {
             const uint64_t ht = port_hitch_t0();
             struct hitch_scope { uint64_t t; ~hitch_scope() { port_hitch_end(PH_LIMIT, t); } } hs{ ht };
@@ -1427,6 +1462,11 @@ extern "C" double r2_frame_period(double f1)
         }
         if (next <= 0.0) next = (double)now;
         next += step;
+        if (pace_fps > 0.0) {   /* fixed-refresh pacing's phase lock (VKPresent.cpp): presents mid-refresh */
+            double c = r2_pacing_correction_ms() * 79800.0;
+            if (c > step * 0.25) c = step * 0.25; else if (c < -step * 0.25) c = -step * 0.25;
+            next += c;
+        }
         if (next + step < (double)now) next = (double)now - step;
     } else {
         ppu_gcm_pump();   /* uncapped: no wait, but keep handlers flowing */
@@ -1436,12 +1476,12 @@ extern "C" double r2_frame_period(double f1)
       if (!t0) t0 = now;
       n++;
       if (now - t0 >= 5ull * 79800000ull) {
-          port_log_async(1, "[fps] 5 s: %.1f fps (target %s%.3f)\n", n * 79800000.0 / (double)(now - t0),
-                  fps > 0.0 ? "" : "uncapped ", fps);
+          port_log_async(1, "[fps] 5 s: %.1f fps (target %s%.3f%s)\n", n * 79800000.0 / (double)(now - t0),
+                  eff > 0.0 ? "" : "uncapped ", eff, pace_fps > 0.0 ? ", fixed-refresh pacing" : "");
           t0 = now; n = 0;
       } }
     port_hitchcatch_frame(g_port_frame_no, hitch_discard);
-    port_hitch_frame(fps, hitch_discard);
+    port_hitch_frame(eff, hitch_discard);
     return 0.0001;   /* the game's own wait then never holds the frame */
 }
 
