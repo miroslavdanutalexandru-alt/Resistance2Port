@@ -21,6 +21,7 @@
 #include "ps3emu/log_first.h"
 #include "ps3emu/port_pc_extras.h"   /* rumble / stick / hold-toggle / background-input logic */
 #include "kbm_stick.h"                 /* mouse -> stick: deadzone-aware, sub-step carry */
+#include "kbm_layout.h"                /* keys follow the game's controller layout (presets, separate crouch) */
 #include "pad_squircle.h"              /* PAD_SQUIRCLE: round gate -> DS3-like square range */
 #include "ps3emu/port_hitch.h"
 #include "../../runtime/ps3_log.h"   /* ps3_diag_enabled (R2_DIAG) */
@@ -352,7 +353,7 @@ void*         g_kbm_hwnd = NULL;          /* set by the window owner */
 
 enum { KA_NONE = 0, KA_BTN, KA_LS_UP, KA_LS_DOWN, KA_LS_LEFT, KA_LS_RIGHT,
        KA_RS_UP, KA_RS_DOWN, KA_RS_LEFT, KA_RS_RIGHT, KA_INTERACT };
-typedef struct { int vk; int act; u16 btn; } KbmBind;
+typedef struct { int vk; int act; u16 btn; int role; } KbmBind;   /* role: KBM_ROLE_* (an L2 key's action) */
 static KbmBind s_kbm[96]; static int s_kbm_n = 0;
 static double s_kbm_sens = 1.0, s_kbm_dz = 0.28, s_kbm_smooth = 0.03;
 static int s_kbm_invert = 0, s_kbm_toggle_vk = VK_F8;
@@ -645,7 +646,13 @@ static void kbm_load(void)
     char line[256];
     s_kbm_n = 0;
     while (f && fgets(line, sizeof line, f)) {
-        char* h = strchr(line, '#'); if (h) *h = 0;
+        /* the comment names the launcher row: an L2 key is "Crouch" or "Sprint" */
+        int role = KBM_ROLE_NONE;
+        char* h = strchr(line, '#');
+        if (h) { const char* c = h + 1; while (*c == ' ' || *c == '\t') c++;
+                 if (!_strnicmp(c, "Crouch", 6)) role = KBM_ROLE_CROUCH;
+                 else if (!_strnicmp(c, "Sprint", 6)) role = KBM_ROLE_SPRINT;
+                 *h = 0; }
         char* eq = strchr(line, '='); if (!eq) continue;
         *eq = 0;
         char k[64], v[64];
@@ -663,7 +670,8 @@ static void kbm_load(void)
         int vk = kbm_key(k); u16 btn = 0; int act = kbm_action(v, &btn);
         if (!vk || !act) { printf("[controls] ignored line: %s = %s\n", k, v); continue; }
         if (act == KA_INTERACT) g_port_kbm_interact_bound = 1;
-        if (s_kbm_n < (int)(sizeof s_kbm / sizeof s_kbm[0])) { s_kbm[s_kbm_n].vk = vk; s_kbm[s_kbm_n].act = act; s_kbm[s_kbm_n].btn = btn; s_kbm_n++; }
+        if (s_kbm_n < (int)(sizeof s_kbm / sizeof s_kbm[0])) { s_kbm[s_kbm_n].vk = vk; s_kbm[s_kbm_n].act = act; s_kbm[s_kbm_n].btn = btn;
+            s_kbm[s_kbm_n].role = (act == KA_BTN && btn == CELL_PAD_CTRL_L2) ? role : KBM_ROLE_NONE; s_kbm_n++; }
     }
     if (f) fclose(f);
     g_ml_deg_per_count = s_ml_deg * s_kbm_sens;
@@ -728,6 +736,41 @@ static u32 kbm_unswap(u32 hsb)
     }
     return (u32)(((out >> 8) & 0xFF) | ((u32)NSW(out & 0xFF) << 8));
 #undef NSW
+}
+/* The game's active controller layout (project/stubs.cpp port_note_layout, kbm_layout.h):
+ * the EA of its 20 action words, and 0x100 | preset | separate crouch << 9 (0 = not found).
+ * Keys are translated through it; when it can't be read the v152 table above is used.
+ * PORT_KBM_LAYOUT=old: the v152 table only; =off: no translation. */
+volatile u32 g_port_layout_ea = 0, g_port_layout_info = 0;
+static u16 kbm_translate(u16 btns, int l2)
+{
+    extern uint8_t* vm_base;
+    static int mode = -1;
+    if (mode < 0) { const char* e = getenv("PORT_KBM_LAYOUT");
+                    mode = !e || !*e ? 0 : !_stricmp(e, "old") ? 1 : !_stricmp(e, "off") ? 2 : 0; }
+    if (mode == 2 || !btns) return btns;
+    const u32 ea = g_port_layout_ea, info = g_port_layout_info;
+    if (mode == 0 && ea && vm_base) {
+        u32 cur[KBM_LAYOUT_SLOTS];
+        for (int i = 0; i < KBM_LAYOUT_SLOTS; i++) {
+            const uint8_t* p = vm_base + ea + 4u * (u32)i;
+            cur[i] = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+        }
+        const int ok = kbm_layout_valid(cur);
+        { static u32 last[KBM_LAYOUT_SLOTS], last_info = 0xFFFFFFFFu;
+          if (info != last_info || memcmp(last, cur, sizeof cur)) {
+              last_info = info; memcpy(last, cur, sizeof cur);
+              char b[600]; int n = snprintf(b, sizeof b, "[controls] keys follow the game's controller layout: preset %u%s%s:",
+                                            info & 0xFF, (info & 0x200) ? ", separate crouch" : "", ok ? "" : " (unreadable, old table used)");
+              int moved = 0;
+              for (int i = 0; i < KBM_LAYOUT_SLOTS && n < (int)sizeof b - 32; i++)
+                  if (cur[i] != kbm_def_layout[i]) { moved++; n += snprintf(b + n, sizeof b - n, " slot%d 0x%04X->0x%04X", i, kbm_def_layout[i], cur[i]); }
+              if (!moved) snprintf(b + n, sizeof b - n, " as shipped");
+              printf("%s\n", b);
+          } }
+        if (ok) return kbm_layout_translate(btns, cur, l2);
+    }
+    return (u16)kbm_unswap(btns);
 }
 static int s_kbm_loaded = 0;
 /* PC port extras: re-read controls.txt (the in-game key binding page) */
@@ -801,6 +844,7 @@ static void pad_poll_keyboard(void)
 
     u16 btns = 0; int lx = 0, ly = 0, krx = 0, kry = 0, interact = 0;
     u16 wup_btn = 0;   /* v190e: buttons the wheel-up notch pressed this poll */
+    int l2_held = 0;   /* KBM_L2_*: the L2 keys held (Crouch / Sprint rows; a key with no row = crouch) */
     for (int i = 0; i < s_kbm_n; i++) {
         int vk = s_kbm[i].vk, down;
         if (vk == KBM_WHEEL_UP) down = wheel_up_frames > 0;
@@ -809,7 +853,9 @@ static void pad_poll_keyboard(void)
         else down = (GetAsyncKeyState(vk) & 0x8000) != 0;
         if (!down) continue;
         switch (s_kbm[i].act) {
-        case KA_BTN: btns |= s_kbm[i].btn; if (vk == KBM_WHEEL_UP) wup_btn |= s_kbm[i].btn; break;
+        case KA_BTN: btns |= s_kbm[i].btn; if (vk == KBM_WHEEL_UP) wup_btn |= s_kbm[i].btn;
+                     if (s_kbm[i].btn == CELL_PAD_CTRL_L2)
+                         l2_held |= s_kbm[i].role == KBM_ROLE_SPRINT ? KBM_L2_SPRINT : KBM_L2_CROUCH; break;
         case KA_LS_UP: ly -= 1; break;    case KA_LS_DOWN: ly += 1; break;
         case KA_LS_LEFT: lx -= 1; break;  case KA_LS_RIGHT: lx += 1; break;
         case KA_RS_UP: kry -= 1; break;   case KA_RS_DOWN: kry += 1; break;
@@ -968,7 +1014,13 @@ static void pad_poll_keyboard(void)
       if (fe3 && (GetAsyncKeyState(VK_SPACE) & 0x8000)) btns |= CELL_PAD_CTRL_START; }
     btns = pad_aim_toggle(0, btns, menu_raw);
     btns = pad_hold_toggle(0, btns, menu_raw, lx || ly);
-    hs->buttons   = menu_raw ? btns : kbm_unswap(btns);   /* v152: undo the in-game button swaps for the keyboard */
+    /* which actions L2 means (crouch and sprint are both L2 in the default layout, not with
+     * "separate crouch"): each held key its own; an L2 only a latch holds (PAD_CROUCH_MODE /
+     * PAD_SPRINT_MODE, no key down) keeps the last keys' meaning */
+    { static int s_l2_last = KBM_L2_CROUCH;
+      if (l2_held) s_l2_last = l2_held;
+      if (!menu_raw) btns = kbm_translate(btns, l2_held ? l2_held : s_l2_last); }   /* v152: undo the in-game button swaps for the keyboard */
+    hs->buttons   = btns;
     g_port_use_kbm = interact;
     hs->connected = 1;
     hs->analog_lx = (u8)(lx < 0 ? 0 : lx > 0 ? 255 : 128);
