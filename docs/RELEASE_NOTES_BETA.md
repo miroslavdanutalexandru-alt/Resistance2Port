@@ -13,6 +13,10 @@ This is a **beta**. The campaign has been played through the opening Iceland lev
 ### New
 - **Cheats (single player, off by default)**, contributed by @Jishnuraj07 (PR #14): **Ctrl+F1** toggles *God mode*, **Ctrl+F2** toggles *Infinite ammo* (`R2_CHEAT_GOD=1` / `R2_CHEAT_AMMO=1` turn them on at start). Once a cheat has been on, trophies are not unlocked until you restart the game. The keys do nothing in photo mode, in the port's menus or while F1 / F2 is bound in `controls.txt`, and cheats stay off in benchmark runs. Co-op is untested.
 
+### Fixes
+- **Keyboard keys now follow the controller layout chosen in the game's own options** (#19). If the game's Controls screen used another layout (for example aim on R2 and alternate fire on L1) or crouch separate from sprint (crouch on L3), keys did the action of the new button instead of the action their launcher row names: the Aim key fired the alternate mode, the Crouch keys only sprinted. Every key now does what its row says, whatever layout the game is set to; controllers are unchanged. If you swapped keys in `controls.txt` to work around this, press **Restore default controls** on the launcher's Controls page (or swap them back). `PORT_KBM_LAYOUT=old` brings the previous behaviour back.
+- **Launcher Controls page:** the last key of a game action can no longer be cleared by accident (right-click shows a message instead), and right-clicking an empty row puts its default key back. The Crouch, Sprint and L3 rows explain how they follow the game's layout.
+
 ## 0.3.0-beta.1 (hotfix)
 
 Setup fix only; the game itself is unchanged from 0.3.0.

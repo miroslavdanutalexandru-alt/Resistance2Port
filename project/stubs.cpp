@@ -991,12 +991,37 @@ extern "C" void port_mouselook_pre(uint32_t player)
     ml_wrf(player + 976, 0.0f);
     ml_wrf(player + 980, 0.0f);
 }
+/* The controller layout the game uses for this options block (func_0011E2B8 ->
+ * func_002AB54C): byte +0x31 (+0x32 when the TOC mode word isn't 1) picks preset
+ * 0-2 from the table built by func_002AB0DC (0xA4 bytes each; +0x290 = the same
+ * four with "separate crouch", byte +0x26) or 3 = the custom one at opts - 0x70.
+ * cellPad.c translates the keyboard's buttons through it (kbm_layout.h). */
+extern "C" volatile uint32_t g_port_layout_ea, g_port_layout_info;
+static void port_note_layout(uint32_t opts)
+{
+    uint32_t ea = 0, info = 0;
+    if (opts && opts < 0xF0000000u) {
+        const uint32_t p1 = vm_read32(0x00DED008u - 0x7E9Cu), mp = p1 ? vm_read32(p1 - 0x7FA8u) : 0u;
+        const uint32_t mode = mp ? vm_read32(mp) : 1u;
+        const uint32_t idx = vm_read8(opts + (mode == 1 ? 0x31u : 0x32u)), sep = vm_read8(opts + 0x26u) ? 1u : 0u;
+        if (idx == 3) ea = opts - 0x70u;
+        else if (idx < 3) {
+            const uint32_t p2 = vm_read32(0x00DED008u - 0x7938u), tbl = p2 ? vm_read32(p2 - 0x7FF0u) : 0u;
+            if (tbl && tbl < 0xF0000000u) ea = tbl + idx * 0xA4u + (sep ? 0x290u : 0u);
+        }
+        info = 0x100u | (idx & 0xFFu) | (sep << 9);
+    }
+    g_port_layout_info = info;
+    g_port_layout_ea = ea;
+}
 extern "C" void port_mouselook(uint32_t player)
 {
-    if (!g_ml_mode || !player) return;
-    ml_load();
+    if (!player) return;
     { const uint32_t c = vm_read32(player + 16016);
-      g_port_opts_ea = c ? vm_read32(c + 6848) : 0; }
+      g_port_opts_ea = c ? vm_read32(c + 6848) : 0;
+      port_note_layout(g_port_opts_ea); }
+    if (!g_ml_mode) return;
+    ml_load();
     const ULONGLONG now = GetTickCount64();
     long dx = InterlockedExchange(&g_kbm_ml_dx, 0), dy = InterlockedExchange(&g_kbm_ml_dy, 0);
     if (port_local_players() > 1) return;   /* split-screen: the mouse is a right stick */

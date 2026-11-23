@@ -749,10 +749,12 @@ static const Act g_acts[] = {
     { "Move left",           "LS_LEFT",    "Movement", "", false },
     { "Move right",          "LS_RIGHT",   "Movement", "", false },
     { "Jump",                "CROSS",      "Movement", "", false },
-    { "Crouch",              "L2",         "Movement", "Tap to crouch or stand up. Same PS3 button as Sprint (L2): "
-                                                        "a tap crouches, holding sprints.", false },
-    { "Sprint",              "L2",         "Movement", "Hold while moving. Same PS3 button as Crouch (L2): "
-                                                        "a tap crouches, holding sprints.", false },
+    { "Crouch",              "L2",         "Movement", "Tap to crouch or stand up. On the PS3 layout this is L2, the same "
+                                                        "button as Sprint. If the game's own controls put crouch on L3 "
+                                                        "(another layout, or crouch separate from sprint), these keys "
+                                                        "follow it: every row keeps doing its action.", false },
+    { "Sprint",              "L2",         "Movement", "Hold while moving. On the PS3 layout this is L2, the same button "
+                                                        "as Crouch; the keys follow the game's own layout setting.", false },
     { "Fire",                "R1",         "Combat", "", false },
     { "Aim / zoom",          "L1",         "Combat", "Aims down the sights or through the scope.", false },
     { "Alternate fire",      "R2",         "Combat", "Each weapon's secondary mode (Bullseye tag, Magnum detonate, "
@@ -769,7 +771,9 @@ static const Act g_acts[] = {
     { "Flashlight",          "DPAD_RIGHT", "Actions", "", false },
     { "Map",                 "DPAD_LEFT",  "Actions", "", false },
     { "Co-op: Grappler / Berserk", "DPAD_DOWN", "Actions", "Co-op abilities. Also zooms a sniper scope out.", false },
-    { "Left stick click (L3)", "L3",       "Actions", "", false },
+    { "Left stick click (L3)", "L3",       "Actions", "The left stick click: the game's crouch button when its controls "
+                                                       "separate crouch from sprint. The Crouch keys follow that setting "
+                                                       "by themselves.", false },
     { "Pause menu",          "START",      "Menus", "", false },
     { "Scoreboard / objectives", "SELECT", "Menus", "", false },
     { "Menu confirm",        "CROSS",      "Menus", "The Cross button: selects in menus (Jump does the same).", false },
@@ -850,6 +854,33 @@ static void ctl_defaults()
     for (auto& d : g_default_binds) { int a = act_named(d[1]); if (a >= 0) bind_add(a, d[0]); }
     g_msens = 1.0; g_minv = 0; g_mdirect = 1; g_mrelease = "F8"; g_mdeg = 0.05; g_mdz = 0.28; g_msmooth = 0.03;
     g_padint = 0;
+}
+// rows no other row stands in for: their last key can't be cleared
+static bool act_required(int a)
+{
+    if (!_strnicmp(g_acts[a].pad, "RS_", 3)) return false;
+    static const char* const opt[] = { "Next weapon (wheel)", "Menu confirm", "Menu back" };
+    for (const char* o : opt) if (!_stricmp(g_acts[a].name, o)) return false;
+    return true;
+}
+static int act_keys(int a)
+{
+    int n = 0;
+    for (int k = 0; k < NSLOT; k++) if (!g_bind[a][k].empty()) n++;
+    return n;
+}
+// a row's default keys back, those no other row uses now; returns how many
+static int act_restore(int a)
+{
+    int n = 0;
+    for (auto& d : g_default_binds) {
+        if (_stricmp(d[1], g_acts[a].name)) continue;
+        bool used = false;
+        for (int b = 0; b < NACT; b++) for (int k = 0; k < NSLOT; k++)
+            if (!_stricmp(g_bind[b][k].c_str(), d[0])) used = true;
+        if (!used) { bind_add(a, d[0]); n++; }
+    }
+    return n;
 }
 static void ctl_load()
 {
@@ -1264,7 +1295,7 @@ static void layout()
     } else if (g_page == P_CONTROLS) {
         deco(D_H1, RectF(x, y, w, SF(34)), "Controls"); y += SF(36);
         deco(D_INTRO, RectF(x, y, w, SF(20)), "Click a key box, then press the key or mouse button you want. "
-                                             "Right-click a box to clear it.");
+                                             "Right-click a box to clear it, or an empty row's box to restore it.");
         y += SF(40);
         const float kw = SF(150), gap = SF(10);
         const float kx0 = x + w - 2 * kw - gap;
@@ -1631,7 +1662,7 @@ static void paint(HDC hdc)
         } else if (g_hot >= 0 && !g_w[g_hot].help.empty() && g_w[g_hot].t != W_NAV) {
             t1 = W(g_w[g_hot].title); t2 = W(g_w[g_hot].help);
         } else if (g_hot >= 0 && g_w[g_hot].t == W_KEY) {
-            t1 = W(g_w[g_hot].title); t2 = L"Click to change. Right-click to clear.";
+            t1 = W(g_w[g_hot].title); t2 = L"Click to change. Right-click to clear (an empty row: to restore it).";
         } else {
             t2 = g_page == P_CONTROLS ? L"Hover over anything to see what it does. Changes are saved automatically."
                : L"Hover over a setting to see what it does. Changes are saved automatically and apply the next "
@@ -1802,12 +1833,14 @@ static void capture_done(const char* key)
         if (g_cap_a == -2) { g_mrelease = key; }
         else {
             // one key, one action: a key taken from another action moves here
-            std::string from;
+            std::string from; int from_a = -1;
             for (int a = 0; a < NACT; a++) for (int k = 0; k < NSLOT; k++)
                 if (!_stricmp(g_bind[a][k].c_str(), key) && !(a == g_cap_a && k == g_cap_k)) {
-                    g_bind[a][k].clear(); if (!g_acts[a].hidden) from = g_acts[a].name; }
+                    g_bind[a][k].clear(); if (!g_acts[a].hidden) { from = g_acts[a].name; from_a = a; } }
             g_bind[g_cap_a][g_cap_k] = key;
-            if (!from.empty()) toast(pretty(key) + " was removed from \"" + from + "\" and now does \"" + g_acts[g_cap_a].name + "\".");
+            if (!from.empty()) toast(pretty(key) + " was removed from \"" + from + "\" and now does \"" + g_acts[g_cap_a].name + "\"."
+                                     + (from_a >= 0 && act_required(from_a) && !act_keys(from_a)
+                                        ? " \"" + from + "\" has no key now: right-click its box to restore it." : std::string()));
             else if (!_stricmp(key, g_mrelease.c_str()))
                 toast("Note: " + pretty(key) + " also frees the mouse cursor in game.");
         }
@@ -2392,7 +2425,18 @@ static LRESULT CALLBACK wndproc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         const int i = hit(x, y);
         if (msg == WM_RBUTTONDOWN && i >= 0 && g_w[i].t == W_KEY) {     // right-click clears
             if (g_w[i].id == -2) { g_mrelease = "F8"; toast("The cursor key can't be empty: it's back to F8."); }
-            else g_bind[g_w[i].id][g_w[i].sub].clear();
+            else {
+                const int a = g_w[i].id, k = g_w[i].sub;
+                const std::string nm = g_acts[a].name;
+                if (g_bind[a][k].empty()) {
+                    if (!act_keys(a)) {
+                        if (act_restore(a)) toast("\"" + nm + "\" has its default key back.");
+                        else toast("\"" + nm + "\": its default key does something else now. Click the box to choose a key.");
+                    }
+                } else if (act_required(a) && act_keys(a) == 1)
+                    toast("\"" + nm + "\" needs a key. Click the box to choose another one.");
+                else g_bind[a][k].clear();
+            }
             ctl_save(); invalidate(); return 0;
         }
         if (msg == WM_LBUTTONDOWN && i >= 0) {
