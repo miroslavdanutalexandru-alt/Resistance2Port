@@ -100,7 +100,7 @@ With the XInput backend (`PAD_BACKEND=xinput`), a Sony DualShock 3/4 or DualSens
 
 **Mouse look is direct:** raw mouse counts turn the camera's yaw and pitch each frame (× the launcher's sensitivity × the game's own Look Sensitivity), not an emulated right stick — no acceleration, dead zone or speed cap. While aiming down sights the turn rate is scaled by the scope zoom so the same mouse movement covers the same part of the screen (`R2_ZOOM_SENS`: 1 = default, 0 = no scaling, up to 2). The game's aim assist only acts on stick input, so it doesn't pull against the mouse, and while the mouse is in use the right stick's turn rate is ignored so the two never add up. Mouse counts made while the camera isn't yours (menus, pause, cutscenes, scripted sequences) are dropped, so the view doesn't jump afterwards. The launcher's **Mouse aiming = Classic** switches back to stick emulation. The game has no mouse pointer in its menus; they are driven by the keyboard (arrows / Enter / Esc) or a controller. F8 frees the cursor.
 
-**Controllers (SDL3).** The port reads controllers through SDL3 (built in, no extra DLL): Xbox, DualShock 4, DualSense, DualShock 3 (with its Windows driver), Switch Pro and Joy-Con work directly. **DS4Windows and Steam Input are no longer needed** (they still work; if they expose a virtual Xbox pad next to the real controller, the port ignores the duplicate so it doesn't become a ghost player 2). Controllers can be plugged in and out at any time, no restart, up to 8. Rumble works on every pad that has it (DualSense included), and a DualShock 4 / DualSense light bar shows the player's colour (player 1 blue, player 2 red). If SDL3 can't start, the port falls back to XInput automatically (`logs\run.log` shows `[cellPad] controllers: SDL3` or `SDL3 could not start`).
+**Controllers (SDL3).** The port reads controllers through SDL3 (built in, no extra DLL): Xbox, DualShock 4, DualSense, DualShock 3 (with its Windows driver), Switch Pro and Joy-Con work directly, over USB or Bluetooth. **DSX, DS4Windows and Steam Input are not needed**, and work best closed: they can hide the real controller from other programs (HidHide) and show only their virtual Xbox pad. If they run anyway and the port sees both the real controller and the tool's virtual copy, the copy is recognised by its mirrored input and ignored, so it doesn't become a ghost player 2 (with local co-op off, the default, a second controller never becomes player 2 anyway). Controllers can be plugged in and out at any time, no restart, up to 8. Rumble works on every pad that has it (DualSense included), and a DualShock 4 / DualSense light bar shows the player's colour (player 1 blue, player 2 red). If SDL3 can't start, the port falls back to XInput automatically (`logs\run.log` shows `[cellPad] controllers: SDL3` or `SDL3 could not start`; a build made without SDL3 says `controllers: XInput only`). If a controller isn't seen, `logs\run.log` lists every controller SDL3 found (`[pad-sdl3] controller 1: ...`), controllers it can't use, and notes when HidHide or a Steam setting may be hiding one.
 
 **Button prompts by controller type:** with *Controller button prompts = Auto*, a PlayStation pad (DualShock 3/4, DualSense) shows PlayStation symbols and an Xbox or other pad shows Xbox letters. Switch controllers are read by button position (the bottom button is Cross); with *Nintendo button layout = Nintendo style* A (right) confirms and B cancels as on a Switch, and the prompts show the Xbox-style letters. Under Steam Input the real controller type is used when SDL reports it; otherwise set the prompts by hand.
 
@@ -125,7 +125,7 @@ With the XInput backend (`PAD_BACKEND=xinput`), a Sony DualShock 3/4 or DualSens
 | Vibration | **100 %**, 75 %, 50 %, 25 %, Off | `PAD_RUMBLE=<0..100>` (`off` = 0): both motors scaled; Off also tells the game rumble is off (system setting) |
 | Confirm button | **Cross**, Circle | `PS3_ENTER_BUTTON=circle`: the PS3 system setting the game reads at start (Japanese layout: Circle accepts, Cross goes back). Keyboard Enter / Esc / Backspace keep meaning confirm / back in menus. Restart; a menu that hard-codes its buttons ignores it |
 | Controller in the background | **Auto**, On, Off | `PAD_BACKGROUND_INPUT=1\|0`: Auto = controllers keep working while another window has the focus only with *Keep running* or *Mute only* in the background (SDL's background-events hint is always on; the port decides) |
-| (no launcher option) | **On** | `PAD_DEDUP=0` keeps virtual duplicates (Steam Input / DS4Windows / ViGEm) as separate controllers |
+| (no launcher option) | **On** | `PAD_DEDUP=0` keeps virtual duplicates (DSX / Steam Input / DS4Windows / ViGEm) as separate controllers. With it on, a controller that connects while another one is playing joins once it is used on its own; one that copies several different inputs of the other controller is ignored until several different buttons are pressed on it while the other controller is untouched (and is still watched after that) |
 | (no launcher option) | **360** | `PAD_GYRO_STICK_DPS=<deg/s>`: gyro speed that equals a full right stick (co-op / classic mouse aiming, where gyro drives the stick) |
 
 With `PAD_BACKEND=xinput` the old behaviour returns: XInput only (up to four), PlayStation pads through DS4Windows / Steam Input, no gyro or light bar.
@@ -134,13 +134,14 @@ With `PAD_BACKEND=xinput` the old behaviour returns: XInput only (up to four), P
 
 Two players on one PC, split-screen, as on PS3. No PSN account is needed: the port provides a second local user.
 
-**Starting it:** plug in two controllers (or one, with *Player 2 uses keyboard and mouse*). Main menu → **Co-op** → the offline / split-screen co-op staging screen (the online options need PSN and don't work). On the staging screen player 2 presses **START** (or Enter / Esc on the keyboard for a keyboard player 2) to join: on PS3 this opens the "select a user" box; the port answers it at once with a local user named **Player 2**, and player 2 shows as logged in. Start the mission and the screen splits.
+**Starting it:** in the launcher, Controls page, set **Local co-op (split-screen)** to **On** (it is off by default, so a second controller, or a virtual copy of your controller made by DSX / DS4Windows / Steam Input, can't start split-screen by itself). Plug in two controllers (or one, with *Player 2 uses keyboard and mouse*). Main menu → **Co-op** → the offline / split-screen co-op staging screen (the online options need PSN and don't work). On the staging screen player 2 presses **START** (or Enter / Esc on the keyboard for a keyboard player 2) to join: on PS3 this opens the "select a user" box; the port answers it at once with a local user named **Player 2**, and player 2 shows as logged in. Start the mission and the screen splits.
 
 Only the offline, split-screen part of co-op works: everything that needs PSN (online co-op, competitive, the lobby browser) stays unavailable.
 
 **Who is who:**
 
-- Player 1 = the keyboard and mouse plus the first controller found (as in single player).
+- With local co-op off (the default): one player. Player 1 = the keyboard and mouse plus **the controller you used last**: pick up any connected controller and press a button, and it takes over. The game never sees a second controller.
+- With local co-op on: player 1 = the keyboard and mouse plus the first controller found.
 - Player 2 = the next controller. A controller keeps its player while it stays plugged in. A controller plugged in later takes the lowest free player; when one is unplugged, its player has no input until it is plugged back.
 - With two local players the direct mouse look is off. The mouse then moves the keyboard player's view like a right stick (it would otherwise turn both heroes).
 
@@ -148,13 +149,15 @@ Only the offline, split-screen part of co-op works: everything that needs PSN (o
 
 | Option | Values | Variable |
 |---|---|---|
-| Local co-op (split-screen) | **On**, Off | `PAD_COOP=0`: the game sees only player 1. Extra controllers (or duplicate virtual pads from Steam Input / DS4Windows) can't join |
-| Player 1 controller | **Automatic**, Controller 1-8 | `PAD_P1_CONTROLLER=<1..8>`: the controller that is player 1 (SDL3: in the order they were connected; XInput: 1-4, Windows' XInput order) |
+| Local co-op (split-screen) | **Off**, On | `PAD_COOP=1`: a second controller can join as player 2. Off (`PAD_COOP=0` or unset): the game sees only player 1, and extra controllers (or duplicate virtual pads from DSX / Steam Input / DS4Windows) can't join. *Player 2 controller* and *Player 2 uses keyboard and mouse* apply when it is On (outside the launcher, with `PAD_COOP` not set at all, setting `PAD_P2_CONTROLLER` or `PAD_P2_KEYBOARD` turns it on) |
+| Player 1 controller | **Automatic**, Controller 1-8 | `PAD_P1_CONTROLLER=<1..8>`: the controller that is player 1 (SDL3: in the order they were connected; XInput: 1-4, Windows' XInput order). Automatic = the controller used last (co-op off) or the first one found (co-op on) |
 | Player 2 controller | **Automatic**, Controller 1-8 | `PAD_P2_CONTROLLER=<1..8>`: the controller that is player 2 (numbered as above) |
 | Player 2 uses keyboard and mouse | **Off**, On | `PAD_P2_KEYBOARD=1`: player 1 = the first controller only, player 2 = keyboard and mouse |
 | (no launcher option) | **2** | `PS3_LOCAL_USERS=<1..4>`: local users the game sees. `1` = player 2 can't sign in. `PS3_USER2_NAME=<name>` renames player 2 |
 
 `logs\run.log` shows which controller each player got (`[cellPad] player 2 <- controller 2`) and when the game counts two local players (`[coop] local players: 2`).
+
+**A real second controller is ignored?** With the duplicate check on, a controller that is plugged in while another one is playing joins once it is used on its own, and one that copies the other controller's inputs is ignored (`logs\run.log`: `... ignored as a duplicate`). If a real second co-op controller is ever ignored, unplug it and plug it back in; `PAD_DEDUP=0` turns the duplicate check off.
 
 **Known limits:** Player 2's progress and settings are not saved separately (as on PS3 for a guest player). If you use NVIDIA DLSS, it may not work right in split-screen. Turn it off (or use FSR / no upscaler) for co-op if the image smears or one half looks wrong.
 
