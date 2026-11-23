@@ -14,7 +14,7 @@ import argparse, glob, json, os, re, shutil, struct, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from regen_common import run, ppu, fix_includes, spu_post
+from regen_common import run, ppu, fix_includes, spu_post, progress, same_content, sync_tree
 
 # Resistance 2 (BCES00226 v1.00) layout of the SPU data section
 PM = dict(off=0xCE9680, size=0x3100, base=0xA00, entry=0xA00)
@@ -181,6 +181,11 @@ def write_workloads(path, d, elfs, placed=(), pics=()):
           '__attribute__((constructor)) static void r2_spu_register_all_ctor(void)', '{', '    r2_spu_register_all();', '}', '']
     open(path, 'w').write('\n'.join(L))
 
+def copy_if_changed(src, dst):
+    """An unchanged file keeps its date, so the build does not compile it again."""
+    if same_content(src, dst): return False
+    shutil.copyfile(src, dst); return True
+
 def spu(port, tk, eboot, work, stage_raw=None):
     sys.path.insert(0, tk)
     from wrap_spu_elf import wrap
@@ -194,6 +199,15 @@ def spu(port, tk, eboot, work, stage_raw=None):
     run([sys.executable, os.path.join(HERE, 'extract_jobmods_r2.py'), eboot, jm])
     env = dict(os.environ, PYTHONPATH=tk)
     ents = load_entries()
+    elfs = [m.start() for m in re.finditer(b'\x7fELF\x01\x02\x01', d) if struct.unpack_from('>H', d, m.start() + 18)[0] == 0x17]
+    # Fixed per-address plugin lifts are superseded by the PIC lifts below;
+    # R2_FIXED_PLACED=1 brings them back.
+    placed = placed_modules(ents) if os.environ.get('R2_FIXED_PLACED') == '1' else []
+    pics = [] if os.environ.get('R2_NO_PIC') == '1' else pic_modules(d, ents)
+    lift_total = 2 + len(elfs) + len(RAW) + len(pics) + len(placed); lifted = [0]
+    def lifted_one():
+        lifted[0] += 1; progress('spu_lift', lifted[0], lift_total, force=True)
+    progress('spu_lift', 0, lift_total, force=True)
     import hashlib
     obs = {}
     for p in ents.values():
@@ -203,9 +217,10 @@ def spu(port, tk, eboot, work, stage_raw=None):
     run([sys.executable, os.path.join(HERE, 'lift_jobmods_base.py'), '--jobmods', jm, '--out', out,
          '--register', os.path.join(work, 'jobmods_register.c'), '--entries', obs_json]
         + (['--full'] if FULL else []), env=env)
+    lifted_one()
     mods = sorted(os.path.basename(x) for x in glob.glob(os.path.join(out, 'jobmod_*')))
     os.makedirs(spudir, exist_ok=True)
-    shutil.copy(os.path.join(work, 'jobmods_register.c'), os.path.join(spudir, 'jobmods_register.c'))
+    copy_if_changed(os.path.join(work, 'jobmods_register.c'), os.path.join(spudir, 'jobmods_register.c'))
     # job manager (policy module)
     print('[spu] lifting pm_wwsjob...', flush=True)
     n = 'pm_wwsjob'; os.makedirs(os.path.join(work, n), exist_ok=True)
@@ -218,9 +233,8 @@ def spu(port, tk, eboot, work, stage_raw=None):
          '--symbol-prefix', n + '_', '-o', os.path.join(out, n), '--source-name', 'spu_recomp.c',
          '--header-name', 'spu_recomp.h', '--return-entries', '--extra-funcs', '0xa2c']
         + lift_args(pe, PM['base'], PM['base'], [0xA2C], fixed_entries(ents, 'pm')), env=env)
-    mods.append(n)
+    mods.append(n); lifted_one()
     # embedded SPU ELF programs (raw SPU / SPURS task images)
-    elfs = [m.start() for m in re.finditer(b'\x7fELF\x01\x02\x01', d) if struct.unpack_from('>H', d, m.start() + 18)[0] == 0x17]
     for i, o in enumerate(elfs):
         phoff, shoff = struct.unpack_from('>I', d, o + 28)[0], struct.unpack_from('>I', d, o + 32)[0]
         phnum, shnum = struct.unpack_from('>H', d, o + 44)[0], struct.unpack_from('>H', d, o + 48)[0]
@@ -234,7 +248,7 @@ def spu(port, tk, eboot, work, stage_raw=None):
              '--symbol-prefix', n + '_', '-o', os.path.join(out, n), '--source-name', 'spu_recomp.c',
              '--header-name', 'spu_recomp.h']
             + lift_args(pe, observed=fixed_entries(ents, 'elf%d' % i)), env=env)
-        mods.append(n)
+        mods.append(n); lifted_one()
     for r in RAW:
         n = r['n']; o = va2off(d, r['va'])
         print('[spu] lifting raw SPU program %s (VA 0x%X, 0x%X bytes at LS 0x%X)...' % (n, r['va'], r['size'], r['base']), flush=True)
@@ -247,11 +261,7 @@ def spu(port, tk, eboot, work, stage_raw=None):
         if r.get('funcs'): cmd += ['--extra-funcs', r['funcs']]
         cmd += lift_args(pe, r['base'], r['base'], [int(x, 0) for x in r.get('funcs', '').split(',') if x])
         run(cmd, env=env)
-        mods.append(n)
-    # Fixed per-address plugin lifts are superseded by the PIC lifts below;
-    # R2_FIXED_PLACED=1 brings them back.
-    placed = placed_modules(ents) if os.environ.get('R2_FIXED_PLACED') == '1' else []
-    pics = [] if os.environ.get('R2_NO_PIC') == '1' else pic_modules(d, ents)
+        mods.append(n); lifted_one()
     for n, va, fo, size, offs, img in pics:
         print('[spu] lifting PIC module %s (0x%X bytes, %d observed entries)...' % (n, size, len(offs)), flush=True)
         os.makedirs(os.path.join(work, n), exist_ok=True)
@@ -261,7 +271,7 @@ def spu(port, tk, eboot, work, stage_raw=None):
              '--symbol-prefix', n + '_', '-o', os.path.join(out, n), '--source-name', 'spu_recomp.c',
              '--header-name', 'spu_recomp.h', '--return-entries', '--merge-chunks',
              '--extra-funcs', '0x30'] + lift_args(pe, 0, 0x30, [0x30], offs, rel=True), env=env)
-        mods.append(n)
+        mods.append(n); lifted_one()
     for n, va, fo, size, b, e, img in placed:
         print('[spu] lifting placed module %s (0x%X bytes at LS 0x%X, %d observed entries)...' % (n, size, b, len(e)), flush=True)
         os.makedirs(os.path.join(work, n), exist_ok=True)
@@ -272,12 +282,15 @@ def spu(port, tk, eboot, work, stage_raw=None):
              '--symbol-prefix', n + '_', '-o', os.path.join(out, n), '--source-name', 'spu_recomp.c',
              '--header-name', 'spu_recomp.h', '--return-entries', '--merge-chunks',
              '--extra-funcs', hex(b + 0x30), '--observed-entries', ','.join(hex(a) for a in ex)], env=env)
-        mods.append(n)
-    write_workloads(os.path.join(spudir, 'spu_workloads.c'), d, elfs, placed, pics)
+        mods.append(n); lifted_one()
+    write_workloads(os.path.join(work, 'spu_workloads.c'), d, elfs, placed, pics)
+    copy_if_changed(os.path.join(work, 'spu_workloads.c'), os.path.join(spudir, 'spu_workloads.c'))
     if not placed:
         for x in glob.glob(os.path.join(spudir, 'wwsplug_*')): shutil.rmtree(x)
     print('[spu] port edits + register cache...', flush=True)
-    for n in mods:
+    progress('spu_post', 0, len(mods), force=True)
+    tally = [0, 0, 0]
+    for i, n in enumerate(mods):
         x = os.path.join(out, n); fix_includes(x)
         if stage_raw is not None: shutil.copytree(x, os.path.join(stage_raw, n))
         hp = os.path.join(hk, 'r2_' + n + '.json')
@@ -293,9 +306,10 @@ def spu(port, tk, eboot, work, stage_raw=None):
         # too (spu_post skipped them, so a regen dropped group entry / writeback from dd413, 7db0, 4154 ...)
         if os.path.exists(hp): run([sys.executable, os.path.join(HERE, 'spu_hooks.py'), 'apply', 'post', f, hp])
         run([sys.executable, os.path.join(HERE, 'spu_w0.py'), f])
-        dst = os.path.join(spudir, n)
-        if os.path.isdir(dst): shutil.rmtree(dst)
-        shutil.copytree(x, dst)
+        # only the files whose content changed are written: the others keep their date and are not compiled again
+        for k, v in enumerate(sync_tree(x, os.path.join(spudir, n))): tally[k] += v
+        progress('spu_post', i + 1, len(mods), force=True)
+    print('[spu] project/spu: %d files changed, %d unchanged, %d removed' % tuple(tally), flush=True)
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

@@ -1,0 +1,27 @@
+# Compile time in seconds of each generated PPU file (one clang-cl job, 2 at a time) and its size in bytes, measured
+# on the PC the port was made on (16 threads, 32 GB). Setup uses them to estimate the first build until it has measured
+# this PC (logs\setup_timings.json); the files' times differ far more than their sizes do.
+recompiled\ppu_recomp_000.cpp 293.1 40780625
+recompiled\ppu_recomp_001.cpp 168.2 40713319
+recompiled\ppu_recomp_002.cpp 199.2 43933735
+recompiled\ppu_recomp_003.cpp 244.2 42688220
+recompiled\ppu_recomp_004.cpp 199.6 38502335
+recompiled\ppu_recomp_005.cpp 224.9 40723356
+recompiled\ppu_recomp_006.cpp 43.7 52222301
+recompiled\ppu_recomp_007.cpp 21.1 38275947
+recompiled\ppu_recomp_008.cpp 15.0 56869959
+recompiled\ppu_recomp_009.cpp 20.8 55955790
+recompiled\ppu_recomp_010.cpp 11.7 54732730
+recompiled\ppu_recomp_011.cpp 22.1 60337781
+recompiled\ppu_recomp_012.cpp 41.9 68895245
+recompiled\ppu_recomp_013.cpp 47.1 71144268
+recompiled\ppu_recomp_014.cpp 25.6 66336062
+recompiled\ppu_recomp_015.cpp 26.5 61838443
+recompiled\ppu_recomp_016.cpp 48.3 66527409
+recompiled\ppu_recomp_017.cpp 39.7 61146482
+recompiled\ppu_recomp_018.cpp 30.4 63577596
+recompiled\ppu_recomp_019.cpp 40.0 63180267
+recompiled\ppu_recomp_020.cpp 22.5 68318250
+recompiled\ppu_recomp_021.cpp 45.9 63086686
+recompiled\ppu_recomp_022.cpp 77.4 61698257
+recompiled\ppu_recomp_023.cpp 39.9 64545873
