@@ -247,7 +247,7 @@ The options are sorted into pages, each with group headings (the same pages as t
 | Controls › Aiming and sticks | Sprint button | see *Controllers (SDL3)* | `PAD_SPRINT_MODE` |
 | Controls › Aiming and sticks | Extra crosshair | Off, Dot, Cross | `R2_CROSSHAIR` (`dot`/`cross`) |
 | Controls | Keys (two per action), Mouse sensitivity, Invert vertical look, Mouse aiming (Direct / Classic), Free the mouse cursor key (F8) | | `controls.txt` |
-| Controls › Aiming and sticks | Vertical mouse sensitivity, Aiming sensitivity, Aim mode, Stick deadzone, Stick response curve | see *Launcher settings* below | `PAD_MOUSE_SENS_Y`, `R2_ADS_SENS`, `PAD_AIM_TOGGLE`, `PAD_DEADZONE`, `PAD_CURVE` |
+| Controls › Aiming and sticks | Vertical mouse sensitivity, Aiming sensitivity, Aim mode, Aim assist, Stick deadzone, Stick response curve | see *Launcher settings* below | `PAD_MOUSE_SENS_Y`, `R2_ADS_SENS`, `PAD_AIM_TOGGLE`, `PORT_AIM_ASSIST`, `PAD_DEADZONE`, `PAD_CURVE` |
 | Controls › Controller, Gyro | Controller support, Gyro aiming, Gyro sensitivity, Gyro vertical, Gyro turning axis, Gyro calibration, Light bar, Nintendo button layout | see *Controllers (SDL3)* under Controls | `PAD_BACKEND`, `PAD_GYRO`, `PAD_GYRO_SENS`, `PAD_GYRO_INVERT_Y`, `PAD_GYRO_SPACE`, `PAD_GYRO_CALIBRATE`, `PAD_LIGHTBAR`, `PAD_NINTENDO_SWAP` |
 | Controls › Controller | Pause when the controller disconnects | On, Off | `R2_PAD_DISCONNECT_PAUSE` (`0` = off) |
 | Controls › Controller | Swap sticks (southpaw) | Off, On | `PAD_SOUTHPAW=1` |
@@ -331,6 +331,7 @@ PC-port options added on top of the PS3 game. Each one is an environment variabl
 - `PAD_MOUSE_SENS_Y=<0.1..4>` — vertical mouse sensitivity relative to horizontal (direct and classic mouse aiming).
 - `R2_ADS_SENS=<0.1..3>` — mouse sensitivity while aiming down sights / scoped, relative to hip fire (on top of `R2_ZOOM_SENS`).
 - `PAD_AIM_TOGGLE=1` — Aim (L1 / Mouse2 / LB) toggles instead of hold, for keyboard and controller; menus and the pause screen release it.
+- `PORT_AIM_ASSIST=on|off` — the game's aim assist (your aim slows down over an enemy and is pulled toward it). Unset / `auto`: off with keyboard & mouse, on with a controller (in split-screen only the keyboard & mouse player loses it); `on` (`1`): always, as on PS3; `off` (`0`): never. Launcher Controls › Aiming and sticks › *Aim assist*; F9 and PC SETTINGS › PC CONTROLS & HUD (changes at once). Enemies are not affected.
 - `PAD_DEADZONE=<0..0.9>` — controller stick deadzone, radial (unset: the XInput standard 24 % per axis, as before).
 - `PAD_CURVE=<0.5..3>` — stick response exponent past the deadzone (1 linear, >1 finer near the centre, <1 faster).
 - `PAD_OUTER_DEADZONE`, `PAD_ANTI_DEADZONE`, `PAD_TRIGGER_DEADZONE`, `PAD_TURN_BOOST`, `PAD_CROUCH_MODE` — stick edge, anti-deadzone, trigger travel, turn boost and crouch toggle/hold: see the table under *Controllers (SDL3)*.
