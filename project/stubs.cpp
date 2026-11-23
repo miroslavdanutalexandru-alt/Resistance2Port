@@ -1070,9 +1070,9 @@ extern "C" void port_mouselook(uint32_t player)
  * 0x00108CC4 they become this frame's pitch / yaw deltas (f29 / f1 after
  * func_006C00D0 at 0x00108D0C), added to the pitch (clamped to
  * hero+0x484..0x488) and turned into the new view matrix at hero+0x350.
- *  r2_mouselook_pre (0x00108280, after F5F10): learns the turn directions
- *    from the stick the mouse emulation fed (so the game's invert setting is
- *    followed), then zeroes the stick's rates -- the scripted / aim inputs
+ *  r2_mouselook_pre (0x00108280, after F5F10): takes the turn directions
+ *    from the sign the game gave the stick (r2ml_follow_game: its invert
+ *    settings), then zeroes the stick's rates -- the scripted / aim inputs
  *    added afterwards stay.
  *  r2_mouselook (0x00108D0C): adds the mouse counts since the last frame to
  *    the yaw / pitch deltas; the game's own clamp and wrap follow.
@@ -1091,18 +1091,65 @@ static void r2ml_save(void)
     if (f) { fprintf(f, "yaw_sign = %d\npitch_sign = %d\n", s_r2ml_sx, s_r2ml_sy); fclose(f); }
     s_r2ml_saved = 1;
 }
+/* Which way the mouse turns the view.
+ *  unset / "game" (default): the game's own stick handling, read each frame in
+ *    r2ml_follow_game: the sign the game gave this frame's right stick (its
+ *    Invert up/down / left/right options and whatever else it flips by), never
+ *    the resulting turn rate. Learning from the rate flipped the direction in
+ *    fights ("yaw direction now 1 / -1" four times in 10 s): recoil, hit
+ *    reactions, melee lunges and scripted turns move the view on their own.
+ *    mouselook_r2.cfg is neither read nor written.
+ *  R2_ML_LEARN=1 / motion: the 0.3.0 rule, learnt from the rate (r2ml_check).
+ *  R2_ML_LEARN=legacy: the older rate rule (|fed| >= 16, no hold time, 4 frames).
+ *  R2_ML_LEARN=0: fixed, mouselook_r2.cfg or -1 / -1. */
+static int r2ml_learn_mode(void)
+{
+    static int m = -1;
+    if (m < 0) { const char* e = getenv("R2_ML_LEARN");
+                 m = (!e || !*e || !_stricmp(e, "game")) ? 3 : *e == '0' ? 0 : !_stricmp(e, "legacy") ? 2 : 1; }
+    return m;
+}
 static void r2ml_load(void)
 {
     if (s_r2ml_sx) return;
     s_r2ml_sx = -1; s_r2ml_sy = -1;   /* stick right / down = negative rates (the game negates the stick) */
-    FILE* f = fopen("mouselook_r2.cfg", "r");
+    FILE* f = r2ml_learn_mode() == 3 ? NULL : fopen("mouselook_r2.cfg", "r");
     if (f) { char l[128]; int v;
         while (fgets(l, sizeof l, f)) {
             if (sscanf(l, " yaw_sign = %d", &v) == 1 && (v == 1 || v == -1)) s_r2ml_sx = v;
             if (sscanf(l, " pitch_sign = %d", &v) == 1 && (v == 1 || v == -1)) s_r2ml_sy = v;
         }
         fclose(f); s_r2ml_saved = 1; }
-    fprintf(stderr, "[mouselook] R2 direct mouse look: yaw %d, pitch %d%c", s_r2ml_sx, s_r2ml_sy, 10);
+    fprintf(stderr, "[mouselook] R2 direct mouse look: yaw %d, pitch %d (%s)%c", s_r2ml_sx, s_r2ml_sy,
+            r2ml_learn_mode() == 3 ? "following the game's stick handling" : r2ml_learn_mode() ? "learnt from the turn rate" : "fixed", 10);
+}
+/* One axis of the game's own stick handling: raw = this frame's stick in the pad
+ * slot, proc = what the look code made of it (negated, then flipped again by the
+ * invert option). Only a pure sign change of the same value counts (any other
+ * input path or scaling is skipped), 3 frames in a row. */
+static void ml_follow_axis(float raw, float proc, int* sign, int* cand, int* run, const char* what)
+{
+    const float ar = fabsf(raw), ap = fabsf(proc);
+    if (!(ar >= 0.2f && ar <= 4.0f) || fabsf(ap - ar) > 0.01f * ar + 1e-4f) return;
+    const int s = ((raw > 0.0f) == (proc > 0.0f)) ? 1 : -1;
+    if (s == *sign) { *run = 0; return; }
+    if (s != *cand) { *cand = s; *run = 0; }
+    if (++*run < 3) return;
+    *sign = s; *run = 0;
+    fprintf(stderr, "[mouselook] %s direction now %d (the game's invert setting)%c", what, s, 10);
+}
+/* func_00107B04: the stick in the hero's pad slot (+0x1C across, +0x18 up/down)
+ * is negated into sp+0x70 / sp+0x78 (loc_00107E58), then negated again for the
+ * Invert left/right (options +0x7) and up/down (+0x3) at 0x107ED8..0x107F40 and
+ * by a level setting (pitch, loc_00107E74). The pre hook runs at 0x108280,
+ * after the stick has been turned into rates; sp+0x70 / 0x78 are still there
+ * (func_000F5F10 only reads them). */
+static void r2ml_follow_game(uint32_t slot, uint32_t sp)
+{
+    static int cand[2], run[2];
+    if (!slot || slot >= 0xF0000000u) return;
+    ml_follow_axis(ml_rdf(slot + 0x1C), ml_rdf(sp + 0x70), &s_r2ml_sx, &cand[0], &run[0], "yaw");
+    ml_follow_axis(ml_rdf(slot + 0x18), ml_rdf(sp + 0x78), &s_r2ml_sy, &cand[1], &run[1], "pitch");
 }
 static void r2ml_check(int fed, float rate, int* sign, int* bad, const char* what)
 {
@@ -1111,12 +1158,9 @@ static void r2ml_check(int fed, float rate, int* sign, int* bad, const char* wha
      * such frames flipped the learned sign, and the next 4 flipped it back
      * ("aim briefly inverted"). Only a clear deflection held in one direction
      * for >= 250 ms counts now, and it takes 8 (15 once saved) such frames
-     * in a row. R2_ML_LEARN=0: never re-learn (use mouselook_r2.cfg / -1,-1).
-     * R2_ML_LEARN=legacy: the old learning (|fed| >= 16, no hold time, 4 frames). */
-    static int learn = -1;
-    if (learn < 0) { const char* e = getenv("R2_ML_LEARN");
-                     learn = (e && *e == '0') ? 0 : (e && !_stricmp(e, "legacy")) ? 2 : 1; }
-    if (!learn) return;
+     * in a row. Only with R2_ML_LEARN=1 / legacy now (r2ml_learn_mode). */
+    const int learn = r2ml_learn_mode();
+    if (learn != 1 && learn != 2) return;
     if (learn == 2) {
         if (!(fed >= 16 || fed <= -16) || !(rate > 1e-5f || rate < -1e-5f)) return;
         const int s = ((fed > 0) == (rate > 0)) ? 1 : -1;
@@ -1528,6 +1572,7 @@ extern "C" void r2_mouselook_pre(ppu_context* ctx, uint32_t hero, uint32_t slot,
     const int gyro = !mouse && port_local_players() <= 1 && cellpad_gyro_active();
     if (!mouse && !gyro) return;   /* controller / look keys: the stick turns the view as on PS3 */
     s_r2ml_gyro = !mouse;
+    if (r2ml_learn_mode() == 3) r2ml_follow_game(slot, sp);
     if (mouse) {
     const float ry = ml_rdf(sp + 0x90), rp = ml_rdf(sp + 0x94);
     r2ml_check(g_ml_fed_rx, ry, &s_r2ml_sx, &s_r2ml_bad_x, "yaw");
