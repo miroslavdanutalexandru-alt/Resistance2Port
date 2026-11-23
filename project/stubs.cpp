@@ -1428,12 +1428,14 @@ static int s_r2ml_gyro = 0;   /* this frame's call takes the gyro, not the mouse
  *   func_001270C8: auto-target with the sights (hero+0x231) near a target.
  * Enemies never read it (it is the human players' controller block).
  * PORT_AIM_ASSIST: unset / auto = off for the keyboard & mouse player
- * (controller 0, pad port 0), on for a controller; on / 1 = on (as on PS3);
+ * (the controller on the keyboard's pad port: 0, or 1 with PAD_P2_KEYBOARD),
+ * on for a controller; on / 1 = on (as on PS3);
  * off / 0 = off for every player. The PC menu's "Aim assist" row changes it
  * live (r2_aim_assist_set, r2_pcextra.cpp). The original value is put back as
  * soon as assist should be on again. */
 static volatile int s_aa_mode = -2;   /* -2 not read yet, -1 auto, 0 off, 1 on */
 extern "C" volatile int g_port_input_kbm;   /* cellPad.c: port 0 is driven by keyboard & mouse */
+extern "C" int cellpad_kbm_guest_port(int* only_kbm);   /* cellPad.c */
 static int aim_assist_parse(const char* e)
 {
     if (!e || !*e || !_stricmp(e, "auto")) return -1;
@@ -1481,8 +1483,12 @@ static void aim_assist_apply(uint32_t hero, uint32_t slot)
     if (!opts || opts >= 0xF0000000u) return;
     int off = mode != 1;
     if (mode < 0) {
-        const int kbm = g_port_input_kbm != 0 || GetTickCount64() - g_ml_kbm_ms < 500;
-        off = kbm && idx == 0;
+        /* the keyboard's guest port: 0, or 1 with PAD_P2_KEYBOARD (then only keyboard &
+           mouse drive it, so that player always loses assist and player 1's controller keeps it) */
+        int only_kbm = 0;
+        const int kport = cellpad_kbm_guest_port(&only_kbm);
+        const int kbm = only_kbm || g_port_input_kbm != 0 || GetTickCount64() - g_ml_kbm_ms < 500;
+        off = kbm && idx == (uint32_t)kport;
     }
     static struct { uint32_t ea; uint8_t v; } saved[8];
     int i = 0;
