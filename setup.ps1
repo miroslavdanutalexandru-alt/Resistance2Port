@@ -30,6 +30,11 @@
 #                         them (no administrator rights, nothing added to Windows; see docs\INSTALL.md)
 #   -AcceptMicrosoftLicense   with -PortableTools: accept Microsoft's licence for the MSVC libraries / Windows SDK
 #   -RemoveTools          remove the build tools Setup installed (asks first); with -CheckOnly only lists them
+#   -GetSdks              add the optional SDKs (DLSS / XeSS / Streamline) to an installed port later: downloads the
+#                         missing ones (after their licences are accepted) and builds again, compiling only what uses them
+#
+# Progress: every step shows what it is doing, how far it is and an estimate of the time left (from the step times
+# measured on this PC the last time, in logs\setup_timings.json); the build counts the generated game code by size.
 
 param(
     [string]$Game = '',         # Setup.bat -Game "<.iso or folder>" skips the question (the installer uses it)
@@ -42,7 +47,8 @@ param(
     [switch]$InstallTools,      # install missing build tools system-wide without asking
     [switch]$PortableTools,     # put missing build tools into tools_cache\ instead (experimental)
     [switch]$AcceptMicrosoftLicense,   # with -PortableTools: Microsoft's licence for the MSVC libraries / Windows SDK
-    [switch]$RemoveTools        # remove the build tools Setup installed (-CheckOnly: only list them)
+    [switch]$RemoveTools,       # remove the build tools Setup installed (-CheckOnly: only list them)
+    [switch]$GetSdks            # only download the optional SDKs now (after the install) and rebuild with them
 )
 
 # 'Continue': tools like python/winget print warnings on stderr, which
@@ -118,12 +124,13 @@ $TitleId = 'BCES00226'
 $Sha1 = @{ 'EBOOT.elf' = '90521ca0eea7673903211a48aac001c091c171af' }
 
 $script:Clock = [Diagnostics.Stopwatch]::StartNew()
-function Step($t) { Write-Host ""; Write-Host ("== {0}   [{1:hh\:mm\:ss} since Setup started, {2:HH:mm}]" -f $t, $script:Clock.Elapsed, (Get-Date)) -ForegroundColor Cyan }
+function Step($t) { if ($script:SpPort) { Enter-SpStep $t }; Write-Host ""; Write-Host ("== {0}   [{1:hh\:mm\:ss} since Setup started, {2:HH:mm}]" -f $t, $script:Clock.Elapsed, (Get-Date)) -ForegroundColor Cyan }
 function Info($t) { Write-Host "   $t" }
 function Fail($t) {
     Write-Host ""; Write-Host "SETUP STOPPED: $t" -ForegroundColor Red
     Write-Host "Nothing is lost - fix the problem above and run Setup.bat again. (Full log: logs\$LogName)"
     Dismount-GameSource
+    if ($script:SpPort) { Write-SpTimingSummary; Save-SpTimings }   # what finished still makes the next estimate better
     try { Stop-Transcript | Out-Null } catch {}
     if (-not $CheckOnly -and -not $Unattended) { Read-Host "Press Enter to close" }; exit 1
 }
@@ -131,6 +138,8 @@ function Fail($t) {
 . (Join-Path $Port 'tools\installer\gamefiles.ps1')
 # Build repair (fresh configuration, first error) and disk-space helpers.
 . (Join-Path $Port 'tools\build_doctor.ps1')
+# Progress bars, time estimates and logs\setup_timings.json (the step durations on this PC, for the next estimates).
+. (Join-Path $Port 'tools\installer\progress.ps1')
 # What the build tools are for, the record of what Setup installed, the portable tools and their removal.
 $script:BtPort = $Port
 . (Join-Path $Port 'tools\installer\buildtools.ps1')
@@ -501,6 +510,85 @@ Write-Host "Resistance 2 - PC port setup" -ForegroundColor Yellow
 Write-Host "Folder: $Port"
 if ($Port -match ' ') { Info "Note: this folder's path has spaces in it. That works, but a path without spaces (like C:\Games\Resistance2Port) is safer." }
 
+# The optional SDKs (NVIDIA DLSS, Intel XeSS, NVIDIA Streamline): each downloaded after its licence is accepted, unless
+# it is already there or -NoOptionalSdks. Also Setup.bat -GetSdks, to add them to an installed port later.
+function Get-OptionalSdks {
+    $dl = Join-Path $Port 'tools\dlss'
+    $needDlss = -not (Test-Path (Join-Path $dl 'lib\nvsdk_ngx_s.lib')) -or -not (Test-Path (Join-Path $dl 'nvngx_dlss.dll'))
+    if ($needDlss -and $NoOptionalSdks) { Info "Skipping the NVIDIA DLSS SDK (-NoOptionalSdks): the DLSS option will use AMD FSR 3.1 instead." }
+    elseif ($needDlss -and (Confirm-SdkLicense 'the NVIDIA DLSS SDK v310.9.16' $DlssLicense)) {
+        Info "Fetching the NVIDIA DLSS SDK v310.9.16 (optional: the NVIDIA DLSS / DLAA option)..."
+        $base = 'https://raw.githubusercontent.com/NVIDIA/DLSS/v310.9.16'
+        $hdrs = 'nvsdk_ngx.h','nvsdk_ngx_defs.h','nvsdk_ngx_defs_dlssd.h','nvsdk_ngx_defs_dlssg.h','nvsdk_ngx_defs_vk.h',
+                'nvsdk_ngx_helpers.h','nvsdk_ngx_helpers_cuda.h','nvsdk_ngx_helpers_d3d.h','nvsdk_ngx_helpers_dlssd.h',
+                'nvsdk_ngx_helpers_dlssd_cuda.h','nvsdk_ngx_helpers_dlssd_d3d.h','nvsdk_ngx_helpers_dlssd_vk.h',
+                'nvsdk_ngx_helpers_dlssg.h','nvsdk_ngx_helpers_dlssg_d3d.h','nvsdk_ngx_helpers_dlssg_vk.h','nvsdk_ngx_helpers_vk.h',
+                'nvsdk_ngx_loader.h','nvsdk_ngx_params.h','nvsdk_ngx_params_dlssd.h','nvsdk_ngx_params_dlssg.h',
+                'nvsdk_ngx_standalone_common.h','nvsdk_ngx_standalone_cuda.h','nvsdk_ngx_vk.h'
+        $files = @(@('LICENSE.txt', 'LICENSE.txt'),
+                   @('lib/Windows_x86_64/x64/nvsdk_ngx_s.lib', 'lib\nvsdk_ngx_s.lib'),
+                   @('lib/Windows_x86_64/rel/nvngx_dlss.dll', 'nvngx_dlss.dll')) + ($hdrs | ForEach-Object { ,@("include/$_", "include\$_") })
+        try {
+            foreach ($f in $files) {
+                $out = Join-Path $dl $f[1]
+                New-Item -ItemType Directory -Force -Path (Split-Path $out) | Out-Null
+                Invoke-WebRequest -UseBasicParsing -Uri "$base/$($f[0])" -OutFile $out
+            }
+        } catch {
+            Info "Could not download the DLSS SDK - building without the NVIDIA DLSS option (FSR still works)."
+            if (Test-Path (Join-Path $dl 'lib')) { Remove-Item (Join-Path $dl 'lib') -Recurse -Force }
+        }
+    }
+    $xd = Join-Path $Port 'tools\xess'
+    if (-not (Test-Path (Join-Path $xd 'bin\libxess.dll'))) {
+        if ($NoOptionalSdks) { Info "Skipping the Intel XeSS SDK (-NoOptionalSdks): the XeSS option will use AMD FSR 3.1 instead." }
+        elseif (Confirm-SdkLicense 'the Intel XeSS SDK 2.1.1' $XessLicense) {
+            Info "Fetching the Intel XeSS SDK 2.1.1 (~90 MB, optional: the Intel XeSS option)..."
+            $zip = Join-Path $env:TEMP "$($TitleId)_xess.zip"; $tmp = Join-Path $env:TEMP "$($TitleId)_xess"
+            try {
+                Invoke-WebRequest -UseBasicParsing -Uri $XessUrl -OutFile $zip
+                if ((Get-PortFileHash $zip SHA256) -ne $XessSha256) { throw "the download is incomplete or not the expected file (SHA-256 mismatch)" }
+                if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+                Expand-PortZip -LiteralPath $zip -DestinationPath $tmp
+                $dll = Get-ChildItem $tmp -Recurse -Filter 'libxess.dll' | Where-Object { $_.Directory.Name -eq 'bin' } | Sort-Object { $_.FullName.Length } | Select-Object -First 1
+                if (-not $dll) { throw "libxess.dll is not in the zip" }
+                $src = $dll.Directory.Parent.FullName
+                New-Item -ItemType Directory -Force -Path (Join-Path $xd 'bin'), (Join-Path $xd 'inc') | Out-Null
+                Copy-Item -LiteralPath (Join-Path $src 'inc\xess') -Destination (Join-Path $xd 'inc') -Recurse -Force
+                foreach ($n in 'LICENSE.txt', 'third-party-programs.txt') { Copy-Item -LiteralPath (Join-Path $src $n) -Destination $xd -Force }
+                Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $xd 'bin') -Force   # last: marks a complete copy
+                Info "Intel XeSS SDK: OK"
+            } catch { Info "Could not get the Intel XeSS SDK ($_) - building without the Intel XeSS option (FSR 3.1 is used instead)." }
+            Remove-Item $zip, $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $sd = Join-Path $Port 'tools\streamline'
+    if (-not (Test-Path (Join-Path $sd 'bin\sl.interposer.dll'))) {
+        if ($NoOptionalSdks) { Info "Skipping NVIDIA Streamline (-NoOptionalSdks): no DLSS Frame Generation option." }
+        elseif (Confirm-SdkLicense 'NVIDIA Streamline 2.14.16 (DLSS Frame Generation)' $SlLicense) {
+            Info "Fetching NVIDIA Streamline 2.14.16 (~200 MB, optional: DLSS Frame Generation on GeForce RTX 40/50)..."
+            $zip = Join-Path $env:TEMP "$($TitleId)_streamline.zip"; $tmp = Join-Path $env:TEMP "$($TitleId)_streamline"
+            try {
+                Invoke-WebRequest -UseBasicParsing -Uri $SlUrl -OutFile $zip
+                if ((Get-PortFileHash $zip SHA256) -ne $SlSha256) { throw "the download is incomplete or not the expected file (SHA-256 mismatch)" }
+                if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+                Expand-PortZip -LiteralPath $zip -DestinationPath $tmp
+                $bin = Join-Path $tmp 'bin\x64'
+                if (-not (Test-Path (Join-Path $bin 'sl.interposer.dll'))) { throw "sl.interposer.dll is not in the zip" }
+                New-Item -ItemType Directory -Force -Path (Join-Path $sd 'bin'), (Join-Path $sd 'include') | Out-Null
+                Copy-Item -Path (Join-Path $tmp 'include\*') -Destination (Join-Path $sd 'include') -Recurse -Force
+                foreach ($n in 'license.txt', '3rd-party-licenses.md') { Copy-Item -LiteralPath (Join-Path $tmp $n) -Destination $sd -Force }
+                foreach ($n in 'nvngx_dlss.license.txt', 'reflex.license.txt') { Copy-Item -LiteralPath (Join-Path $bin $n) -Destination $sd -Force }
+                foreach ($n in 'sl.common.dll', 'sl.dlss_g.dll', 'sl.reflex.dll', 'sl.pcl.dll', 'nvngx_dlssg.dll', 'NvLowLatencyVk.dll', 'sl.interposer.dll') {
+                    Copy-Item -LiteralPath (Join-Path $bin $n) -Destination (Join-Path $sd 'bin') -Force   # sl.interposer last: marks a complete copy
+                }
+                Info "NVIDIA Streamline: OK"
+            } catch { Info "Could not get NVIDIA Streamline ($_) - building without DLSS Frame Generation." }
+            Remove-Item $zip, $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 if ($RemoveTools) {
     Refresh-Path   # with the portable tools: the portable git undoes a safe.directory setting
     Step $(if ($CheckOnly) { "Build tools Setup installed (nothing is removed with -CheckOnly)" } else { "Removing the build tools Setup installed" })
@@ -521,6 +609,42 @@ if ($CheckOnly) {
     }
     try { Stop-Transcript | Out-Null } catch {}
     exit $(if ($script:Chk.Errors) { 1 } else { 0 })
+}
+Initialize-SpProgress $Port -Unattended:$Unattended
+if ($GetSdks) {
+    # The optional SDKs after the install: download what is missing, then build again. build.bat configures RPCS3's
+    # renderer every time, which is when it looks for the SDKs, so only the files that use them are compiled again.
+    Step "Optional SDKs (NVIDIA DLSS, Intel XeSS, NVIDIA Streamline)"
+    Refresh-Path
+    $sdkMarks = @('tools\dlss\lib\nvsdk_ngx_s.lib', 'tools\xess\bin\libxess.dll', 'tools\streamline\bin\sl.interposer.dll')
+    $sdkBefore = @($sdkMarks | Where-Object { Test-Path -LiteralPath (Join-Path $Port $_) })
+    $NoOptionalSdks = $false
+    Get-OptionalSdks
+    $sdkNew = @($sdkMarks | Where-Object { (Test-Path -LiteralPath (Join-Path $Port $_)) -and $sdkBefore -notcontains $_ })
+    $sdkHave = @($sdkMarks | Where-Object { Test-Path -LiteralPath (Join-Path $Port $_) })
+    Info ("Optional SDKs present: {0} of 3{1}." -f $sdkHave.Count, $(if ($sdkNew.Count) { " ($($sdkNew.Count) new)" } else { '' }))
+    if (-not (Test-Path -LiteralPath (Join-Path $Port 'recompiled\ppu_recomp.h'))) {
+        Info "The port is not installed yet: run Setup.bat (or Setup.exe) - it builds with these SDKs."
+    } elseif (-not $sdkNew.Count) {
+        Info "Nothing new to build with."
+    } else {
+        Step "5/5  Building"
+        Set-BuildJobs
+        Repair-MovedBuildDirs $Port
+        $script:BuildStart = Get-Date
+        Invoke-SpBuild $Port "`"$Port\build.bat`" nopause" @(, @('recompiled', 'build'))
+        if ($LASTEXITCODE -ne 0) {
+            $e = Get-FirstBuildError $Port $script:BuildStart
+            if ($e) { Write-Host ""; Write-Host "   The first error:" -ForegroundColor Yellow; foreach ($l in $e -split "`n") { Write-Host "   $l" -ForegroundColor Yellow } }
+            Fail "The build failed - see logs\build.log and logs\build_rpcs3.log (the first error is shown above)."
+        }
+        Info "Done: the new options are in the launcher's graphics settings."
+    }
+    Complete-SpStep
+    Save-SpTimings
+    try { Stop-Transcript | Out-Null } catch {}
+    if (-not $Unattended) { Read-Host "Press Enter to close" }
+    exit 0
 }
 Step "Checking this PC"
 Refresh-Path
@@ -663,11 +787,14 @@ if ($genWhy) {
     if ($genWhy -ne 'new') { Info "Files that come out the same keep their date, so the build only compiles what really changed." }
     $genSnap = Save-GenSnapshot $Port $GenDirs
     Remove-GenStamp $Port
-    & $py tools\r2_regen.py --eboot game\EBOOT.elf | Out-Host
-    if ($LASTEXITCODE -ne 0) { Fail "Generating the game code failed (see the messages above)." }
+    $code = Invoke-SpRegen $py 'tools\r2_regen.py --eboot game\EBOOT.elf' @('ppu_analyze', 'ppu_lift', 'ppu_emit', 'ppu_post', 'ppu_hooks', 'ppu_copy', 'spu_lift', 'spu_post')
+    if ($code -ne 0) { Fail "Generating the game code failed (see the messages above)." }
     if ($genSnap.Count) { $g = Restore-GenTimes $Port $GenDirs $genSnap; Info ("Generated files: {0} changed, {1} unchanged." -f $g.Changed, $g.Kept) }
     Save-GenStamp $Port $GenScript
-} else { Info "Already generated (set R2_REGEN=1 to force)." }
+} else {
+    Set-SpEstimate 'gen' 1; Info "Already generated (set R2_REGEN=1 to force)."
+    if ((Get-GenPlan $Port $GenScript).Legacy) { Save-GenStamp $Port $GenScript }   # the earlier version's record, for this version's generator
+}
 
 # ---------------------------------------------------------------- 5. build
 Step "5/5  Building"
@@ -708,92 +835,20 @@ If the internet works and that link is gone, download an FFmpeg 7.1 'win64-lgpl-
     if (-not $FFmpegZip) { Remove-Item $zip -Force -ErrorAction SilentlyContinue }
 }
 Info "FFmpeg (LGPL build): OK"
-$dl = Join-Path $Port 'tools\dlss'
-$needDlss = -not (Test-Path (Join-Path $dl 'lib\nvsdk_ngx_s.lib')) -or -not (Test-Path (Join-Path $dl 'nvngx_dlss.dll'))
-if ($needDlss -and $NoOptionalSdks) { Info "Skipping the NVIDIA DLSS SDK (-NoOptionalSdks): the DLSS option will use AMD FSR 3.1 instead." }
-elseif ($needDlss -and (Confirm-SdkLicense 'the NVIDIA DLSS SDK v310.9.16' $DlssLicense)) {
-    Info "Fetching the NVIDIA DLSS SDK v310.9.16 (optional: the NVIDIA DLSS / DLAA option)..."
-    $base = 'https://raw.githubusercontent.com/NVIDIA/DLSS/v310.9.16'
-    $hdrs = 'nvsdk_ngx.h','nvsdk_ngx_defs.h','nvsdk_ngx_defs_dlssd.h','nvsdk_ngx_defs_dlssg.h','nvsdk_ngx_defs_vk.h',
-            'nvsdk_ngx_helpers.h','nvsdk_ngx_helpers_cuda.h','nvsdk_ngx_helpers_d3d.h','nvsdk_ngx_helpers_dlssd.h',
-            'nvsdk_ngx_helpers_dlssd_cuda.h','nvsdk_ngx_helpers_dlssd_d3d.h','nvsdk_ngx_helpers_dlssd_vk.h',
-            'nvsdk_ngx_helpers_dlssg.h','nvsdk_ngx_helpers_dlssg_d3d.h','nvsdk_ngx_helpers_dlssg_vk.h','nvsdk_ngx_helpers_vk.h',
-            'nvsdk_ngx_loader.h','nvsdk_ngx_params.h','nvsdk_ngx_params_dlssd.h','nvsdk_ngx_params_dlssg.h',
-            'nvsdk_ngx_standalone_common.h','nvsdk_ngx_standalone_cuda.h','nvsdk_ngx_vk.h'
-    $files = @(@('LICENSE.txt', 'LICENSE.txt'),
-               @('lib/Windows_x86_64/x64/nvsdk_ngx_s.lib', 'lib\nvsdk_ngx_s.lib'),
-               @('lib/Windows_x86_64/rel/nvngx_dlss.dll', 'nvngx_dlss.dll')) + ($hdrs | ForEach-Object { ,@("include/$_", "include\$_") })
-    try {
-        foreach ($f in $files) {
-            $out = Join-Path $dl $f[1]
-            New-Item -ItemType Directory -Force -Path (Split-Path $out) | Out-Null
-            Invoke-WebRequest -UseBasicParsing -Uri "$base/$($f[0])" -OutFile $out
-        }
-    } catch {
-        Info "Could not download the DLSS SDK - building without the NVIDIA DLSS option (FSR still works)."
-        if (Test-Path (Join-Path $dl 'lib')) { Remove-Item (Join-Path $dl 'lib') -Recurse -Force }
-    }
-}
-$xd = Join-Path $Port 'tools\xess'
-if (-not (Test-Path (Join-Path $xd 'bin\libxess.dll'))) {
-    if ($NoOptionalSdks) { Info "Skipping the Intel XeSS SDK (-NoOptionalSdks): the XeSS option will use AMD FSR 3.1 instead." }
-    elseif (Confirm-SdkLicense 'the Intel XeSS SDK 2.1.1' $XessLicense) {
-        Info "Fetching the Intel XeSS SDK 2.1.1 (~90 MB, optional: the Intel XeSS option)..."
-        $zip = Join-Path $env:TEMP "$($TitleId)_xess.zip"; $tmp = Join-Path $env:TEMP "$($TitleId)_xess"
-        try {
-            Invoke-WebRequest -UseBasicParsing -Uri $XessUrl -OutFile $zip
-            if ((Get-PortFileHash $zip SHA256) -ne $XessSha256) { throw "the download is incomplete or not the expected file (SHA-256 mismatch)" }
-            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
-            Expand-PortZip -LiteralPath $zip -DestinationPath $tmp
-            $dll = Get-ChildItem $tmp -Recurse -Filter 'libxess.dll' | Where-Object { $_.Directory.Name -eq 'bin' } | Sort-Object { $_.FullName.Length } | Select-Object -First 1
-            if (-not $dll) { throw "libxess.dll is not in the zip" }
-            $src = $dll.Directory.Parent.FullName
-            New-Item -ItemType Directory -Force -Path (Join-Path $xd 'bin'), (Join-Path $xd 'inc') | Out-Null
-            Copy-Item -LiteralPath (Join-Path $src 'inc\xess') -Destination (Join-Path $xd 'inc') -Recurse -Force
-            foreach ($n in 'LICENSE.txt', 'third-party-programs.txt') { Copy-Item -LiteralPath (Join-Path $src $n) -Destination $xd -Force }
-            Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $xd 'bin') -Force   # last: marks a complete copy
-            Info "Intel XeSS SDK: OK"
-        } catch { Info "Could not get the Intel XeSS SDK ($_) - building without the Intel XeSS option (FSR 3.1 is used instead)." }
-        Remove-Item $zip, $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-$sd = Join-Path $Port 'tools\streamline'
-if (-not (Test-Path (Join-Path $sd 'bin\sl.interposer.dll'))) {
-    if ($NoOptionalSdks) { Info "Skipping NVIDIA Streamline (-NoOptionalSdks): no DLSS Frame Generation option." }
-    elseif (Confirm-SdkLicense 'NVIDIA Streamline 2.14.16 (DLSS Frame Generation)' $SlLicense) {
-        Info "Fetching NVIDIA Streamline 2.14.16 (~200 MB, optional: DLSS Frame Generation on GeForce RTX 40/50)..."
-        $zip = Join-Path $env:TEMP "$($TitleId)_streamline.zip"; $tmp = Join-Path $env:TEMP "$($TitleId)_streamline"
-        try {
-            Invoke-WebRequest -UseBasicParsing -Uri $SlUrl -OutFile $zip
-            if ((Get-PortFileHash $zip SHA256) -ne $SlSha256) { throw "the download is incomplete or not the expected file (SHA-256 mismatch)" }
-            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
-            Expand-PortZip -LiteralPath $zip -DestinationPath $tmp
-            $bin = Join-Path $tmp 'bin\x64'
-            if (-not (Test-Path (Join-Path $bin 'sl.interposer.dll'))) { throw "sl.interposer.dll is not in the zip" }
-            New-Item -ItemType Directory -Force -Path (Join-Path $sd 'bin'), (Join-Path $sd 'include') | Out-Null
-            Copy-Item -Path (Join-Path $tmp 'include\*') -Destination (Join-Path $sd 'include') -Recurse -Force
-            foreach ($n in 'license.txt', '3rd-party-licenses.md') { Copy-Item -LiteralPath (Join-Path $tmp $n) -Destination $sd -Force }
-            foreach ($n in 'nvngx_dlss.license.txt', 'reflex.license.txt') { Copy-Item -LiteralPath (Join-Path $bin $n) -Destination $sd -Force }
-            foreach ($n in 'sl.common.dll', 'sl.dlss_g.dll', 'sl.reflex.dll', 'sl.pcl.dll', 'nvngx_dlssg.dll', 'NvLowLatencyVk.dll', 'sl.interposer.dll') {
-                Copy-Item -LiteralPath (Join-Path $bin $n) -Destination (Join-Path $sd 'bin') -Force   # sl.interposer last: marks a complete copy
-            }
-            Info "NVIDIA Streamline: OK"
-        } catch { Info "Could not get NVIDIA Streamline ($_) - building without DLSS Frame Generation." }
-        Remove-Item $zip, $tmp -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
+Get-OptionalSdks
 Info "Fetching RPCS3's renderer source and applying the port's patch..."
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Port 'tools\fetch_rpcs3.ps1') | Out-Host
 if ($LASTEXITCODE -ne 0) { Fail "Could not download or patch the RPCS3 source. The reason and what to do are printed above (git's own messages are in logs\fetch_rpcs3.log): no internet, a proxy or firewall blocking github.com, an antivirus, or a drive git cannot use (exFAT / FAT32 / network)." }
 Set-BuildJobs
 Repair-MovedBuildDirs $Port
 $script:BuildStart = $script:BuildStart0 = Get-Date
-& cmd /c "`"$Port\build.bat`" nopause"
+$BuildPairs = @(, @('recompiled', 'build'))   # the generated PPU code and its build folder (for the build progress)
+Invoke-SpBuild $Port "`"$Port\build.bat`" nopause" $BuildPairs
 for ($h = 1; $LASTEXITCODE -ne 0 -and $h -le 2 -and -not $script:UserJobs -and (Test-BuildOom); $h++) {
     Info "The compiler ran out of memory. Trying again with fewer files at a time (the build continues where it stopped)..."
     Set-BuildJobs -Halve $h
     $script:BuildStart = Get-Date
-    & cmd /c "`"$Port\build.bat`" nopause"
+    Invoke-SpBuild $Port "`"$Port\build.bat`" nopause" $BuildPairs
 }
 # Not out of memory and not an error in the code ("build.ninja still dirty", a moved folder, a stale CMake cache):
 # one more try with a fresh build configuration. The files already compiled are kept.
@@ -803,7 +858,7 @@ if ($LASTEXITCODE -ne 0 -and -not (Test-BuildOom) -and ((Test-BuildConfigProblem
     Info "Trying once more with a fresh build configuration (the files already compiled are kept)..."
     Reset-BuildConfig $Port
     $script:BuildStart = Get-Date
-    & cmd /c "`"$Port\build.bat`" nopause"
+    Invoke-SpBuild $Port "`"$Port\build.bat`" nopause" $BuildPairs
 }
 if ($LASTEXITCODE -ne 0) {
     $e = Get-FirstBuildError $Port $script:BuildStart
@@ -847,6 +902,9 @@ if ($desktop -and -not $Unattended -and -not (Test-Path -LiteralPath $lnk)) {   
 $missing = @('build\Resistance2.exe', 'Launcher.exe' | Where-Object { -not (Test-Path -LiteralPath (Join-Path $Port $_)) })
 if ($missing) { Fail "The build finished but $($missing -join ', ') is missing - an antivirus may have quarantined it (check its quarantine/history, restore the file and add the port folder to the exclusions), or see logs\build.log." }
 
+Complete-SpStep
+Write-SpTimingSummary
+Save-SpTimings
 Write-Host ""
 Write-Host "SETUP COMPLETE. Start the game with Launcher.exe." -ForegroundColor Green
 if (@(Get-BtManifest | Where-Object { $_ -match '^(winget|direct|portable)\|' }).Count) {
