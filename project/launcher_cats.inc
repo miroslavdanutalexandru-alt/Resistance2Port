@@ -32,6 +32,7 @@ static const CatGroup g_cat[] = {
     { P_UI,       "PHOTO MODE AND DISCORD",        "photo discord" },
     { P_ADVANCED, "START-UP",                      "skipintro language" },
     { P_ADVANCED, "GAMEPLAY",                      "gore dyndiff" },
+    { P_ADVANCED, "CHEATS (SINGLE PLAYER)",        "cheat_god cheat_ammo cheat_grenades cheat_keys" },
     { P_ADVANCED, "MODS AND TEXTURES",             "mods texpack texdump hdui" },
     { P_ADVANCED, "SAVES",                         "savedir savebackup" },
     { P_ADVANCED, "CPU THREADS",                   "pcores threadprio" },
