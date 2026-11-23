@@ -441,6 +441,21 @@ static void register_pc_options()
                "The game quietly eases enemy damage the longer a section takes and the more you die (PS3 original). "
                "Off keeps the difficulty you picked at its full strength.",
                "PORT_DYNDIFF", { {"On  (PS3 original)", ""}, {"Off", "0"} }, 0);
+    // r2_cheats.cpp: optional single-player cheats (also F9 rows; never online or in a benchmark run)
+    add_option(SEC_PC, "cheat_god", "God mode",
+               "Single-player cheat: your health stays full and nothing can kill you. Only you (and local co-op "
+               "players); enemies and online play are not affected. Trophies are off until the game is restarted.",
+               "PORT_CHEAT_GODMODE", { {"Off", ""}, {"On", "1"} }, 0);
+    add_option(SEC_PC, "cheat_ammo", "Infinite ammo",
+               "Single-player cheat: your weapons never run out. Trophies are off until the game is restarted.",
+               "PORT_CHEAT_AMMO", { {"Off", ""}, {"On", "1"} }, 0);
+    add_option(SEC_PC, "cheat_grenades", "Infinite grenades",
+               "Single-player cheat: your grenade count never drops. Trophies are off until the game is restarted.",
+               "PORT_CHEAT_GRENADES", { {"Off", ""}, {"On", "1"} }, 0);
+    add_option(SEC_PC, "cheat_keys", "Cheat hotkeys",
+               "In the game, Ctrl+F1 toggles God mode and Ctrl+F2 Infinite ammo and grenades. Off: only this page and "
+               "the F9 menu change them.",
+               "PORT_CHEAT_KEYS", { {"Off", ""}, {"On", "1"} }, 0);
     add_option(SEC_PC, "trophytoast", "Trophy notifications",
                "A small notification in the corner of the game window when you earn a trophy. Trophies are always "
                "recorded (see the Trophies page).",

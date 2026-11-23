@@ -1,32 +1,37 @@
-/* Resistance 2 PC port: cheats (God mode, Infinite ammo).
+/* Resistance 2 PC port: optional single-player cheats (God mode, Infinite ammo,
+ * Infinite grenades). All off by default; they only touch the local players.
  *
- *   Ctrl+F1   God mode       every frame the game's own "set_hero_health_min"
- *                            native (func_00034854, the Lua binding at OPD
- *                            0x00D73940) is run with 4 = all four health bars, so
- *                            every local player's health is topped back up to full,
- *                            and the hero's moby is kept non-damageable (what
- *                            set_damageable(moby, false) does: bit 0x8 at moby+0x64),
- *                            so instant-kill attacks don't land either.
- *   Ctrl+F2   Infinite ammo  every frame, for each local player's weapons (the
- *                            weapon lookup func_000F35BC, types 0..46) the four
- *                            ammo counters (primary +0x314/+0x316, alt +0x318/+0x31A,
- *                            int16) and the grenade counts (player+0x8A0 inventory,
- *                            types 21..24, slot type-21) are not allowed to drop below the highest
- *                            value seen for that weapon. Ammo kinds 7 / 10 (infinite)
- *                            and 9 (no count, heat) at weapon+0x32B / +0x32C are left
- *                            alone; kind 1 also holds the clip (+0x316 / +0x31A).
+ *   God mode           every frame the game's own "set_hero_health_min"
+ *                      native (func_00034854, the Lua binding at OPD
+ *                      0x00D73940) is run with 4 = all four health bars, so
+ *                      every local player's health is topped back up to full,
+ *                      and the hero's moby is kept non-damageable (what
+ *                      set_damageable(moby, false) does: bit 0x8 at moby+0x64),
+ *                      so instant-kill attacks don't land either.
+ *   Infinite ammo      every frame, for each local player's weapons (the
+ *                      weapon lookup func_000F35BC, types 0..46 except the
+ *                      grenades) the four ammo counters (primary +0x314/+0x316,
+ *                      alt +0x318/+0x31A, int16) are not allowed to drop below the
+ *                      highest value seen for that weapon. Ammo kinds 7 / 10
+ *                      (infinite) and 9 (no count, heat) at weapon+0x32B / +0x32C
+ *                      are left alone; kind 1 also holds the clip (+0x316 / +0x31A).
+ *   Infinite grenades  the same for the grenade counts (player+0x8A0 inventory,
+ *                      types 21..24, count byte at +0x220 + (type - 21) + 9).
  *
- *   R2_CHEAT_GOD=1 / R2_CHEAT_AMMO=1 turn them on at start. Both are off by default.
- *   Once either has been on, trophy unlocks are not recorded until the game is restarted
- *   (g_trophy_unlocks_blocked, sceNpTrophy.c). In an R2_BENCH run both stay off. The keys
- *   are ignored in photo mode and the port's menus, and while F1 / F2 is bound to a game
- *   action in controls.txt (r2_pcextra.cpp).
+ * Turned on by the launcher / F9 menu rows (PORT_CHEAT_GODMODE, PORT_CHEAT_AMMO,
+ * PORT_CHEAT_GRENADES = 1; R2_CHEAT_GOD / R2_CHEAT_AMMO still work, the latter
+ * also turns on grenades) or, when PORT_CHEAT_KEYS=1, Ctrl+F1 / F2 / F3
+ * (r2_pcextra.cpp). Once any has been on, trophy unlocks are not recorded until
+ * the game is restarted (g_trophy_unlocks_blocked, sceNpTrophy.c). In an R2_BENCH
+ * run and with PORT_ONLINE on they all stay off. Every change is logged.
  *
  * Runs on the game's main thread at the top of the frame limiter func_00635D28
  * (hook in tools/hooks/r2.json), i.e. between frames. The guest calls run on a
  * scratch frame 0x400 below the guest stack pointer and the whole PPU context is
  * restored afterwards, so the limiter itself sees exactly the registers it would
- * have had. Addresses are for BCES00226 1.00 (the only EBOOT the port supports). */
+ * have had. Addresses are for BCES00226 1.00 (the only EBOOT the port supports).
+ *
+ * First version by Jishnuraj07 (GitHub R2 PR #14). */
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -40,13 +45,16 @@ extern "C" volatile int g_trophy_unlocks_blocked;   /* sceNpTrophy.c */
 
 extern "C" volatile int g_r2_cheat_god = 0;
 extern "C" volatile int g_r2_cheat_ammo = 0;
+extern "C" volatile int g_r2_cheat_gren = 0;
 
-/* R2_BENCH runs stay comparable: no cheats at all (env vars and keys are ignored). */
-static int cheats_allowed(void)
+static int env_on(const char* n) { const char* e = getenv(n); return e && *e && strcmp(e, "0") != 0; }
+/* R2_BENCH runs stay comparable and PORT_ONLINE (RPCN, port_online.c) is never
+ * cheated in: no cheats at all (env vars, menu rows and keys are ignored). */
+static int cheats_blocked(void)
 {
-    static int bench = -1;
-    if (bench < 0) { const char* b = getenv("R2_BENCH"); bench = (b && *b && atoi(b) != 0) ? 1 : 0; }
-    return !bench;
+    static int why = -1;
+    if (why < 0) why = env_on("R2_BENCH") ? 1 : env_on("PORT_ONLINE") ? 2 : 0;
+    return why;
 }
 /* Once a cheat has been on, trophies stay off until the game is restarted. */
 static void block_trophies(void)
@@ -55,17 +63,40 @@ static void block_trophies(void)
     g_trophy_unlocks_blocked = 1;
     fprintf(stderr, "[cheat] trophies are off until the game is restarted\n");
 }
-/* UI thread (r2_pcextra.cpp key toggles): 0 = God mode, 1 = Infinite ammo. Returns the new
- * state, or -1 when cheats are not allowed (benchmark run). */
-extern "C" int r2_cheat_toggle(int which)
+static const char* const s_name[3] = { "god mode", "infinite ammo", "infinite grenades" };
+static volatile int& cheat_flag(int which) { return which == 0 ? g_r2_cheat_god : which == 1 ? g_r2_cheat_ammo : g_r2_cheat_gren; }
+/* The old R2_CHEAT_* names (R2 PR #14) become the PORT_CHEAT_* the menu rows and
+ * the launcher use. Called before the F9 menu reads them (r2_pcextra.cpp opts_init). */
+extern "C" void r2_cheats_init_env(void)
 {
-    if (!cheats_allowed()) return -1;
-    volatile int& v = which ? g_r2_cheat_ammo : g_r2_cheat_god;
-    const int on = !v;
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    if (env_on("R2_CHEAT_GOD") && !getenv("PORT_CHEAT_GODMODE")) _putenv_s("PORT_CHEAT_GODMODE", "1");
+    if (env_on("R2_CHEAT_AMMO")) {
+        if (!getenv("PORT_CHEAT_AMMO")) _putenv_s("PORT_CHEAT_AMMO", "1");
+        if (!getenv("PORT_CHEAT_GRENADES")) _putenv_s("PORT_CHEAT_GRENADES", "1");
+    }
+    const int why = cheats_blocked();
+    if (why && (env_on("PORT_CHEAT_GODMODE") || env_on("PORT_CHEAT_AMMO") || env_on("PORT_CHEAT_GRENADES")))
+        fprintf(stderr, "[cheat] %s: cheats are off\n", why == 1 ? "benchmark run" : "online (PORT_ONLINE)");
+}
+/* 0 = God mode, 1 = Infinite ammo, 2 = Infinite grenades; on: 1 / 0, -1 = toggle.
+ * Returns the new state, -1 in a benchmark run, -2 with online on. Any thread. */
+extern "C" int r2_cheat_set(int which, int on)
+{
+    if (which < 0 || which > 2) return 0;
+    r2_cheats_init_env();
+    if (const int why = cheats_blocked()) return -why;
+    volatile int& v = cheat_flag(which);
+    if (on < 0) on = !v;
+    on = on ? 1 : 0;
     if (on) block_trophies();
+    if (v != on) fprintf(stderr, "[cheat] %s %s\n", s_name[which], on ? "on" : "off");
     v = on;
     return on;
 }
+extern "C" int r2_cheat_toggle(int which) { return r2_cheat_set(which, -1); }
 
 static const uint64_t R2_TOC = 0x00DED008ULL;
 
@@ -112,18 +143,20 @@ static void hold8(uint32_t obj, uint32_t field)
  * 7 / 10 = infinite, 9 = no count (heat), anything else = the single count +0x314 */
 static int counted_kind(uint8_t k) { return k != 7 && k != 9 && k != 10; }
 
+/* grenades (func_00034488 / func_000E7F20): player+0x8A0 inventory, count byte
+ * at +0x220 + (type - 21) + 9 for the grenade types 21..24 */
+static void grenades_player(uint32_t player)
+{
+    const uint32_t f = 0x8A0 + 0x220 + 9;
+    if (s_diag && !s_gdiag && (s_gdiag = 1))
+        fprintf(stderr, "[cheat] player 0x%08X grenades %u %u %u %u\n", player, vm_read8(player + f),
+                vm_read8(player + f + 1), vm_read8(player + f + 2), vm_read8(player + f + 3));
+    for (uint32_t k = 0; k < 4; k++) hold8(player, f + k);
+}
 static void ammo_player(ppu_context* c, uint32_t player)
 {
     for (uint32_t type = 0; type < 0x2F; type++) {
-        if (type >= 21 && type <= 24) {   /* grenades (func_00034488 / func_000E7F20): player+0x8A0 inventory,
-                                             count byte at +0x220 + (type - 21) + 9 */
-            const uint32_t f = 0x8A0 + 0x220 + (type - 21) + 9;
-            if (s_diag && !s_gdiag && type == 21 && (s_gdiag = 1))
-                fprintf(stderr, "[cheat] player 0x%08X grenades %u %u %u %u\n", player, vm_read8(player + f),
-                        vm_read8(player + f + 1), vm_read8(player + f + 2), vm_read8(player + f + 3));
-            hold8(player, f);
-            continue;
-        }
+        if (type >= 21 && type <= 24) continue;   /* grenades: grenades_player */
         const uint32_t h = (uint32_t)gcall(c, func_000F35BC, player, type);
         if (!h) continue;
         const uint32_t w = (uint32_t)gcall(c, func_0018C464, h);
@@ -152,10 +185,14 @@ static void ammo_player(ppu_context* c, uint32_t player)
  * the iterator's entry, the same lookup func_0011C93C does before it returns
  * [moby+0x40]); it is only touched when [moby+0x40] is that player. This stops
  * instant-kill attacks (the Chameleon grab) that the health refill can't undo.
- * Only a bit we cleared is set again when God mode is turned off. */
+ * Only a bit we cleared is set again when God mode is turned off, and only on a
+ * moby that is still a local player's hero then. The table is a ring: when a long
+ * session has gone through more hero mobys than it holds, the oldest is forgotten
+ * (it belonged to a level that has been left). */
 struct Inv { uint32_t moby; int cleared; };
-static Inv s_inv[8];
-static int s_ninv = 0;
+static Inv s_inv[16];
+static int s_ninv = 0, s_inv_next = 0;
+static const int INV_N = (int)(sizeof s_inv / sizeof s_inv[0]);
 static void god_moby(uint32_t moby, uint32_t player, int on)
 {
     if (!moby || vm_read32(moby + 0x40) != player) {
@@ -170,13 +207,15 @@ static void god_moby(uint32_t moby, uint32_t player, int on)
     if (on) {
         if (!(cur & 0x8u)) return;
         if (k == s_ninv) {
-            if (s_ninv >= 8) return;
-            s_inv[s_ninv++] = { moby, 0 };
+            if (s_ninv < INV_N) k = s_ninv++;
+            else { k = s_inv_next; s_inv_next = (s_inv_next + 1) % INV_N; }
+            s_inv[k] = { moby, 0 };
             fprintf(stderr, "[cheat] god mode: hero moby 0x%08X (player 0x%08X) flags %08X -> %08X\n", moby, player, cur, cur & ~0x8u);
         }
         s_inv[k].cleared = 1;
         vm_write32(a, cur & ~0x8u);
     } else if (k < s_ninv && s_inv[k].cleared) {
+        s_inv[k].cleared = 0;
         vm_write32(a, cur | 0x8u);
         fprintf(stderr, "[cheat] god mode off: hero moby 0x%08X flags %08X -> %08X\n", moby, cur, cur | 0x8u);
     }
@@ -187,26 +226,27 @@ extern "C" void r2_cheats_frame(ppu_context* ctx)
     static int init = 0;
     if (!init) {
         init = 1;
-        if (cheats_allowed()) {
-            const char* e = getenv("R2_CHEAT_GOD");  if (e && *e && *e != '0') g_r2_cheat_god = 1;
-            e = getenv("R2_CHEAT_AMMO");             if (e && *e && *e != '0') g_r2_cheat_ammo = 1;
-            if (g_r2_cheat_god || g_r2_cheat_ammo) {
-                fprintf(stderr, "[cheat] at start: god %d, ammo %d\n", g_r2_cheat_god, g_r2_cheat_ammo);
-                block_trophies();
-            }
-        } else if (getenv("R2_CHEAT_GOD") || getenv("R2_CHEAT_AMMO"))
-            fprintf(stderr, "[cheat] benchmark run: cheats are off\n");
+        r2_cheats_init_env();
+        if (!cheats_blocked()) {
+            if (env_on("PORT_CHEAT_GODMODE")) r2_cheat_set(0, 1);
+            if (env_on("PORT_CHEAT_AMMO")) r2_cheat_set(1, 1);
+            if (env_on("PORT_CHEAT_GRENADES")) r2_cheat_set(2, 1);
+            if (g_r2_cheat_god || g_r2_cheat_ammo || g_r2_cheat_gren)
+                fprintf(stderr, "[cheat] at start: god %d, ammo %d, grenades %d\n", g_r2_cheat_god, g_r2_cheat_ammo, g_r2_cheat_gren);
+        }
     }
-    if (!cheats_allowed()) return;
-    static int ammo_was = 0, god_was = 0;
-    const int god = g_r2_cheat_god, ammo = g_r2_cheat_ammo;
-    if (god || ammo) block_trophies();
-    if (ammo && !ammo_was) { s_nhwm = 0; s_ndiag = 0; s_gdiag = 0; s_diag = 1; }   /* fresh start every time it is turned on */
-    ammo_was = ammo;
-    const int god_off = god_was && !god;   /* turned off this frame: give back the invulnerability bits */
-    if (!god && !ammo && !god_off) return;
-    if (g_trampoline_fn) return;         /* never expected at function entry; don't disturb it */
+    if (cheats_blocked()) return;
+    static int hold_was = 0, god_was = 0, restore = 0;
+    const int god = g_r2_cheat_god, ammo = g_r2_cheat_ammo, gren = g_r2_cheat_gren;
+    if (god || ammo || gren) block_trophies();
+    const int hold = ammo || gren;
+    if (hold && !hold_was) { s_nhwm = 0; s_ndiag = 0; s_gdiag = 0; s_diag = 1; }   /* fresh start every time it is turned on */
+    hold_was = hold;
+    if (god_was && !god) restore = 1;    /* turned off: give back the invulnerability bits (once a player exists) */
+    if (god) restore = 0;
     god_was = god;
+    if (!god && !hold && !restore) return;
+    if (g_trampoline_fn) return;         /* never expected at function entry; don't disturb it */
 
     static ppu_context save;             /* main thread only */
     save = *ctx;
@@ -222,15 +262,16 @@ extern "C" void r2_cheats_frame(ppu_context* ctx)
         const uint32_t player = (uint32_t)gcall(c, func_0011C93C, iter);
         if (player) {
             np++;
-            if (god || god_off) {
+            if (god || restore) {
                 const uint32_t ent = vm_read32(iter);
                 if (ent) god_moby((uint32_t)gcall(c, func_0071DC64, ent), player, god);
             }
             if (ammo) ammo_player(c, player);
+            if (gren) grenades_player(player);
         }
         gcall(c, func_0071DD34, iter);                    /* next */
     }
-    if (god_off) s_ninv = 0;
+    if (restore && np) { restore = 0; s_ninv = 0; s_inv_next = 0; }
     static int np_was = -1;
     if (np != np_was) { fprintf(stderr, "[cheat] %d local player(s)\n", np); np_was = np; }
 
