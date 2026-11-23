@@ -742,7 +742,7 @@ static u32 kbm_unswap(u32 hsb)
  * Keys are translated through it; when it can't be read the v152 table above is used.
  * PORT_KBM_LAYOUT=old: the v152 table only; =off: no translation. */
 volatile u32 g_port_layout_ea = 0, g_port_layout_info = 0;
-static u16 kbm_translate(u16 btns, int l2_role)
+static u16 kbm_translate(u16 btns, int l2)
 {
     extern uint8_t* vm_base;
     static int mode = -1;
@@ -768,7 +768,7 @@ static u16 kbm_translate(u16 btns, int l2_role)
               if (!moved) snprintf(b + n, sizeof b - n, " as shipped");
               printf("%s\n", b);
           } }
-        if (ok) return kbm_layout_translate(btns, cur, l2_role);
+        if (ok) return kbm_layout_translate(btns, cur, l2);
     }
     return (u16)kbm_unswap(btns);
 }
@@ -844,7 +844,7 @@ static void pad_poll_keyboard(void)
 
     u16 btns = 0; int lx = 0, ly = 0, krx = 0, kry = 0, interact = 0;
     u16 wup_btn = 0;   /* v190e: buttons the wheel-up notch pressed this poll */
-    int l2_roles = 0;  /* 1 << KBM_ROLE_*: the L2 keys held (crouch / sprint rows) */
+    int l2_held = 0;   /* KBM_L2_*: the L2 keys held (Crouch / Sprint rows; a key with no row = crouch) */
     for (int i = 0; i < s_kbm_n; i++) {
         int vk = s_kbm[i].vk, down;
         if (vk == KBM_WHEEL_UP) down = wheel_up_frames > 0;
@@ -854,7 +854,8 @@ static void pad_poll_keyboard(void)
         if (!down) continue;
         switch (s_kbm[i].act) {
         case KA_BTN: btns |= s_kbm[i].btn; if (vk == KBM_WHEEL_UP) wup_btn |= s_kbm[i].btn;
-                     if (s_kbm[i].btn == CELL_PAD_CTRL_L2) l2_roles |= 1 << s_kbm[i].role; break;
+                     if (s_kbm[i].btn == CELL_PAD_CTRL_L2)
+                         l2_held |= s_kbm[i].role == KBM_ROLE_SPRINT ? KBM_L2_SPRINT : KBM_L2_CROUCH; break;
         case KA_LS_UP: ly -= 1; break;    case KA_LS_DOWN: ly += 1; break;
         case KA_LS_LEFT: lx -= 1; break;  case KA_LS_RIGHT: lx += 1; break;
         case KA_RS_UP: kry -= 1; break;   case KA_RS_DOWN: kry += 1; break;
@@ -1013,13 +1014,12 @@ static void pad_poll_keyboard(void)
       if (fe3 && (GetAsyncKeyState(VK_SPACE) & 0x8000)) btns |= CELL_PAD_CTRL_START; }
     btns = pad_aim_toggle(0, btns, menu_raw);
     btns = pad_hold_toggle(0, btns, menu_raw, lx || ly);
-    /* which action L2 means (crouch and sprint are both L2 in the default layout, not with
-     * "separate crouch"); a latched L2 (PAD_CROUCH_MODE / PAD_SPRINT_MODE) keeps the last one */
-    { static int s_l2_role = KBM_ROLE_CROUCH;
-      if (l2_roles & (1 << KBM_ROLE_CROUCH)) s_l2_role = KBM_ROLE_CROUCH;
-      else if (l2_roles & (1 << KBM_ROLE_SPRINT)) s_l2_role = KBM_ROLE_SPRINT;
-      else if (l2_roles & (1 << KBM_ROLE_NONE)) s_l2_role = KBM_ROLE_NONE;
-      if (!menu_raw) btns = kbm_translate(btns, s_l2_role); }   /* v152: undo the in-game button swaps for the keyboard */
+    /* which actions L2 means (crouch and sprint are both L2 in the default layout, not with
+     * "separate crouch"): each held key its own; an L2 only a latch holds (PAD_CROUCH_MODE /
+     * PAD_SPRINT_MODE, no key down) keeps the last keys' meaning */
+    { static int s_l2_last = KBM_L2_CROUCH;
+      if (l2_held) s_l2_last = l2_held;
+      if (!menu_raw) btns = kbm_translate(btns, l2_held ? l2_held : s_l2_last); }   /* v152: undo the in-game button swaps for the keyboard */
     hs->buttons   = btns;
     g_port_use_kbm = interact;
     hs->connected = 1;

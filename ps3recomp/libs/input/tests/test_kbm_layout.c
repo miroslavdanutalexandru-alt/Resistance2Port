@@ -26,34 +26,43 @@ int main(void)
     /* shipped layout: nothing moves */
     preset(cur, 0, 0);
     assert(kbm_layout_valid(cur));
-    assert(kbm_layout_translate(0xFFFF, cur, KBM_ROLE_NONE) == 0xFFFF);
+    assert(kbm_layout_translate(0xFFFF, cur, 0) == 0xFFFF);
 
     /* preset 1: aim key (L1) -> R2, alternate fire key (R2) -> L1 (issue #19) */
     preset(cur, 1, 0);
-    assert(kbm_layout_translate(CELL_PAD_CTRL_L1, cur, KBM_ROLE_NONE) == CELL_PAD_CTRL_R2);
-    assert(kbm_layout_translate(CELL_PAD_CTRL_R2, cur, KBM_ROLE_NONE) == CELL_PAD_CTRL_L1);
-    assert(kbm_layout_translate(CELL_PAD_CTRL_R1 | CELL_PAD_CTRL_CROSS, cur, KBM_ROLE_NONE)
+    assert(kbm_layout_translate(CELL_PAD_CTRL_L1, cur, 0) == CELL_PAD_CTRL_R2);
+    assert(kbm_layout_translate(CELL_PAD_CTRL_R2, cur, 0) == CELL_PAD_CTRL_L1);
+    assert(kbm_layout_translate(CELL_PAD_CTRL_R1 | CELL_PAD_CTRL_CROSS, cur, 0)
            == (CELL_PAD_CTRL_R1 | CELL_PAD_CTRL_CROSS));
 
     /* separate crouch: the crouch key presses L3, the sprint key stays on L2 */
     preset(cur, 1, 1);
-    assert(kbm_layout_translate(CELL_PAD_CTRL_L2, cur, KBM_ROLE_CROUCH) == CELL_PAD_CTRL_L3);
-    assert(kbm_layout_translate(CELL_PAD_CTRL_L2, cur, KBM_ROLE_SPRINT) == CELL_PAD_CTRL_L2);
-    assert(kbm_layout_translate(CELL_PAD_CTRL_L2, cur, KBM_ROLE_NONE) == CELL_PAD_CTRL_L3);
-    assert(kbm_layout_translate(CELL_PAD_CTRL_R3, cur, KBM_ROLE_NONE) == CELL_PAD_CTRL_R3);      /* melee */
-    assert(kbm_layout_translate(CELL_PAD_CTRL_START, cur, KBM_ROLE_NONE) == CELL_PAD_CTRL_START);
+    assert(kbm_layout_translate(CELL_PAD_CTRL_L2, cur, KBM_L2_CROUCH) == CELL_PAD_CTRL_L3);
+    assert(kbm_layout_translate(CELL_PAD_CTRL_L2, cur, KBM_L2_SPRINT) == CELL_PAD_CTRL_L2);
+    assert(kbm_layout_translate(CELL_PAD_CTRL_L2, cur, 0) == CELL_PAD_CTRL_L3);
+    /* sprinting (Shift) and tapping crouch (C) together: both buttons, neither drops the other */
+    assert(kbm_layout_translate(CELL_PAD_CTRL_L2, cur, KBM_L2_CROUCH | KBM_L2_SPRINT)
+           == (CELL_PAD_CTRL_L3 | CELL_PAD_CTRL_L2));
+    assert(kbm_layout_translate(CELL_PAD_CTRL_L2 | CELL_PAD_CTRL_R1, cur, KBM_L2_CROUCH | KBM_L2_SPRINT)
+           == (CELL_PAD_CTRL_L3 | CELL_PAD_CTRL_L2 | CELL_PAD_CTRL_R1));
+    assert(kbm_layout_translate(CELL_PAD_CTRL_R3, cur, 0) == CELL_PAD_CTRL_R3);      /* melee */
+    assert(kbm_layout_translate(CELL_PAD_CTRL_START, cur, 0) == CELL_PAD_CTRL_START);
 
     /* preset 2: fire R2, alternate L2, aim R1, crouch / sprint L1 */
     preset(cur, 2, 0);
-    assert(kbm_layout_translate(CELL_PAD_CTRL_R1, cur, KBM_ROLE_NONE) == CELL_PAD_CTRL_R2);
-    assert(kbm_layout_translate(CELL_PAD_CTRL_R2, cur, KBM_ROLE_NONE) == CELL_PAD_CTRL_L2);
-    assert(kbm_layout_translate(CELL_PAD_CTRL_L1, cur, KBM_ROLE_NONE) == CELL_PAD_CTRL_R1);
-    assert(kbm_layout_translate(CELL_PAD_CTRL_L2, cur, KBM_ROLE_SPRINT) == CELL_PAD_CTRL_L1);
+    assert(kbm_layout_translate(CELL_PAD_CTRL_R1, cur, 0) == CELL_PAD_CTRL_R2);
+    assert(kbm_layout_translate(CELL_PAD_CTRL_R2, cur, 0) == CELL_PAD_CTRL_L2);
+    assert(kbm_layout_translate(CELL_PAD_CTRL_L1, cur, 0) == CELL_PAD_CTRL_R1);
+    assert(kbm_layout_translate(CELL_PAD_CTRL_L2, cur, KBM_L2_SPRINT) == CELL_PAD_CTRL_L1);
+    assert(kbm_layout_translate(CELL_PAD_CTRL_L2, cur, KBM_L2_CROUCH | KBM_L2_SPRINT) == CELL_PAD_CTRL_L1);
+    preset(cur, 0, 0);
+    assert(kbm_layout_translate(CELL_PAD_CTRL_L2, cur, KBM_L2_CROUCH | KBM_L2_SPRINT) == CELL_PAD_CTRL_L2);
+    preset(cur, 2, 0);
 
     /* preset 3: grenade (Circle) -> L2, crouch -> L3 */
     preset(cur, 3, 0);
-    assert(kbm_layout_translate(CELL_PAD_CTRL_CIRCLE, cur, KBM_ROLE_NONE) == CELL_PAD_CTRL_L2);
-    assert(kbm_layout_translate(CELL_PAD_CTRL_L2, cur, KBM_ROLE_CROUCH) == CELL_PAD_CTRL_L3);
+    assert(kbm_layout_translate(CELL_PAD_CTRL_CIRCLE, cur, 0) == CELL_PAD_CTRL_L2);
+    assert(kbm_layout_translate(CELL_PAD_CTRL_L2, cur, KBM_L2_CROUCH) == CELL_PAD_CTRL_L3);
 
     /* garbage is refused (the caller falls back) */
     preset(cur, 0, 0); cur[4] = 0x1001;

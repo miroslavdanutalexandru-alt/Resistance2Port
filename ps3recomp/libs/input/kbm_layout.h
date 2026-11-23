@@ -23,7 +23,7 @@
 #define KBM_SLOT_CROUCH    6    /* +0x18: crouch (L2, or L3 with "separate crouch") */
 #define KBM_SLOT_SPRINT    16   /* +0x40: sprint (L2) */
 
-enum { KBM_ROLE_NONE = 0, KBM_ROLE_CROUCH = 1, KBM_ROLE_SPRINT = 2 };
+enum { KBM_ROLE_NONE = 0, KBM_ROLE_CROUCH = 1, KBM_ROLE_SPRINT = 2 };   /* an L2 key's row (controls.txt comment) */
 
 /* the shipped layout, func_002AC9EC: jump, fire, alternate fire, aim, up, down,
  * crouch, separate crouch, melee, map, reload, interact, grenade type,
@@ -57,26 +57,38 @@ static inline int kbm_layout_valid(const uint32_t cur[KBM_LAYOUT_SLOTS])
     return cur[0] && cur[1] && cur[2] && cur[3];
 }
 
+/* l2 mask for kbm_layout_translate: which actions the held L2 means */
+#define KBM_L2_CROUCH  1
+#define KBM_L2_SPRINT  2
+
+static inline uint16_t kbm_slot_sdk(const uint32_t cur[KBM_LAYOUT_SLOTS], int slot)
+{
+    const uint16_t s = cur[slot] ? kbm_game_to_sdk_bit((uint16_t)cur[slot]) : 0;
+    return s ? s : kbm_game_to_sdk_bit(kbm_def_layout[slot]);
+}
+
 /* Keyboard buttons (CELL_PAD_CTRL_*) meant with the default layout -> the buttons
- * that do the same actions with layout `cur`. `l2_role` says which action an L2
- * key means (crouch and sprint share L2 by default, not with separate crouch).
- * A button used by several actions (d-pad, Triangle) follows the first of them
- * the layout moved. */
-static inline uint16_t kbm_layout_translate(uint16_t btns, const uint32_t cur[KBM_LAYOUT_SLOTS], int l2_role)
+ * that do the same actions with layout `cur`. An L2 in `btns` is crouch and / or
+ * sprint as `l2` (KBM_L2_*) says: they share L2 by default, not with separate
+ * crouch, so a held sprint key and a crouch key each press their own button
+ * (0 = crouch). A button used by several actions (d-pad, Triangle) follows the
+ * first of them the layout moved. */
+static inline uint16_t kbm_layout_translate(uint16_t btns, const uint32_t cur[KBM_LAYOUT_SLOTS], int l2)
 {
     uint16_t out = 0;
     for (int b = 0; b < 16; b++) {
         const uint16_t sdk = (uint16_t)(1u << b);
         if (!(btns & sdk)) continue;
         const uint16_t g = kbm_sdk_game[b];
-        uint16_t to = g;
-        if (g == 0x0010 && l2_role != KBM_ROLE_NONE) {
-            const uint32_t w = cur[l2_role == KBM_ROLE_SPRINT ? KBM_SLOT_SPRINT : KBM_SLOT_CROUCH];
-            if (w) to = (uint16_t)w;
-        } else {
-            for (int i = 0; i < KBM_LAYOUT_SLOTS; i++)
-                if (kbm_def_layout[i] == g && cur[i] && cur[i] != g) { to = (uint16_t)cur[i]; break; }
+        if (g == 0x0010) {
+            if (!(l2 & (KBM_L2_CROUCH | KBM_L2_SPRINT))) l2 = KBM_L2_CROUCH;
+            if (l2 & KBM_L2_CROUCH) out |= kbm_slot_sdk(cur, KBM_SLOT_CROUCH);
+            if (l2 & KBM_L2_SPRINT) out |= kbm_slot_sdk(cur, KBM_SLOT_SPRINT);
+            continue;
         }
+        uint16_t to = g;
+        for (int i = 0; i < KBM_LAYOUT_SLOTS; i++)
+            if (kbm_def_layout[i] == g && cur[i] && cur[i] != g) { to = (uint16_t)cur[i]; break; }
         const uint16_t s = kbm_game_to_sdk_bit(to);
         out |= s ? s : sdk;
     }
