@@ -112,6 +112,7 @@ const RowDef k_controls2[] = {
     { "GYRO VERTICAL", SRC_PCX, "gyroinvy", { {"NORMAL", ""}, {"INVERTED", "1"} } },
     { "LIGHT BAR", SRC_PCX, "lightbar", { {"PLAYER COLOUR", ""}, {"OFF", "0"} } },
     { "NINTENDO LAYOUT", SRC_PCX, "nswap", { {"BY POSITION", ""}, {"NINTENDO", "1"} } },
+    { "AIM ASSIST", SRC_PCX, "aimassist", { {"AUTO", ""}, {"ON", "on"}, {"OFF", "off"} } },
 };
 const RowDef k_audio[] = {
     { "MASTER VOLUME", SRC_PCX, "volume", { {"100%", ""}, {"90%", "90"}, {"80%", "80"}, {"70%", "70"}, {"60%", "60"}, {"50%", "50"},

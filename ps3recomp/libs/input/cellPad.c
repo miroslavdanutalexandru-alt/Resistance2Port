@@ -164,6 +164,14 @@ static u32 pad_host_port(u32 guest)
     pad_coop_init();
     return (s_coop_p2kb && guest < 2) ? (guest ^ 1u) : guest;
 }
+/* The guest port keyboard & mouse drive (internal port 0): 1 with PAD_P2_KEYBOARD,
+ * else 0. *only_kbm = 1 when no controller shares that port (PAD_P2_KEYBOARD). */
+int cellpad_kbm_guest_port(int* only_kbm)
+{
+    pad_coop_init();
+    if (only_kbm) *only_kbm = s_coop_p2kb;
+    return s_coop_p2kb ? 1 : 0;
+}
 /* Is guest port `guest` connected? Port 0 (and the keyboard's port) always is. */
 static int pad_port_on(u32 guest)
 {

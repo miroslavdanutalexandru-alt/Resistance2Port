@@ -18,6 +18,7 @@ This is a **beta**. The campaign has been played through the opening Iceland lev
 - **A real second co-op controller is ignored?** Unplug it and plug it back in (`PAD_DEDUP=0` turns the duplicate check off).
 
 ### New
+- **Aim assist option.** Launcher > Controls > Aiming and sticks > **Aim assist**, or in game with F9 or *PC SETTINGS* > *PC CONTROLS & HUD*, where a change takes effect at once and is saved for the launcher too: *Auto* (the default) turns the game's aim assist off while you play with keyboard & mouse and keeps it with a controller; *On* keeps it always, as on PS3; *Off* turns it off for everyone. Aim assist is the slowdown when your aim passes over an enemy and the pull toward it. In split-screen, *Auto* only turns it off for the keyboard & mouse player. Enemies aim as before. `PORT_AIM_ASSIST=on` / `off` (unset = Auto). *Not yet tested in play; please report how it feels.*
 - **Cheats (single player, off by default)**, contributed by @Jishnuraj07 (PR #14): **Ctrl+F1** toggles *God mode*, **Ctrl+F2** toggles *Infinite ammo* (`R2_CHEAT_GOD=1` / `R2_CHEAT_AMMO=1` turn them on at start). Once a cheat has been on, trophies are not unlocked until you restart the game. The keys do nothing in photo mode, in the port's menus or while F1 / F2 is bound in `controls.txt`, and cheats stay off in benchmark runs. Co-op is untested.
 
 ### Fixes

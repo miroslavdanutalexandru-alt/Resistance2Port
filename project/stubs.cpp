@@ -1416,8 +1416,109 @@ extern "C" volatile double g_ml_sens_y;   /* cellPad.c: PAD_MOUSE_SENS_Y */
 extern "C" int cellpad_gyro_active(void);
 extern "C" int cellpad_gyro_take(double* yaw_deg, double* pitch_deg);
 static int s_r2ml_gyro = 0;   /* this frame's call takes the gyro, not the mouse */
+/* Aim assist on/off. Byte +0x2E4 of a controller's options block ([ctrl+0x1AC0],
+ * the profile options: +0x3 / +0x7 are Invert up/down / left/right, +0x8 the
+ * sensitivity; func_002AB73C sets the defaults with +0x2E4 = 1; no game menu
+ * shows it) switches the game's aim assist for that controller's hero:
+ *   func_00107B04 (hero look code) at 0x1083F8 only takes the assist path when
+ *     it is set: the view slows down over a target (f23 / f21) and is pulled
+ *     toward it (f28 / f25), applied to the look rates at 0x108CC4; unset, the
+ *     factors are 1 and the pulls 0 (loc_00108C90);
+ *   the same function at 0x107F50: the stick hold used with it;
+ *   func_001270C8: auto-target with the sights (hero+0x231) near a target.
+ * Enemies never read it (it is the human players' controller block).
+ * PORT_AIM_ASSIST: unset / auto = off for the keyboard & mouse player
+ * (the controller on the keyboard's pad port: 0, or 1 with PAD_P2_KEYBOARD),
+ * on for a controller; on / 1 = on (as on PS3);
+ * off / 0 = off for every player. The PC menu's "Aim assist" row changes it
+ * live (r2_aim_assist_set, r2_pcextra.cpp). The original value is put back as
+ * soon as assist should be on again. */
+static volatile int s_aa_mode = -2;   /* -2 not read yet, -1 auto, 0 off, 1 on */
+extern "C" volatile int g_port_input_kbm;   /* cellPad.c: port 0 is driven by keyboard & mouse */
+extern "C" int cellpad_kbm_guest_port(int* only_kbm);   /* cellPad.c */
+static int aim_assist_parse(const char* e)
+{
+    if (!e || !*e || !_stricmp(e, "auto")) return -1;
+    if (!_stricmp(e, "on")) return 1;
+    if (!_stricmp(e, "off")) return 0;
+    return atoi(e) != 0 ? 1 : 0;
+}
+static void aim_assist_log(int m)
+{
+    fprintf(stderr, "[aimassist] aim assist: %s%c", m < 0 ? "auto (off with keyboard & mouse, on with a controller)"
+                                                : m ? "on (as on PS3)" : "off", 10);
+}
+/* start-up value, once; PORT_AIM_ASSIST is rewritten to the normalised value ("on" / "off",
+   removed for auto) so the PC menu row, which reads it, shows the mode in use ("1" / "0") */
+extern "C" void r2_aim_assist_init(void)
+{
+    static volatile LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
+    const int m = aim_assist_parse(getenv("PORT_AIM_ASSIST"));
+    _putenv_s("PORT_AIM_ASSIST", m < 0 ? "" : m ? "on" : "off");
+    if (s_aa_mode == -2) { aim_assist_log(m); s_aa_mode = m; }
+}
+/* live change (PC menu row): "" = auto, "on", "off" */
+extern "C" void r2_aim_assist_set(const char* v)
+{
+    r2_aim_assist_init();
+    const int m = aim_assist_parse(v);
+    if (m != s_aa_mode) aim_assist_log(m);
+    s_aa_mode = m;
+}
+/* slot: the hero's pad slot (R_24 at 0x108280) = ctrl + [ctrl+0x1AA4] * 0x60 in the
+   controller array (stride 0x1AC4, 8 entries); index 0 is pad port 0 */
+static void aim_assist_apply(uint32_t hero, uint32_t slot)
+{
+    if (s_aa_mode == -2) r2_aim_assist_init();
+    const int mode = s_aa_mode;
+    if (!hero || hero >= 0xF0000000u) return;
+    const uint32_t t = vm_read32(0x00DED008u - 0x7E98u); if (!t) return;
+    const uint32_t p = vm_read32(t - 0x8000u);            if (!p) return;
+    const uint32_t base = vm_read32(p);                   if (!base) return;
+    if (slot < base || slot >= base + 8u * 0x1AC4u) return;   /* no controller (dummy slot) */
+    const uint32_t idx = (slot - base) / 0x1AC4u, ctrl = base + idx * 0x1AC4u;
+    if (ctrl + vm_read32(ctrl + 0x1AA4) * 0x60u != slot) return;
+    const uint32_t opts = vm_read32(ctrl + 0x1AC0);
+    if (!opts || opts >= 0xF0000000u) return;
+    int off = mode != 1;
+    if (mode < 0) {
+        /* the keyboard's guest port: 0, or 1 with PAD_P2_KEYBOARD (then only keyboard &
+           mouse drive it, so that player always loses assist and player 1's controller keeps it) */
+        int only_kbm = 0;
+        const int kport = cellpad_kbm_guest_port(&only_kbm);
+        const int kbm = only_kbm || g_port_input_kbm != 0 || GetTickCount64() - g_ml_kbm_ms < 500;
+        off = kbm && idx == (uint32_t)kport;
+    }
+    static struct { uint32_t ea; uint8_t v; } saved[8];
+    int i = 0;
+    while (i < 8 && saved[i].ea != opts) i++;
+    const uint8_t cur = vm_read8(opts + 0x2E4);
+    if (off) {
+        if (i == 8) {
+            for (i = 0; i < 8 && saved[i].ea; i++) {}
+            if (i == 8) i = 0;
+            saved[i].ea = opts; saved[i].v = cur;
+            static int n = 0;
+            if (n++ < 40) fprintf(stderr, "[aimassist] off for controller %u (hero 0x%08X, options 0x%08X, was %u)%c", idx, hero, opts, cur, 10);
+        }
+        if (cur) vm_write8(opts + 0x2E4, 0);
+    } else if (i < 8) {
+        vm_write8(opts + 0x2E4, saved[i].v);
+        static int n = 0;
+        if (n++ < 40) fprintf(stderr, "[aimassist] back on for controller %u (hero 0x%08X)%c", idx, hero, 10);
+        saved[i].ea = 0;
+    } else if (!cur) {
+        /* only the defaults set it (1) and no game menu clears it: a 0 here is one an earlier
+           session forced off and the profile kept */
+        vm_write8(opts + 0x2E4, 1);
+        static int n = 0;
+        if (n++ < 8) fprintf(stderr, "[aimassist] was off in the profile, on again for controller %u%c", idx, 10);
+    }
+}
 extern "C" void r2_mouselook_pre(ppu_context* ctx, uint32_t hero, uint32_t slot, uint32_t sp)
 {
+    aim_assist_apply(hero, slot);
     s_r2ml_hero = 0;
     if (!g_ml_mode || !hero || !r2ml_is_pad0(slot)) return;
     g_r2_look_ms = GetTickCount64();
