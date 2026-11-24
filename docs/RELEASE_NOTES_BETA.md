@@ -1,4 +1,4 @@
-﻿# Resistance 2 PC port: community beta release notes
+# Resistance 2 PC port: community beta release notes
 
 **Version:** 0.3.0-beta.1 (GitHub pre-release). **Release date:** 2026-11-21.
 
