@@ -73,22 +73,44 @@ def pic_switch_targets(code):
     never registers them; at run time the miss went to the unlifted-job
     interpreter, which then ran the REST of the job interpreted (Bryce Canyon
     swarm, wwspic_DFF680/E00F00: img 217 ~66 ms per run, ~2000x slower).
-    Accepted only when the clgti bound gives the table length and every entry
+    Accepted only when the bi target is that `a` of a base and the rotqby'd
+    lqx word, the clgti bound gives the table length and every entry
     lands on code inside the module. R2_PIC_SWITCH=0 turns it off."""
     out = set()
     n = len(code)
     word = lambda a: struct.unpack_from('>I', code, a)[0]
     for a in range(0x30, n - 8, 4):
         if word(a) & 0xFFE00000 != 0x35000000: continue           # bi
-        cnt = None; lq = False
-        for b in range(a - 4, max(0x2C, a - 0x44), -4):
+        lo = max(0x2C, a - 0x44)
+        def writer(r, before):
+            # nearest earlier instruction whose rt field is r, other than
+            # stores and conditional branches (rt is a source there)
+            for b in range(before - 4, lo, -4):
+                w = word(b)
+                if w & 0x7F != r: continue
+                if w >> 24 == 0x24 or w >> 21 == 0x144 or w >> 23 in (0x41, 0x47, 0x40, 0x42, 0x44, 0x46): continue
+                return b, w
+            return None, None
+        # The bi target must be `a rT, rE, rBase` with rE = rotqby of an lqx
+        # table word. A bi straight on the loaded word is an absolute-address
+        # table (function pointers, not table-relative offsets): skip it.
+        ab, aw = writer((word(a) >> 7) & 0x7F, a)
+        if aw is None or aw >> 21 != 0x0C0: continue                # a
+        rot = None
+        for r in ((aw >> 7) & 0x7F, (aw >> 14) & 0x7F):
+            rb, rw = writer(r, ab)
+            if rw is not None and rw >> 21 == 0x1DC: rot = (rb, rw)  # rotqby
+        if not rot: continue
+        lb, lw = writer((rot[1] >> 7) & 0x7F, rot[0])
+        if lw is None or lw >> 21 != 0x1C4: continue                # lqx
+        cnt = None
+        for b in range(a - 4, lo, -4):
             w = word(b)
-            if w >> 21 == 0x1C4: lq = True                          # lqx
             if w >> 24 == 0x5C:                                     # clgti
                 i10 = (w >> 14) & 0x3FF
                 cnt = i10 + 1 if i10 < 0x200 else None
                 break
-        if not cnt or not lq or cnt > 256 or a + 4 + cnt * 4 > n: continue
+        if not cnt or cnt > 256 or a + 4 + cnt * 4 > n: continue
         tbl = a + 4
         ts = [tbl + struct.unpack_from('>i', code, tbl + 4 * i)[0] for i in range(cnt)]
         if all(0x30 <= t < n and not t & 3 for t in ts):
