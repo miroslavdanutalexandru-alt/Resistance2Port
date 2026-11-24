@@ -764,6 +764,7 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
     static cause_tally ctally[16];
     static int nctally = 0;
     static unsigned ctally_frames = 0;
+    static unsigned cause_lines = 0;     /* [spike] cause: lines this 5 s window (cap 10; the 5 s tally counts all) */
     static double prev_ft = 0.0;
     if (!init) {
         init = 1;
@@ -1011,28 +1012,29 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
                                   " ads %ld present %ld hard-sync %ld other %ld | depth scale copies: direct %ld carrier %ld\n",
                         cnt[PH_SW_BINDDMA], cnt[PH_SW_AV], cnt[PH_SW_ZHINT], cnt[PH_SW_ZHARD], cnt[PH_SW_BLIT], cnt[PH_SW_LABEL],
                         cnt[PH_SW_ADS], cnt[PH_SW_PRESENT], cnt[PH_SW_HARD], cnt[PH_SW_OTHER], cnt[PH_DSDIRECT], cnt[PH_DSCARRIER]);
-                if (cause_now && ncp > 0) {
-                    char cs[512]; size_t co = 0;
-                    for (int i = 0; i < ncp && i < 3 && co < sizeof cs - 96; i++) {
-                        if (i && cp[i].v < 0.05) break;
-                        const char* sep = i == 0 ? "" : i == 1 ? " | then " : ", ";
-                        if (cp[i].lr) co += snprintf(cs + co, sizeof cs - co, "%s%s@0x%08X %.1f", sep, cp[i].n, cp[i].lr, cp[i].v);
-                        else co += snprintf(cs + co, sizeof cs - co, "%s%s %.1f", sep, cp[i].n, cp[i].v);
-                        if (i == 0) co += snprintf(cs + co, sizeof cs - co, " (%.0f%%)", ft > 0.0 ? cp[0].v * 100.0 / ft : 0.0);
-                    }
-                    char jm[64] = "none";
-                    if (jmax_img >= 0) {
-                        const char* tg = port_hitch_job_tag((int)jmax_img);
-                        snprintf(jm, sizeof jm, "img %ld%s%s %.1f ms", jmax_img, *tg ? ":" : "", tg, jmax_ms);
-                    }
-                    char gb[24] = "n/a";
-                    if (cnt[PH_GPU]) snprintf(gb, sizeof gb, "%.1f", ms[PH_GPU]);
-                    port_log_async(1, "[spike] cause: %s | spu: frame-loop waits %.1f, lane-sum %.1f/%ld (parallel, not frame time),"
-                                      " longest job %s | rsx: frame-loop waits %.1f, rsx-iv %.1f fifo-idle %.1f gpu-busy %s\n",
-                            cs, cls_spu_wait, spu_ms, spu_runs, jm, cls_rsx_wait, mxms[PH_RSX], ms[PH_FIFOIDLE], gb);
-                }
             }
         } else dropped++;
+    }
+    /* own gate and cap, independent of the [hitch] threshold, its line cap and PORT_SPIKE_LOG */
+    if (cause_now && ncp > 0 && cause_lines++ < 10) {
+        char cs[512]; size_t co = 0;
+        for (int i = 0; i < ncp && i < 3 && co < sizeof cs - 96; i++) {
+            if (i && cp[i].v < 0.05) break;
+            const char* sep = i == 0 ? "" : i == 1 ? " | then " : ", ";
+            if (cp[i].lr) co += snprintf(cs + co, sizeof cs - co, "%s%s@0x%08X %.1f", sep, cp[i].n, cp[i].lr, cp[i].v);
+            else co += snprintf(cs + co, sizeof cs - co, "%s%s %.1f", sep, cp[i].n, cp[i].v);
+            if (i == 0) co += snprintf(cs + co, sizeof cs - co, " (%.0f%%)", ft > 0.0 ? cp[0].v * 100.0 / ft : 0.0);
+        }
+        char jm[64] = "none";
+        if (jmax_img >= 0) {
+            const char* tg = port_hitch_job_tag((int)jmax_img);
+            snprintf(jm, sizeof jm, "img %ld%s%s %.1f ms", jmax_img, *tg ? ":" : "", tg, jmax_ms);
+        }
+        char gb[24] = "n/a";
+        if (cnt[PH_GPU]) snprintf(gb, sizeof gb, "%.1f", ms[PH_GPU]);
+        port_log_async(1, "[spike] cause: %s | spu: frame-loop waits %.1f, lane-sum %.1f/%ld (parallel, not frame time),"
+                          " longest job %s | rsx: frame-loop waits %.1f, rsx-iv %.1f fifo-idle %.1f gpu-busy %s\n",
+                cs, cls_spu_wait, spu_ms, spu_runs, jm, cls_rsx_wait, mxms[PH_RSX], ms[PH_FIFOIDLE], gb);
     }
     prev_ft = ft;
     if ((double)(now - sum_t0) >= k * 5e9 && !win.empty()) {
@@ -1095,7 +1097,7 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
             port_log_async(1, "[spike] causes 5 s: %u frames >= %.0f ms, largest frame-loop part: %s (PORT_SPIKE_CAUSE=0 off)\n",
                     ctally_frames, cause_ms, ts);
         }
-        nctally = 0; ctally_frames = 0;
+        nctally = 0; ctally_frames = 0; cause_lines = 0;
         sm_game = sm_gw = sm_cpu = sm_fifo = sm_label = sm_zcull = sm_hard = sm_rlim = sm_sub = sm_lim = 0.0;
         sm_mrsx = sm_ring = sm_av = 0.0;
         for (int i = 0; i < RC_COUNT; i++) rc_win[i] = 0;
