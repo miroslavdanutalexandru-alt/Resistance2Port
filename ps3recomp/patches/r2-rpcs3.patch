@@ -10203,7 +10203,7 @@ index 2c736de..21d3612 100644
  	return true;
  }
 diff --git a/rpcs3/Emu/RSX/VK/VKFragmentProgram.cpp b/rpcs3/Emu/RSX/VK/VKFragmentProgram.cpp
-index 439cd37..323befd 100644
+index 439cd37..55957d2 100644
 --- a/rpcs3/Emu/RSX/VK/VKFragmentProgram.cpp
 +++ b/rpcs3/Emu/RSX/VK/VKFragmentProgram.cpp
 @@ -5,6 +5,10 @@
@@ -10288,6 +10288,23 @@ index 439cd37..323befd 100644
  	OS << "\n" << "	fs_main();\n\n";
  
  	if (m_prog.ctrl & RSX_SHADER_CONTROL_DISABLE_EARLY_Z)
+@@ -633,7 +685,15 @@ void VKFragmentProgram::Decompile(const RSXFragmentProgram& prog)
+ 		decompiler.device_props.has_native_half_support = pdev->get_shader_types_support().allow_float16;
+ 	}
+ 
+-	decompiler.device_props.emulate_depth_compare = !pdev->get_formats_support().d24_unorm_s8;
++	// R2PORT #16: RSX_D32_EMULATE_CMP=0 keeps the native shadow compare on D32S8-for-D24S8 hosts (AMD, R2_HIGHP_Z=1)
++	static const bool r2_d32_emulate_cmp = []
++	{
++		const char* e = std::getenv("RSX_D32_EMULATE_CMP");
++		const bool on = !(e && *e == '0');
++		if (!on) std::printf("[r2rsx] RSX_D32_EMULATE_CMP=0: native shadow compare on D32S8 depth\n");
++		return on;
++	}();
++	decompiler.device_props.emulate_depth_compare = r2_d32_emulate_cmp && !pdev->get_formats_support().d24_unorm_s8;
+ 	decompiler.device_props.emulated_depth_storage = vk::emulate_extended_depth_range();
+ 	decompiler.device_props.has_low_precision_rounding = vk::is_NVIDIA(vk::get_driver_vendor());
+ 	decompiler.Task();
 diff --git a/rpcs3/Emu/RSX/VK/VKGSRender.cpp b/rpcs3/Emu/RSX/VK/VKGSRender.cpp
 index b101a27..a712709 100644
 --- a/rpcs3/Emu/RSX/VK/VKGSRender.cpp
