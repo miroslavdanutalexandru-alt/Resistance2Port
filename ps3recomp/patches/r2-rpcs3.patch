@@ -17355,10 +17355,10 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..17c72df
+index 0000000..33ffe06
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
-@@ -0,0 +1,3233 @@
+@@ -0,0 +1,3246 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation, two backends:
 +//  * NVIDIA DLSS Frame Generation through Streamline (manual hooking): sl.interposer.dll is loaded at run time
@@ -18551,14 +18551,15 @@ index 0000000..17c72df
 +	// draw, FlipIn = the same buffer at flip (scene + HUD), B0 = the swapchain image before the port overlays,
 +	// B1 = after them. a: game rectangle on the swapchain (x, y, w, h); b: uv scale of the used buffer region
 +	// (x, y), swapchain size (z, w); c: HUD threshold, overlay threshold, HUD pixel limit, flags
-+	// (1 = split the HUD this frame, 2 = HDR10 output, 4 = debug view).
++	// (1 = split the HUD this frame, 2 = HDR10 output, 4 = debug view, 8 / 16 = HUD hold record / use);
++	// hd.x: HUD hold time stamp (1/8 s units, >= 1), hd.y: its maximum age in those units.
 +	const char* r2fg_hud_common =
 +		"layout(set=0, binding=0) uniform sampler2D HudIn;\n"
 +		"layout(set=0, binding=1) uniform sampler2D FlipIn;\n"
 +		"layout(set=0, binding=2) uniform sampler2D B0;\n"
 +		"layout(set=0, binding=3) uniform sampler2D B1;\n"
 +		"layout(set=0, binding=4, r32ui) uniform uimage2D Count;\n"
-+		"layout(push_constant) uniform PC { vec4 a; vec4 b; vec4 c; };\n"
++		"layout(push_constant) uniform PC { vec4 a; vec4 b; vec4 c; vec4 hd; };\n"
 +		"float maxdiff(vec3 x, vec3 y) { vec3 d = abs(x - y); return max(d.x, max(d.y, d.z)); }\n"
 +		"bool game_uv(ivec2 p, out vec2 uv)\n"
 +		"{\n"
@@ -18585,7 +18586,7 @@ index 0000000..17c72df
 +			m_src = std::string("#version 450\nlayout(local_size_x = 8, local_size_y = 8) in;\n") + r2fg_hud_common + body;
 +			ssbo_count = 0;
 +			use_push_constants = true;
-+			push_constants_size = 48;
++			push_constants_size = 64;
 +			create();
 +		}
 +
@@ -18671,11 +18672,13 @@ index 0000000..17c72df
 +				"	}\n"
 +				"	vec4 b0 = texelFetch(B0, p, 0);\n"
 +				"	vec4 b1 = texelFetch(B1, p, 0);\n"
-+				// R2_DLSS_FG_HUD_HOLD: a split frame records its HUD area (flags 8); a frame without one (the classifier
-+				// was unsure, or the coverage limit tripped) keeps that area as UI (flags 16), see r2fg_hold_mv_pass
++				// R2_DLSS_FG_HUD_HOLD: a split frame the coverage limit accepted records its HUD area with the time stamp hd.x
++				// (flags 8); a frame without one (the classifier was unsure, or the coverage limit tripped) keeps an area
++				// recorded at most hd.y ago as UI (flags 16), see r2fg_hold_mv_pass. Only accepted splits refresh the stamp.
 +				"	bool held = false;\n"
-+				"	if (split && (flags & 8u) != 0u) imageStore(Hold, p, uvec4(hud ? 1u : 0u));\n"
-+				"	else if (!split && (flags & 16u) != 0u && imageLoad(Hold, p).r != 0u) held = true;\n"
++				"	uint now = uint(hd.x + 0.5);\n"
++				"	if (split && (flags & 8u) != 0u) imageStore(Hold, p, uvec4(hud ? now : 0u));\n"
++				"	else if (!split && (flags & 16u) != 0u) { uint h = imageLoad(Hold, p).r; held = h != 0u && now - h <= uint(hd.y + 0.5); }\n"
 +				"	vec3 hl = b0.rgb;\n"
 +				"	vec2 uv;\n"
 +				// SDR: take the HUD's own contribution back out of the presented scene. HDR10 (PQ) is not additive:
@@ -18716,7 +18719,8 @@ index 0000000..17c72df
 +
 +	// R2_DLSS_FG_HUD_HOLD, on a frame without a HUD split: zero frame generation's motion vectors under the held HUD
 +	// area so the HUD still baked into the HUD-less colour is not dragged along with the scene behind it.
-+	// a: game rectangle on the swapchain; b: motion-vector size (w, h), HUD pixel limit, flags (1 = split attempted).
++	// a: game rectangle on the swapchain; b: motion-vector size (w, h), HUD pixel limit, flags (1 = split attempted);
++	// c: the HUD hold time stamp and maximum age (as hd in r2fg_compose_pass).
 +	struct r2fg_hold_mv_pass : compute_task
 +	{
 +		const vk::image_view* count = nullptr;
@@ -18731,7 +18735,7 @@ index 0000000..17c72df
 +				"layout(set=0, binding=0, r32ui) uniform uimage2D Count;\n"
 +				"layout(set=0, binding=1, r32ui) uniform uimage2D Hold;\n"
 +				"layout(set=0, binding=2, rg16f) uniform writeonly image2D MvOut;\n"
-+				"layout(push_constant) uniform PC { vec4 a; vec4 b; };\n"
++				"layout(push_constant) uniform PC { vec4 a; vec4 b; vec4 c; };\n"
 +				"void main()\n"
 +				"{\n"
 +				"	ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
@@ -18739,11 +18743,12 @@ index 0000000..17c72df
 +				"	if ((uint(b.w + 0.5) & 1u) != 0u && float(imageLoad(Count, ivec2(0, 0)).r) < b.z) return;\n"
 +				"	ivec2 hs = imageSize(Hold);\n"
 +				"	ivec2 s = clamp(ivec2(a.xy + (vec2(p) + 0.5) / b.xy * a.zw), ivec2(0), hs - 1);\n"
-+				"	if (imageLoad(Hold, s).r != 0u) imageStore(MvOut, p, vec4(0.0));\n"
++				"	uint h = imageLoad(Hold, s).r;\n"
++				"	if (h != 0u && uint(c.x + 0.5) - h <= uint(c.y + 0.5)) imageStore(MvOut, p, vec4(0.0));\n"
 +				"}\n";
 +			ssbo_count = 0;
 +			use_push_constants = true;
-+			push_constants_size = 32;
++			push_constants_size = 48;
 +			create();
 +		}
 +
@@ -18832,7 +18837,7 @@ index 0000000..17c72df
 +
 +		// R2_DLSS_FG_HUD_HOLD: HUD area of the last split frame (swapchain-sized r32ui), when that split was
 +		image_ptr hold;
-+		unsigned long long hold_ms = 0;
++		unsigned long long hold_ms = 0, hold_base = 0;
 +
 +		// R2_DLSS_FG_STATS: per-present counters and the GPU readback ring (8 slots of 16 words, see r2fg_stats_pass)
 +		std::unique_ptr<vk::buffer> st_buf;
@@ -19348,23 +19353,29 @@ index 0000000..17c72df
 +			else s.shape++;
 +		}
 +
-+		// R2_DLSS_FG_HUD_HOLD: the HUD area of the last split frame (2 s at most) stays UI on frames without one
++		// R2_DLSS_FG_HUD_HOLD: the HUD area of the last split frame the GPU accepted (under 2 s old) stays UI on frames
++		// without one. The age is checked on the GPU against the stamp each accepted split writes (r2fg_compose_pass);
++		// hold_ms (the last CPU-side split attempt) only skips the hold passes once no split was even tried for 2 s.
 +		const unsigned long long t_now = now_ms();
 +		const bool hold_on = fgcfg().hud_hold && fgcfg().hud;
 +		{
 +			vk::viewable_image* old = f.hold.get();
 +			fg_ensure(f.hold, VK_FORMAT_R32_UINT, hold_on ? W : 1, hold_on ? H : 1, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-+			if (f.hold.get() != old)
++			// stamps stay exact in a float push constant: restart (clear) long before 2^24
++			if (f.hold.get() != old || (t_now - f.hold_base) / 125 > (1u << 22))
 +			{
 +				f.hold->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 +				const VkClearColorValue z{};
 +				vkCmdClearColorImage(cmd, f.hold->value, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &k_color_range);
 +				f.hold_ms = 0;
++				f.hold_base = t_now;
 +			}
 +			f.hold->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
 +		}
 +		const bool hold_use = hold_on && f.hold_ms && t_now - f.hold_ms < 2000;
 +		if (hold_on && split) f.hold_ms = t_now;
++		const float hold_stamp = static_cast<float>((t_now - f.hold_base) / 125 + 1);
++		constexpr float hold_max_age = 15.f; // 1/8 s units: elapsed < 2 s since the last accepted split
 +
 +		f.count->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 +		const VkClearColorValue zero{};
@@ -19373,13 +19384,14 @@ index 0000000..17c72df
 +		src->push_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 +
 +		const float rect_w = static_cast<float>(x2 - x1), rect_h = static_cast<float>(y2 - y1);
-+		const float k[12] = {
++		const float k[16] = {
 +			static_cast<float>(x1), static_cast<float>(y1), rect_w, rect_h,
 +			static_cast<float>(std::min(buffer_w, src->width())) / static_cast<float>(src->width()),
 +			static_cast<float>(std::min(buffer_h, src->height())) / static_cast<float>(src->height()),
 +			static_cast<float>(W), static_cast<float>(H),
 +			0.5f / 255.f, 0.25f / 1023.f, 0.3f * rect_w * rect_h,
-+			static_cast<float>((split ? 1 : 0) | (hdr10 ? 2 : 0) | (f.debug_view ? 4 : 0) | (hold_on ? 8 : 0) | (hold_use ? 16 : 0)) };
++			static_cast<float>((split ? 1 : 0) | (hdr10 ? 2 : 0) | (f.debug_view ? 4 : 0) | (hold_on ? 8 : 0) | (hold_use ? 16 : 0)),
++			hold_stamp, hold_max_age, 0.f, 0.f };
 +		const auto bind = [&](vk::r2fg_hud_pass_base* pass)
 +		{
 +			pass->in[0] = split ? fg_view(f.hud.get()) : fg_view(f.b0.get());
@@ -19417,7 +19429,8 @@ index 0000000..17c72df
 +			pass->count = fg_view(f.count.get());
 +			pass->hold = fg_view(f.hold.get());
 +			pass->out_mv = fg_view(f.mv.get());
-+			const float km[8] = { k[0], k[1], k[2], k[3], static_cast<float>(f.rw), static_cast<float>(f.rh), k[10], split ? 1.f : 0.f };
++			const float km[12] = { k[0], k[1], k[2], k[3], static_cast<float>(f.rw), static_cast<float>(f.rh), k[10], split ? 1.f : 0.f,
++				hold_stamp, hold_max_age, 0.f, 0.f };
 +			pass->run(cmd, km, f.rw, f.rh);
 +			f.mv->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 +			if (fgcfg().stats) g_fgst.held++;
