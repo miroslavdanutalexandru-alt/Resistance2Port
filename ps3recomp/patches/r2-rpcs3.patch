@@ -17355,10 +17355,10 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..39300d6
+index 0000000..17c72df
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
-@@ -0,0 +1,2865 @@
+@@ -0,0 +1,3233 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation, two backends:
 +//  * NVIDIA DLSS Frame Generation through Streamline (manual hooking): sl.interposer.dll is loaded at run time
@@ -17485,6 +17485,9 @@ index 0000000..39300d6
 +		int limit_fps = 0; // R2_DLSS_FG_LIMIT_FPS: cap on presented fps with DLSS-G on (0 = refresh-based cap); evens out an uneven base rate
 +		unsigned gap = 2; // R2_DLSS_FG_GAP: scene-less frames mid-play that resume without the warm-up (pfg_streak_gap; 0 = old)
 +		int pace = PFG_PACE_VRR; // FSR 3 present pacer (PORT_FG_PACE)
++		int stats = 0;    // R2_DLSS_FG_STATS (or R2_FG_DEBUG): 10 s [fg-stats] line (inputs pairing, HUD split, motion vectors)
++		int fx_mv = 0;    // R2_DLSS_FG_FX_MV: motion of effect-covered pixels: 0 as rendered, 1 camera only, 2 zero
++		bool hud_hold = true; // R2_DLSS_FG_HUD_HOLD: frames without a HUD split keep the last split's HUD area as UI
 +	};
 +
 +	const fg_config& fgcfg()
@@ -17521,6 +17524,10 @@ index 0000000..39300d6
 +		if (r.limit_fps) std::fprintf(stderr, "[fg-vk] DLSS_FG_LIMIT_FPS=%d (presented frames)\n", r.limit_fps);
 +			if (const char* e = penv("DLSS_FG_DEPTH_SEP")) { const float v = static_cast<float>(std::atof(e)); if (v > 0.f && v < 10000.f) r.depth_sep = v; }
 +			if (r.cam_ident || r.depth_sep != 40.f) std::fprintf(stderr, "[fg-vk] DLSS_FG_CAM_IDENT=%d DLSS_FG_DEPTH_SEP=%.1f\n", r.cam_ident ? 1 : 0, r.depth_sep);
++			r.stats = std::max(penv_int("DLSS_FG_STATS", 0), penv_int("FG_DEBUG", 0));
++			r.fx_mv = std::clamp(penv_int("DLSS_FG_FX_MV", 0), 0, 2);
++			r.hud_hold = penv_int("DLSS_FG_HUD_HOLD", 1) != 0;
++			if (r.want) std::fprintf(stderr, "[fg-vk] DLSS_FG_STATS=%d DLSS_FG_FX_MV=%d DLSS_FG_HUD_HOLD=%d\n", r.stats, r.fx_mv, r.hud_hold ? 1 : 0);
 +			return r;
 +		}();
 +		return c;
@@ -18342,7 +18349,8 @@ index 0000000..39300d6
 +
 +	// RSX_MV_DUMP A/B variants: r2fg_copy_pass with changes to the motion vectors frame generation gets.
 +	// flags 1 (b): 3x3 nearest-depth dilation; 2 (g): cleared (sky) depth reprojected as a direction (zinf, no
-+	// translation); 4 (d): zero motion where blended non-depth-writing effects (smoke, particles) drew.
++	// translation); 4 (d, R2_DLSS_FG_FX_MV=2): zero motion where blended non-depth-writing effects (smoke, particles)
++	// drew; 8 (R2_DLSS_FG_FX_MV=1): camera-only motion there (the surface behind reprojected with T, no object motion).
 +	struct r2fg_mvd_pass : compute_task
 +	{
 +		const vk::image_view* in_depth = nullptr;
@@ -18389,6 +18397,12 @@ index 0000000..39300d6
 +				"		if (abs(q.w) > 1e-7) { vec2 m = (q.xy / q.w - ndc) * 0.5; if (!any(isnan(m)) && all(lessThan(abs(m), vec2(2.0)))) mv = m; }\n"
 +				"	}\n"
 +				"	if ((fl & 4) != 0 && texelFetch(FxIn, p, 0).r > 0.0) mv = vec2(0.0);\n"
++				"	if ((fl & 8) != 0 && texelFetch(FxIn, p, 0).r > 0.0 && !(inv ? d <= 1e-7 : d >= 0.9999999))\n"
++				"	{\n"
++				"		vec2 ndc = (vec2(p) + 0.5) / c.zw * 2.0 - 1.0 - c.xy;\n"
++				"		vec4 q = T * vec4(ndc, d * b.x + b.y, 1.0);\n"
++				"		if (abs(q.w) > 1e-7) { vec2 m = (q.xy / q.w - ndc) * 0.5; if (!any(isnan(m)) && !any(isinf(m)) && all(lessThan(abs(m), vec2(2.0)))) mv = m; }\n"
++				"	}\n"
 +				"	imageStore(DepthOut, p, vec4(d, 0.0, 0.0, 0.0));\n"
 +				"	imageStore(MvOut, p, vec4(mv, 0.0, 0.0));\n"
 +				"}\n";
@@ -18436,6 +18450,100 @@ index 0000000..39300d6
 +			std::memcpy(k + 16, tail, sizeof(tail));
 +			vkCmdPushConstants(cmd, m_program->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, push_constants_size, k);
 +			compute_task::run(cmd, (w + 7) / 8, (h + 7) / 8, 1);
++		}
++	};
++
++	// R2_DLSS_FG_STATS: motion-vector statistics of frame generation's inputs as tagged, on a 160 x 90 sample grid,
++	// into slot b.z (16 words) of a host-visible ring: 1 samples, 2 moving > 0.5 px, 3 object motion (differs from
++	// the camera reprojection of its depth by > 1 px), 4 effect-covered, 5 effect-covered with object motion, 6 max
++	// |mv| px * 16, 7 sum |mv| px * 4, 8 sky, 9 camera reprojection valid, 10 sum camera px * 4 (word 0: stamp).
++	struct r2fg_stats_pass : compute_task
++	{
++		const vk::image_view* in_depth = nullptr;
++		const vk::image_view* in_mv = nullptr;
++		const vk::image_view* in_fx = nullptr;
++		const vk::buffer* buf = nullptr;
++		std::unique_ptr<vk::sampler> m_sampler;
++
++		r2fg_stats_pass()
++		{
++			m_src =
++				"#version 450\n"
++				"layout(local_size_x = 8, local_size_y = 8) in;\n"
++				"layout(set=0, binding=0) uniform sampler2D DepthIn;\n"
++				"layout(set=0, binding=1) uniform sampler2D MvIn;\n"
++				"layout(set=0, binding=2) uniform sampler2D FxIn;\n"
++				"layout(std430, set=0, binding=3) buffer Stats { uint sv[]; };\n"
++				"layout(push_constant) uniform PC { mat4 T; vec4 a; vec4 b; vec4 c; };\n" // a: w, h, has fx, inverted; b: zA, zB, slot; c: jndc, view size
++				"void main()\n"
++				"{\n"
++				"	uvec2 g = gl_GlobalInvocationID.xy;\n"
++				"	if (g.x >= 160u || g.y >= 90u) return;\n"
++				"	uint s = uint(b.z + 0.5) * 16u;\n"
++				"	ivec2 sz = ivec2(a.xy);\n"
++				"	ivec2 p = min(ivec2((vec2(g) + 0.5) / vec2(160.0, 90.0) * vec2(sz)), sz - 1);\n"
++				"	float d = texelFetch(DepthIn, p, 0).r;\n"
++				"	vec2 mv = texelFetch(MvIn, p, 0).rg;\n"
++				"	float l = min(length(mv * c.zw), 4000.0);\n"
++				"	if (isnan(l)) l = 4000.0;\n"
++				"	atomicAdd(sv[s + 1u], 1u);\n"
++				"	if (l > 0.5) atomicAdd(sv[s + 2u], 1u);\n"
++				"	atomicMax(sv[s + 6u], uint(l * 16.0));\n"
++				"	atomicAdd(sv[s + 7u], uint(l * 4.0));\n"
++				"	bool fx = a.z > 0.5 && texelFetch(FxIn, p, 0).r > 0.0;\n"
++				"	if (fx) atomicAdd(sv[s + 4u], 1u);\n"
++				"	if (a.w > 0.5 ? d <= 1e-7 : d >= 0.9999999) { atomicAdd(sv[s + 8u], 1u); return; }\n"
++				"	vec2 ndc = (vec2(p) + 0.5) / c.zw * 2.0 - 1.0 - c.xy;\n"
++				"	vec4 q = T * vec4(ndc, d * b.x + b.y, 1.0);\n"
++				"	if (!(abs(q.w) > 1e-7)) return;\n"
++				"	vec2 cm = (q.xy / q.w - ndc) * 0.5;\n"
++				"	if (any(isnan(cm)) || any(isinf(cm))) return;\n"
++				"	atomicAdd(sv[s + 9u], 1u);\n"
++				"	atomicAdd(sv[s + 10u], uint(min(length(cm * c.zw), 4000.0) * 4.0));\n"
++				"	if (length((mv - cm) * c.zw) > 1.0) { atomicAdd(sv[s + 3u], 1u); if (fx) atomicAdd(sv[s + 5u], 1u); }\n"
++				"}\n";
++			ssbo_count = 0;
++			use_push_constants = true;
++			push_constants_size = 112;
++			create();
++		}
++
++		std::vector<glsl::program_input> get_inputs() override
++		{
++			auto r = compute_task::get_inputs();
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "DepthIn", vk::glsl::input_type_texture, 0, 0));
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "MvIn", vk::glsl::input_type_texture, 0, 1));
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "FxIn", vk::glsl::input_type_texture, 0, 2));
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "Stats", vk::glsl::input_type_storage_buffer, 0, 3));
++			return r;
++		}
++
++		void bind_resources(const vk::command_buffer&) override
++		{
++			if (!m_sampler)
++			{
++				m_sampler = std::make_unique<vk::sampler>(*vk::get_current_renderer(),
++					VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++					VK_FALSE, 0.f, 1.f, 0.f, 0.f, VK_FILTER_NEAREST, VK_FILTER_NEAREST, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE);
++			}
++			m_program->bind_uniform({ *in_depth, *m_sampler }, 0, 0);
++			m_program->bind_uniform({ *in_mv, *m_sampler }, 0, 1);
++			m_program->bind_uniform({ in_fx ? *in_fx : *in_depth, *m_sampler }, 0, 2);
++			m_program->bind_uniform({ *buf, 0, buf->size() }, 0, 3);
++		}
++
++		void run(const vk::command_buffer& cmd, u32 w, u32 h, bool inverted, const double* T, float zA, float zB, u32 slot,
++			float jndc_x, float jndc_y, float view_w, float view_h)
++		{
++			if (!m_program) load_program(cmd);
++			float k[28]{};
++			for (int c = 0; c < 4; ++c)
++				for (int r = 0; r < 4; ++r) k[c * 4 + r] = static_cast<float>(T[r * 4 + c]);
++			const float tail[12] = { static_cast<float>(w), static_cast<float>(h), in_fx ? 1.f : 0.f, inverted ? 1.f : 0.f,
++				zA, zB, static_cast<float>(slot), 0.f, jndc_x, jndc_y, view_w, view_h };
++			std::memcpy(k + 16, tail, sizeof(tail));
++			vkCmdPushConstants(cmd, m_program->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, push_constants_size, k);
++			compute_task::run(cmd, 20, 12, 1);
 +		}
 +	};
 +
@@ -18537,6 +18645,7 @@ index 0000000..39300d6
 +	{
 +		const vk::image_view* out_hudless = nullptr;
 +		const vk::image_view* out_ui = nullptr;
++		const vk::image_view* hold = nullptr;
 +
 +		r2fg_compose_pass()
 +		{
@@ -18544,6 +18653,7 @@ index 0000000..39300d6
 +			init(
 +				"layout(set=0, binding=5, " + fmt + ") uniform writeonly image2D HudlessOut;\n"
 +				"layout(set=0, binding=6, " + fmt + ") uniform writeonly image2D UiOut;\n"
++				"layout(set=0, binding=7, r32ui) uniform uimage2D Hold;\n"
 +				"void main()\n"
 +				"{\n"
 +				"	ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
@@ -18561,17 +18671,23 @@ index 0000000..39300d6
 +				"	}\n"
 +				"	vec4 b0 = texelFetch(B0, p, 0);\n"
 +				"	vec4 b1 = texelFetch(B1, p, 0);\n"
++				// R2_DLSS_FG_HUD_HOLD: a split frame records its HUD area (flags 8); a frame without one (the classifier
++				// was unsure, or the coverage limit tripped) keeps that area as UI (flags 16), see r2fg_hold_mv_pass
++				"	bool held = false;\n"
++				"	if (split && (flags & 8u) != 0u) imageStore(Hold, p, uvec4(hud ? 1u : 0u));\n"
++				"	else if (!split && (flags & 16u) != 0u && imageLoad(Hold, p).r != 0u) held = true;\n"
 +				"	vec3 hl = b0.rgb;\n"
 +				"	vec2 uv;\n"
 +				// SDR: take the HUD's own contribution back out of the presented scene. HDR10 (PQ) is not additive:
 +				// the scene under the HUD keeps the HUD there, the opaque UI layer covers it on every frame.
 +				"	if (hud_c && (flags & 2u) == 0u && game_uv(p, uv))\n"
 +				"		hl = clamp(b0.rgb + textureLod(HudIn, uv, 0.0).rgb - textureLod(FlipIn, uv, 0.0).rgb, 0.0, 1.0);\n"
-+				"	vec4 ui = (hud || ovl) ? vec4(b1.rgb, 1.0) : vec4(0.0);\n"
++				"	vec4 ui = (hud || ovl || held) ? vec4(b1.rgb, 1.0) : vec4(0.0);\n"
 +				"	if ((flags & 4u) != 0u)\n"
 +				"	{\n"
 +				"		vec3 d = b1.rgb;\n"
 +				"		if (hud) d = mix(d, vec3(1.0, 0.0, 1.0), 0.5);\n"
++				"		else if (held) d = mix(d, vec3(1.0, 1.0, 0.0), 0.5);\n"
 +				"		else if (ovl) d = mix(d, vec3(0.0, 1.0, 1.0), 0.5);\n"
 +				"		hl = d;\n"
 +				"	}\n"
@@ -18585,6 +18701,7 @@ index 0000000..39300d6
 +			auto r = r2fg_hud_pass_base::get_inputs();
 +			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "HudlessOut", vk::glsl::input_type_storage_texture, 0, 5));
 +			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "UiOut", vk::glsl::input_type_storage_texture, 0, 6));
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "Hold", vk::glsl::input_type_storage_texture, 0, 7));
 +			return r;
 +		}
 +
@@ -18593,6 +18710,64 @@ index 0000000..39300d6
 +			r2fg_hud_pass_base::bind_resources(cmd);
 +			m_program->bind_uniform({ *out_hudless }, 0, 5);
 +			m_program->bind_uniform({ *out_ui }, 0, 6);
++			m_program->bind_uniform({ *hold }, 0, 7);
++		}
++	};
++
++	// R2_DLSS_FG_HUD_HOLD, on a frame without a HUD split: zero frame generation's motion vectors under the held HUD
++	// area so the HUD still baked into the HUD-less colour is not dragged along with the scene behind it.
++	// a: game rectangle on the swapchain; b: motion-vector size (w, h), HUD pixel limit, flags (1 = split attempted).
++	struct r2fg_hold_mv_pass : compute_task
++	{
++		const vk::image_view* count = nullptr;
++		const vk::image_view* hold = nullptr;
++		const vk::image_view* out_mv = nullptr;
++
++		r2fg_hold_mv_pass()
++		{
++			m_src =
++				"#version 450\n"
++				"layout(local_size_x = 8, local_size_y = 8) in;\n"
++				"layout(set=0, binding=0, r32ui) uniform uimage2D Count;\n"
++				"layout(set=0, binding=1, r32ui) uniform uimage2D Hold;\n"
++				"layout(set=0, binding=2, rg16f) uniform writeonly image2D MvOut;\n"
++				"layout(push_constant) uniform PC { vec4 a; vec4 b; };\n"
++				"void main()\n"
++				"{\n"
++				"	ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
++				"	if (p.x >= int(b.x) || p.y >= int(b.y)) return;\n"
++				"	if ((uint(b.w + 0.5) & 1u) != 0u && float(imageLoad(Count, ivec2(0, 0)).r) < b.z) return;\n"
++				"	ivec2 hs = imageSize(Hold);\n"
++				"	ivec2 s = clamp(ivec2(a.xy + (vec2(p) + 0.5) / b.xy * a.zw), ivec2(0), hs - 1);\n"
++				"	if (imageLoad(Hold, s).r != 0u) imageStore(MvOut, p, vec4(0.0));\n"
++				"}\n";
++			ssbo_count = 0;
++			use_push_constants = true;
++			push_constants_size = 32;
++			create();
++		}
++
++		std::vector<glsl::program_input> get_inputs() override
++		{
++			auto r = compute_task::get_inputs();
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "Count", vk::glsl::input_type_storage_texture, 0, 0));
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "Hold", vk::glsl::input_type_storage_texture, 0, 1));
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "MvOut", vk::glsl::input_type_storage_texture, 0, 2));
++			return r;
++		}
++
++		void bind_resources(const vk::command_buffer&) override
++		{
++			m_program->bind_uniform({ *count }, 0, 0);
++			m_program->bind_uniform({ *hold }, 0, 1);
++			m_program->bind_uniform({ *out_mv }, 0, 2);
++		}
++
++		void run(const vk::command_buffer& cmd, const float* k, u32 w, u32 h)
++		{
++			if (!m_program) load_program(cmd);
++			vkCmdPushConstants(cmd, m_program->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, push_constants_size, k);
++			compute_task::run(cmd, (w + 7) / 8, (h + 7) / 8, 1);
 +		}
 +	};
 +}
@@ -18655,6 +18830,19 @@ index 0000000..39300d6
 +		u32 reflex_limit = ~0u;
 +		u32 hud_frames = 0, frames_on = 0;
 +
++		// R2_DLSS_FG_HUD_HOLD: HUD area of the last split frame (swapchain-sized r32ui), when that split was
++		image_ptr hold;
++		unsigned long long hold_ms = 0;
++
++		// R2_DLSS_FG_STATS: per-present counters and the GPU readback ring (8 slots of 16 words, see r2fg_stats_pass)
++		std::unique_ptr<vk::buffer> st_buf;
++		u32 st_seq = 0;                 // presents with a stats slot
++		u32 st_slot_seq[8] = {};        // seq written into each slot (0 = none)
++		bool st_slot_split[8] = {};     // the slot's frame attempted a HUD split ...
++		float st_slot_limit[8] = {};    // ... with this HUD pixel limit
++		bool st_tagged = false;         // this frame's scene has a stats slot
++		u32 st_tags = 0;                // scene tags since the last present
++
 +		// Reflex / PCL frame ids
 +		std::mutex mu;
 +		u32 sim_id = 0, present_id = 0, cur_rid = 0;
@@ -18697,7 +18885,10 @@ index 0000000..39300d6
 +	{
 +		auto& f = g_fg;
 +		f.depth.reset(); f.mv.reset(); f.hud.reset();
-+		f.b0.reset(); f.b1.reset(); f.hudless.reset(); f.ui.reset(); f.count.reset();
++		f.b0.reset(); f.b1.reset(); f.hudless.reset(); f.ui.reset(); f.count.reset(); f.hold.reset();
++		f.st_buf.reset();
++		std::memset(f.st_slot_seq, 0, sizeof(f.st_slot_seq));
++		f.st_tagged = false;
 +		f.scene = f.hud_started = f.have_b0 = f.ready = false;
 +	}
 +
@@ -18738,6 +18929,125 @@ index 0000000..39300d6
 +		if (why.empty()) fglog("frame generation %ux on", f.mult);
 +		else fglog("frame generation paused: %s", why.c_str());
 +	}
++
++	// R2_DLSS_FG_STATS: counters of the current 10 s window
++	struct fg_stats10
++	{
++		u32 presents = 0, on = 0, resets = 0;
++		u32 tags[3] = {};      // presents with 0 / 1 / 2+ scene tags since the previous present
++		u32 split = 0, unsure = 0, no_start = 0, rt_other = 0, no_draws = 0, shape = 0, hud_off = 0, held = 0;
++		u32 cov_frames = 0, cov_reject = 0; // split frames read back / of those over the HUD pixel limit
++		u64 gpu[11] = {};
++		u32 gpu_frames = 0, gpu_lost = 0, gpu_max = 0;
++		u32 fx_frames = 0;     // tags with effect coverage
++	};
++	fg_stats10 g_fgst;
++
++	// reads back a finished ring slot (stamp = its seq) into g_fgst and frees it
++	void fg_stats_harvest(u32 slot)
++	{
++		auto& f = g_fg;
++		const u32 seq = f.st_slot_seq[slot];
++		if (!seq || !f.st_buf) return;
++		f.st_slot_seq[slot] = 0;
++		const u32* d = static_cast<const u32*>(f.st_buf->map(slot * 64, 64));
++		if (!d) return;
++		u32 w[16];
++		std::memcpy(w, d, sizeof(w));
++		f.st_buf->unmap();
++		auto& s = g_fgst;
++		if (w[0] != seq) { s.gpu_lost++; return; }
++		s.gpu_frames++;
++		for (int i = 1; i <= 10; ++i) if (i != 6) s.gpu[i] += w[i];
++		s.gpu_max = std::max(s.gpu_max, w[6]);
++		if (f.st_slot_split[slot] && w[12] == seq)
++		{
++			s.cov_frames++;
++			if (static_cast<float>(w[11]) >= f.st_slot_limit[slot]) s.cov_reject++;
++		}
++	}
++
++	// scene tag: GPU motion-vector statistics of frame generation's inputs into the next ring slot
++	void fg_stats_tag(vk::command_buffer& cmd, vk::viewable_image* fx, bool inverted, const double* T, float zA, float zB,
++		float jndc_x, float jndc_y, float view_w, float view_h)
++	{
++		auto& f = g_fg;
++		if (!f.st_buf)
++		{
++			auto& dev = *vk::get_current_renderer();
++			f.st_buf = std::make_unique<vk::buffer>(dev, 8 * 64, dev.get_memory_mapping().host_visible_coherent,
++				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
++				VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, 0, VMM_ALLOCATION_POOL_UNDEFINED);
++		}
++		const u32 seq = ++f.st_seq ? f.st_seq : ++f.st_seq;
++		const u32 slot = seq % 8;
++		fg_stats_harvest(slot);
++		f.st_slot_seq[slot] = seq;
++		f.st_slot_split[slot] = false;
++		f.st_tagged = true;
++		if (fx) g_fgst.fx_frames++;
++		vkCmdFillBuffer(cmd, f.st_buf->value, slot * 64, 64, 0);
++		vk::insert_global_memory_barrier(cmd);
++		auto pass = vk::get_compute_task<vk::r2fg_stats_pass>();
++		pass->in_depth = fg_view(f.depth.get());
++		pass->in_mv = fg_view(f.mv.get());
++		pass->in_fx = fx ? fg_view(fx) : nullptr;
++		pass->buf = f.st_buf.get();
++		pass->run(cmd, f.rw, f.rh, inverted, T, zA, zB, slot, jndc_x, jndc_y, view_w, view_h);
++		vk::insert_global_memory_barrier(cmd);
++		vkCmdFillBuffer(cmd, f.st_buf->value, slot * 64, 4, seq);
++		vk::insert_global_memory_barrier(cmd);
++	}
++
++	// present phase 1: the HUD pixel count of this frame's split (r2fg_mask_pass) into the current slot
++	void fg_stats_count(vk::command_buffer& cmd, bool split, float limit)
++	{
++		auto& f = g_fg;
++		if (!split || !f.st_tagged || !f.st_buf || !f.count) return;
++		const u32 slot = f.st_seq % 8;
++		if (f.st_slot_seq[slot] != f.st_seq) return;
++		f.st_slot_split[slot] = true;
++		f.st_slot_limit[slot] = limit;
++		vk::insert_global_memory_barrier(cmd);
++		VkBufferImageCopy region{};
++		region.bufferOffset = slot * 64 + 44;
++		region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++		region.imageExtent = { 1, 1, 1 };
++		vkCmdCopyImageToBuffer(cmd, f.count->value, VK_IMAGE_LAYOUT_GENERAL, f.st_buf->value, 1, &region);
++		vk::insert_global_memory_barrier(cmd);
++		vkCmdFillBuffer(cmd, f.st_buf->value, slot * 64 + 48, 4, f.st_seq);
++		vk::insert_global_memory_barrier(cmd);
++	}
++
++	// every present while frame generation is usable; one [fg-stats] line per 10 s
++	void fg_stats_present(bool on, bool reset)
++	{
++		auto& f = g_fg;
++		auto& s = g_fgst;
++		static unsigned long long t0 = 0;
++		const unsigned long long t = now_ms();
++		if (!t0) t0 = t;
++		s.presents++;
++		if (on) s.on++;
++		if (on && reset) s.resets++;
++		s.tags[std::min<u32>(f.st_tags, 2)]++;
++		f.st_tags = 0;
++		f.st_tagged = false;
++		if (t - t0 < 10000) return;
++		t0 = t;
++		const double n = s.gpu[1] ? static_cast<double>(s.gpu[1]) : 1.0;
++		const double nc = s.gpu[9] ? static_cast<double>(s.gpu[9]) : 1.0;
++		fglog("[fg-stats] 10 s: presents %u, FG on %u, FG resets %u | scene tags per present 0:%u 1:%u 2+:%u | HUD split %u "
++			"(coverage-rejected %u of %u read), not split: unsure %u, no HUD start %u, other buffer %u, no draws %u, size/format %u, HUD split off %u; "
++			"HUD hold used %u",
++			s.presents, s.on, s.resets, s.tags[0], s.tags[1], s.tags[2], s.split, s.cov_reject, s.cov_frames,
++			s.unsure, s.no_start, s.rt_other, s.no_draws, s.shape, s.hud_off, s.held);
++		fglog("[fg-stats] motion vectors (%u frames, %u not read back, %u with effects): moving > 0.5 px %.1f%%, object motion %.1f%%, "
++			"effect-covered %.1f%% (with object motion %.1f%%), sky %.1f%% | mean |mv| %.2f px, camera-only %.2f px, max %.1f px (render pixels)",
++			s.gpu_frames, s.gpu_lost, s.fx_frames, 100.0 * s.gpu[2] / n, 100.0 * s.gpu[3] / nc, 100.0 * s.gpu[4] / n,
++			100.0 * s.gpu[5] / nc, 100.0 * s.gpu[8] / n, s.gpu[7] / 4.0 / n, s.gpu[10] / 4.0 / nc, s.gpu_max / 16.0);
++		s = fg_stats10{};
++	}
 +}
 +
 +namespace vk
@@ -18765,8 +19075,12 @@ index 0000000..39300d6
 +		f.depth->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
 +		f.mv->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
 +		float zinf = 0.f, jndc_x = 0.f, jndc_y = 0.f;
-+		vk::image* fx = var == 'd' ? r2mvd_fx_image() : nullptr;
-+		const u32 fl = (var == 'b' ? 1u : 0u) | (var == 'g' && r2mvd_sky(zinf, jndc_x, jndc_y) ? 2u : 0u) | (fx ? 4u : 0u);
++		vk::viewable_image* fx_now = (fgcfg().fx_mv || fgcfg().stats) ? r2fg_fx_image() : nullptr;
++		if (fx_now && (fx_now->width() < rw || fx_now->height() < rh)) fx_now = nullptr;
++		vk::image* fx = var == 'd' ? r2mvd_fx_image() : fgcfg().fx_mv ? fx_now : nullptr;
++		const u32 fx_fl = !fx ? 0u : (var == 'd' || fgcfg().fx_mv == 2) ? 4u : 8u;
++		const u32 fl = (var == 'b' ? 1u : 0u) | (var == 'g' && r2mvd_sky(zinf, jndc_x, jndc_y) ? 2u : 0u) | fx_fl;
++		if (fx_fl == 8u) r2fg_jitter_ndc(jndc_x, jndc_y);
 +		if (fl) [[unlikely]]
 +		{
 +			auto pass = vk::get_compute_task<vk::r2fg_mvd_pass>();
@@ -18791,6 +19105,14 @@ index 0000000..39300d6
 +		f.mv->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 +
 +		f.rw = rw; f.rh = rh;
++		f.st_tags++;
++		if (fgcfg().stats)
++		{
++			float sx = 0.f, sy = 0.f;
++			r2fg_jitter_ndc(sx, sy);
++			if (fx_now) fx_now->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++			fg_stats_tag(cmd, fx_now, inverted, T, zA, zB, sx, sy, mv_w, mv_h);
++		}
 +		f.jx = jx; f.jy = jy;
 +		f.mvsx = mv_w / static_cast<float>(rw);
 +		f.mvsy = mv_h / static_cast<float>(rh);
@@ -19003,7 +19325,7 @@ index 0000000..39300d6
 +		const VkImageUsageFlags out_usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 +		fg_ensure(f.hudless, out_fmt, W, H, out_usage);
 +		fg_ensure(f.ui, out_fmt, W, H, out_usage);
-+		fg_ensure(f.count, VK_FORMAT_R32_UINT, 1, 1, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
++		fg_ensure(f.count, VK_FORMAT_R32_UINT, 1, 1, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 +		f.out_fmt = out_fmt;
 +		if (hdr10 && f.sc_format != out_fmt)
 +		{
@@ -19014,6 +19336,35 @@ index 0000000..39300d6
 +
 +		const bool split = fgcfg().hud && f.hud && f.hud_rt == src && !f.unsure && f.hud_draws &&
 +			f.hud->info.format == src->info.format && f.hud->width() == src->width() && f.hud->height() == src->height();
++		if (fgcfg().stats)
++		{
++			auto& s = g_fgst;
++			if (!fgcfg().hud) s.hud_off++;
++			else if (split) s.split++;
++			else if (f.unsure) s.unsure++;
++			else if (!f.hud_started) s.no_start++;
++			else if (f.hud_rt != src) s.rt_other++;
++			else if (!f.hud_draws) s.no_draws++;
++			else s.shape++;
++		}
++
++		// R2_DLSS_FG_HUD_HOLD: the HUD area of the last split frame (2 s at most) stays UI on frames without one
++		const unsigned long long t_now = now_ms();
++		const bool hold_on = fgcfg().hud_hold && fgcfg().hud;
++		{
++			vk::viewable_image* old = f.hold.get();
++			fg_ensure(f.hold, VK_FORMAT_R32_UINT, hold_on ? W : 1, hold_on ? H : 1, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
++			if (f.hold.get() != old)
++			{
++				f.hold->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++				const VkClearColorValue z{};
++				vkCmdClearColorImage(cmd, f.hold->value, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &k_color_range);
++				f.hold_ms = 0;
++			}
++			f.hold->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
++		}
++		const bool hold_use = hold_on && f.hold_ms && t_now - f.hold_ms < 2000;
++		if (hold_on && split) f.hold_ms = t_now;
 +
 +		f.count->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 +		const VkClearColorValue zero{};
@@ -19028,7 +19379,7 @@ index 0000000..39300d6
 +			static_cast<float>(std::min(buffer_h, src->height())) / static_cast<float>(src->height()),
 +			static_cast<float>(W), static_cast<float>(H),
 +			0.5f / 255.f, 0.25f / 1023.f, 0.3f * rect_w * rect_h,
-+			static_cast<float>((split ? 1 : 0) | (hdr10 ? 2 : 0) | (f.debug_view ? 4 : 0)) };
++			static_cast<float>((split ? 1 : 0) | (hdr10 ? 2 : 0) | (f.debug_view ? 4 : 0) | (hold_on ? 8 : 0) | (hold_use ? 16 : 0)) };
 +		const auto bind = [&](vk::r2fg_hud_pass_base* pass)
 +		{
 +			pass->in[0] = split ? fg_view(f.hud.get()) : fg_view(f.b0.get());
@@ -19051,12 +19402,27 @@ index 0000000..39300d6
 +			bind(pass);
 +			pass->out_hudless = fg_view(f.hudless.get());
 +			pass->out_ui = fg_view(f.ui.get());
++			pass->hold = fg_view(f.hold.get());
 +			pass->run(cmd, k, W, H);
 +		};
 +		if (hdr10) compose(vk::get_compute_task<vk::r2fg_compose_pass<true>>());
 +		else compose(vk::get_compute_task<vk::r2fg_compose_pass<false>>());
 +		src->pop_layout(cmd);
 +		f.ui->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++		if (hold_use && f.mv && f.rw && f.rh)
++		{
++			vk::insert_global_memory_barrier(cmd);
++			f.mv->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
++			auto pass = vk::get_compute_task<vk::r2fg_hold_mv_pass>();
++			pass->count = fg_view(f.count.get());
++			pass->hold = fg_view(f.hold.get());
++			pass->out_mv = fg_view(f.mv.get());
++			const float km[8] = { k[0], k[1], k[2], k[3], static_cast<float>(f.rw), static_cast<float>(f.rh), k[10], split ? 1.f : 0.f };
++			pass->run(cmd, km, f.rw, f.rh);
++			f.mv->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++			if (fgcfg().stats) g_fgst.held++;
++		}
++		if (fgcfg().stats) fg_stats_count(cmd, split, k[10]);
 +
 +		if (f.debug_view)
 +		{
@@ -19556,6 +19922,7 @@ index 0000000..39300d6
 +				t0 = t; rendered = on_frames = 0; shown = 0;
 +			}
 +		}
++		if (fg_usable() && fgcfg().stats) fg_stats_present(on, mvd_reset);
 +
 +		// R2_DLSS_FG_VSYNC_RECHECK (default on): vsync support was read at device creation, before any swapchain or
 +		// options existed, and Streamline can report it unavailable that early; FIFO was then swapped for IMMEDIATE
@@ -19999,6 +20366,7 @@ index 0000000..39300d6
 +			if (fgcfg().debug && (f.frames_on % 600) == 1)
 +				fglog("frame generation (FSR 3): %u frames on, HUD split on %u", f.frames_on, f.hud_frames);
 +		}
++		if (fgcfg().stats) fg_stats_present(gen && x.on, x.frame_reset);
 +		g_r2fg_active = gen && x.on ? 2 : 0;
 +		x.prev_gen = gen;
 +		x.gen = x.on = x.frame_reset = false;
@@ -20226,10 +20594,10 @@ index 0000000..39300d6
 +#endif
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.h b/rpcs3/Emu/RSX/VK/VKR2FrameGen.h
 new file mode 100644
-index 0000000..7ec7e41
+index 0000000..4301910
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.h
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,90 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation: NVIDIA DLSS Frame Generation (2x, 3x/4x Multi Frame Generation) through Streamline
 +// (sl.interposer.dll and its plugins), or AMD FSR 3 frame interpolation (2x, amd_fidelityfx_vk.dll) for GPUs
@@ -20284,6 +20652,11 @@ index 0000000..7ec7e41
 +	const double* r2mvd_game_vp();
 +	bool r2mvd_sky(float& zinf, float& jndc_x, float& jndc_y);
 +	vk::viewable_image* r2mvd_fx_image();
++	// VKR2Upscaler.cpp (PORT_DLSS_BIAS_MASK, default on): R8 coverage of this frame's blended non-depth-writing effect
++	// draws (smoke, sparks, muzzle flash) drawn before the upscaler run, scene-depth sized; nullptr if none
++	vk::viewable_image* r2fg_fx_image();
++	// ... and the jitter of the last upscaler run in NDC (the convention of T's input)
++	void r2fg_jitter_ndc(float& x, float& y);
 +	void r2mvd_timing(const char* body);
 +	void r2mvd_fg_images(vk::command_buffer& cmd, vk::image* hudless, vk::image* ui, vk::image* depth, vk::image* mv);
 +
@@ -26056,10 +26429,10 @@ index 0000000..db54a19
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..0c4905e
+index 0000000..9719507
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12020 @@
+@@ -0,0 +1,12036 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -29239,6 +29612,8 @@ index 0000000..0c4905e
 +		std::unique_ptr<vk::viewable_image> fx_img;
 +		u32 fx_frame = ~0u;
 +		vk::render_target* fx_ds = nullptr;
++		bool fx_run_ok = false;        // r2aa_run: fx_img holds this frame's coverage on the scene depth (r2fg_fx_image)
++		float run_jndc[2] = {};        // r2aa_run: this run's jitter in NDC (r2fg_jitter_ndc)
 +		bool fx_cur = false;           // the draw being emitted is an effect draw into the scene
 +		bool fx_unj = false;           // RSX_FX_UNJITTER: ... and is drawn unjittered
 +		u64 fx_unj_draws = 0, fx_unj_frames = 0; u32 fx_unj_frame = ~0u;
@@ -35347,6 +35722,17 @@ index 0000000..0c4905e
 +		return mvd_on() && g_mvd.fx_ok && g_r2.fx_img ? g_r2.fx_img.get() : nullptr;
 +	}
 +
++	vk::viewable_image* r2fg_fx_image()
++	{
++		return g_r2.fx_run_ok && g_r2.fx_img ? g_r2.fx_img.get() : nullptr;
++	}
++
++	void r2fg_jitter_ndc(float& x, float& y)
++	{
++		x = g_r2.run_jndc[0];
++		y = g_r2.run_jndc[1];
++	}
++
 +	void r2mvd_timing(const char* body)
 +	{
 +		if (mvd_on()) mvd_tline(body, g_mvd.frame.load() ? g_mvd.frame.load() - 1 : 0);
@@ -36326,6 +36712,9 @@ index 0000000..0c4905e
 +		g_mvd.jndc[1] = jndc_y;
 +		g_mvd.fx_ok = st.fx_img && st.fx_frame == st.frame && st.fx_ds == ds;
 +	}
++	st.fx_run_ok = st.fx_img && st.fx_frame == st.frame && st.fx_ds == ds;
++	st.run_jndc[0] = jndc_x;
++	st.run_jndc[1] = jndc_y;
 +	const bool use_mask_old = r2cfg().mask && ((st.backend == 2 && g_dlss.set_mask) || (st.backend == 1 && r2cfg().fsr_reactive));
 +	// PORT_DLSS_BIAS_MASK: this frame's effect draws were redrawn into fx_img (same depth target); max'ed into the mask after prep
 +	const bool fx_used = r2cfg().fx_mask && st.backend == 2 && g_dlss.set_mask && st.fx_img && st.fx_frame == st.frame && st.fx_ds == ds && !reset;
