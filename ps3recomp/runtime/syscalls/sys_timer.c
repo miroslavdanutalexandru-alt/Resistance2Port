@@ -286,7 +286,7 @@ static int ps3_usleep_watch_wait(void* ctx, uint64_t usec, int* early)
     if (now.QuadPart >= s_wst_next) {
         QueryPerformanceFrequency(&f);
         const long long nx = now.QuadPart + 10 * f.QuadPart, prev = s_wst_next;
-        if (InterlockedCompareExchange64(&s_wst_next, nx, prev) == prev && prev) {
+        if (InterlockedCompareExchange64(&s_wst_next, nx, prev) == prev && prev && !g_port_hitch.off) {   /* PORT_HITCH_LOG=1 */
             fprintf(stderr, "[usleep-watch] 10 s: %lld waits, %lld woken by the writer, %lld timed out, %lld already done\n",
                     (long long)InterlockedExchange64(&s_wst_wait, 0), (long long)InterlockedExchange64(&s_wst_woken, 0),
                     (long long)InterlockedExchange64(&s_wst_tmo, 0), (long long)InterlockedExchange64(&s_wst_ready, 0));

@@ -8928,7 +8928,7 @@ index 7f134af..d571098 100644
  		std::string_view renderer_info() const { return m_renderer_info; }
  
 diff --git a/rpcs3/Emu/RSX/RSXZCULL.cpp b/rpcs3/Emu/RSX/RSXZCULL.cpp
-index 8f61814..68bdb39 100644
+index 8f61814..9d9f42b 100644
 --- a/rpcs3/Emu/RSX/RSXZCULL.cpp
 +++ b/rpcs3/Emu/RSX/RSXZCULL.cpp
 @@ -3,6 +3,29 @@
@@ -9394,7 +9394,7 @@ index 8f61814..68bdb39 100644
 +
 +		void ZCULL_control::r3_precise_report(u64 now)
 +		{
-+			if (!r3_precise_config().on) return;
++			static const bool r2_log = [] { const char* e = std::getenv("PORT_HITCH_LOG"); return e && *e && *e != '0'; }(); if (!r2_log || !r3_precise_config().on) return; // R2PORT: PORT_HITCH_LOG=1
 +			if (!m_pk_report_us) { m_pk_report_us = now; return; }
 +			if (now - m_pk_report_us < 5'000'000) return;
 +			u32 live = 0;
@@ -18014,7 +18014,7 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..face2e6
+index 0000000..cd31708
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 @@ -0,0 +1,3361 @@
@@ -20697,7 +20697,7 @@ index 0000000..face2e6
 +				shown += st_ok && st.numFramesActuallyPresented ? st.numFramesActuallyPresented : 1;
 +			}
 +			else shown++;
-+			if (t - t0 >= 10000)
++			if (fgcfg().stats && t - t0 >= 10000) // R2_DLSS_FG_STATS=1
 +			{
 +				const double s = (t - t0) / 1000.0;
 +				fglog("DLSS-G %ux: on %.0f%% of frames | rendered %.1f fps -> presented %.1f fps | Reflex limit %u us%s%s%s",
@@ -27216,10 +27216,10 @@ index 0000000..db54a19
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..4b1fcdf
+index 0000000..1d078e3
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12091 @@
+@@ -0,0 +1,12089 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -34060,7 +34060,6 @@ index 0000000..4b1fcdf
 +	void r2_present_source_diag(int kind, int why, u32 addr, u32 gw, u32 gh, u32 pw, u32 ph, u32 sw, u32 sh, u32 inset)
 +	{
 +		static const bool on = [] { const char* e = std::getenv("R2_PRESENT_DIAG"); return !(e && *e == '0'); }();
-+		if (!on) return;
 +		static const char* const kinds[3] = { "surface cache", "texture cache", "guest memory 1x" };
 +		static const char* const whys[4] = { "", "no surface or texture at the address", "surface at the address does not fit",
 +			"texture at the address is smaller than the buffer" };
@@ -34071,6 +34070,14 @@ index 0000000..4b1fcdf
 +		kind = std::clamp(kind, 0, 2);
 +		why = std::clamp(why, 0, 3);
 +		const u32 scale = static_cast<u32>(g_cfg.video.resolution_scale_percent);
++		// The one-time warning is logged whatever R2_PRESENT_DIAG says; only the source lines are diagnostics.
++		if (kind == 2 && !warned && scale > 100)
++		{
++			warned = true;
++			r2log("WARNING: the flip is presenting the %ux%u guest-memory copy although resolution scale is %u%% (%s) -- "
++				"the picture is at PS3 resolution", pw, ph, scale, whys[why]);
++		}
++		if (!on) return;
 +		if ((kind != last_kind || pw != last_w || ph != last_h) && changes < 16)
 +		{
 +			changes++;
@@ -34081,16 +34088,7 @@ index 0000000..4b1fcdf
 +		}
 +		last_kind = kind; last_w = pw; last_h = ph;
 +		flips++;
-+		if (kind == 2)
-+		{
-+			mem_flips++;
-+			if (!warned && scale > 100)
-+			{
-+				warned = true;
-+				r2log("WARNING: the flip is presenting the %ux%u guest-memory copy although resolution scale is %u%% (%s) -- "
-+					"the picture is at PS3 resolution", pw, ph, scale, whys[why]);
-+			}
-+		}
++		if (kind == 2) mem_flips++;
 +		const auto now = std::chrono::steady_clock::now();
 +		if (now - t0 >= std::chrono::seconds(10))
 +		{
@@ -39313,10 +39311,10 @@ index 0000000..4b1fcdf
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.h b/rpcs3/Emu/RSX/VK/VKR2Upscaler.h
 new file mode 100644
-index 0000000..86d44c7
+index 0000000..cfa2cec
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.h
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,75 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3).
 +// Temporal anti-aliasing of the 3D scene with AMD FSR 3.1 (FidelityFX API, amd_fidelityfx_vk.dll) or
 +// NVIDIA DLAA (r2_dlss.dll, NGX) or Intel XeSS (libxess.dll, VKR2XeSS.cpp). Enabled by RSX_FSR=1 (FSR 3.1) /
@@ -39379,8 +39377,9 @@ index 0000000..86d44c7
 +	// VKPresent.cpp: area-filtered shrink (exact 2:1 box steps) of the w x h region of 'src' while it is at least twice
 +	// the dw x dh output; returns the image to present and updates w, h (RSX_PRESENT_DOWNSCALE=0: returns src)
 +	vk::viewable_image* r2_present_downscale(const vk::command_buffer& cmd, vk::viewable_image* src, u32& w, u32& h, u32 dw, u32 dh);
-+	// R2PORT diagnostics (R2_PRESENT_DIAG=0 = off): where the flip's image came from (0 surface cache, 1 texture cache,
-+	// 2 guest-memory 1x copy) and why the scaled surface was not used (see scratch/res_cap_720.md)
++	// R2PORT diagnostics (R2_PRESENT_DIAG=1 = on; the game's main defaults it to 0): where the flip's image came from (0 surface cache, 1 texture cache,
++	// 2 guest-memory 1x copy) and why the scaled surface was not used (see scratch/res_cap_720.md). The one-time WARNING for a
++	// 1x copy presented at a resolution scale above 100% is always logged.
 +	void r2_present_source_diag(int kind, int why, u32 addr, u32 gw, u32 gh, u32 pw, u32 ph, u32 sw, u32 sh, u32 inset);
 +
 +	// instance.cpp: add the instance extensions NGX (RSX_FSR=2) or XeSS (RSX_FSR=4) needs

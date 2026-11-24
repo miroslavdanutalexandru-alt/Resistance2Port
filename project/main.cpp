@@ -947,10 +947,14 @@ int main(int argc, char** argv)
 
     /* R2 perf 1115: [spu-jobs] / [spike] SPU job timing. R2's WWS policy module calls a job at LS 0x35D4
      * (bisled $lr,$5 -> return pc 0x35D8); the runtime default 0x2AA0 is R3's. Image 419 (the R3 job the
-     * focus / lane boost default to) means nothing here. SPU_JOB_TIMING=0 turns the timing off. */
+     * focus / lane boost default to) means nothing here. SPU_JOB_TIMING=1 turns the timing on. */
     if (!getenv("SPU_WWSJOB_LINK")) _putenv_s("SPU_WWSJOB_LINK", "0x35D8");
     if (!getenv("SPU_JOB_FOCUS")) _putenv_s("SPU_JOB_FOCUS", "0");
     if (!getenv("SPU_JOB_BOOST")) _putenv_s("SPU_JOB_BOOST", "0");
+    /* Release builds: the diagnostics below are opt-in (set the var to 1). Their readers default them on. */
+    for (const char* v : { "SPU_JOB_TIMING", "PORT_DIALOGUE_DIAG", "R2_PIPE_LOG", "RSX_TEXDIAG", "R2_PRESENT_DIAG" })
+        if (!getenv(v)) _putenv_s(v, "0");
+    g_port_hitch.off = !port_hitch_env_on();   /* PORT_HITCH_LOG=1: [hitch] / [spike] / tex-upload / [fps] / [occ] stats */
     /* R2's movie player (func_006A531C) asks for the English voice tracks (20 + k) when the system language
      * is 8..11 (Russian, Korean, Chinese), so the file layer's voice fallback must not rename them for those
      * (lang_fallback.h). PS3_LANG_TITLE_ENGLISH=none restores 0.3.0's renaming. */

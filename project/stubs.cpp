@@ -253,7 +253,7 @@ extern "C" void port_joblist_reset(uint32_t list)
  * a = 0x20000 | (tag & 0xFFFF), b = tag. */
 #include "ps3emu/ps3_ftrace.h"
 #define PORT_HITCH_IMPLEMENTATION
-#include "ps3emu/port_hitch.h"   /* [hitch] frame hitch logger (PORT_HITCH_LOG=0 off) */
+#include "ps3emu/port_hitch.h"   /* [hitch] frame hitch logger (PORT_HITCH_LOG=1 on; also the [fps] 5 s lines) */
 extern "C" unsigned long long port_ftw_now(void) { return PS3_FT_ON() ? ps3_ft_now() : 0ull; }
 extern "C" void port_ftw_span(unsigned tag, unsigned long long t0, ppu_context* ctx)
 {
@@ -445,7 +445,7 @@ extern "C" int port_frame_wait(uint64_t target, uint32_t last_ea)
       prev = now;
       if (!t0) t0 = now;
       if (now - t0 >= 5ull * 79800000ull && n) {
-          port_log_async(1, "[fps] 5 s: %u frames, %.1f fps, frame %.2f ms avg, %.2f ms worst (target %d)\n",
+          if (!g_port_hitch.off) port_log_async(1, "[fps] 5 s: %u frames, %.1f fps, frame %.2f ms avg, %.2f ms worst (target %d)\n",
                   n, n * 79800000.0 / (double)(now - t0), sum / n / 79800.0, (double)worst / 79800.0, (int)s_rf_mode);
           t0 = now; n = 0; sum = 0; worst = 0;
       } }
@@ -1427,7 +1427,7 @@ extern "C" double r2_frame_period(double f1)
         if (!t0) t0 = now;
         n++;
         if (now - t0 >= 5ull * 79800000ull) {
-            port_log_async(1, "[fps] 5 s: %.1f fps (target 30)\n", n * 79800000.0 / (double)(now - t0));
+            if (!g_port_hitch.off) port_log_async(1, "[fps] 5 s: %.1f fps (target 30)\n", n * 79800000.0 / (double)(now - t0));
             t0 = now; n = 0;
         }
         port_hitchcatch_frame(g_port_frame_no, hitch_discard);
@@ -1477,7 +1477,7 @@ extern "C" double r2_frame_period(double f1)
       if (!t0) t0 = now;
       n++;
       if (now - t0 >= 5ull * 79800000ull) {
-          port_log_async(1, "[fps] 5 s: %.1f fps (target %s%.3f%s)\n", n * 79800000.0 / (double)(now - t0),
+          if (!g_port_hitch.off) port_log_async(1, "[fps] 5 s: %.1f fps (target %s%.3f%s)\n", n * 79800000.0 / (double)(now - t0),
                   eff > 0.0 ? "" : "uncapped ", eff, pace_fps > 0.0 ? ", fixed-refresh pacing" : "");
           t0 = now; n = 0;
       } }

@@ -1,6 +1,6 @@
 /* Resistance 2 port: [perf] slow-window verdict (R2 #15, the swarm FPS drop).
  *
- * The [thrcpu] monitor (debugtools.inc, every PS3_THREAD_CPU s, default 5) already
+ * The [thrcpu] monitor (debugtools.inc, every PS3_THREAD_CPU s, default 0 = off) already
  * measures every host thread's CPU use. This adds the guest frame rate of the same
  * window and, when it falls well under the best rate seen in this run, one [perf]
  * line naming what limits it: the main game thread (PPU game code), the RSX render
