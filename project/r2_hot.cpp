@@ -704,6 +704,9 @@ long long g_nw_us = 2000;      /* R2_OCC_NOWAIT_US */
 long long g_nw_drain_us = 100000;   /* R2_OCC_NOWAIT_DRAIN_MS */
 int g_nw_pend = 0, g_nw_fail = 0;   /* main thread only */
 uint32_t g_nw_frame = 0, g_nw_try_frame = 0;
+int g_nw_tail = 0, g_nw_tail_settle = 0;   /* after giving up: in-flight reports not drained yet (main thread only) */
+uint64_t g_nw_tail_seq = 0;
+uint32_t g_nw_tail_frame = 0, g_nw_tail_settle_frame = 0;
 std::atomic<long long> g_nw_skips{0}, g_nw_budget_ok{0}, g_nw_periods{0}, g_nw_drains{0}, g_nw_drain_ns{0}, g_nw_drain_max_ns{0},
     g_nw_drain_to{0}, g_nw_forced{0};
 
@@ -953,7 +956,9 @@ void sp_update_mark(uint32_t frame)
    report claimed by then is written. No game reset runs during that wait, so afterwards every slot holds its last
    issued report (writes are in order) and the game's own wait/results are exact again from that read on. A drain that
    does not finish in R2_OCC_NOWAIT_DRAIN_MS (default 100) answers that frame visible and retries next frame; after 3
-   failed drains in a row no new sets are skipped. =0: the old blocking wait, exactly. */
+      failed drains in a row R2_OCC_NOWAIT turns itself off: no more drains, every set waits the game's way and is drawn
+      visible until the RSX was idle on its own once (non-blocking fence) and two more frames began, then the plain lifted
+      wait. =0: the old blocking wait, exactly. */
 int occ_nw_drain(long long* ns_out)   /* 0 passed, 1 timed out, -1 no RPCS3 renderer */
 {
     LARGE_INTEGER f, q0, q; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&q0);
@@ -1044,7 +1049,7 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
             fprintf(stderr, "[occ] R2_OCC_SYNC_SITES: sets read from caller 0x%08X are never skipped\n", g_occ_sync_lr[i]);
         g_occ_next.store(GetTickCount64() + 10000);
     }
-    if (g_occ_us < 0 && !g_occ_skip && !g_occ_gw && !g_sp_on && !g_nw_on && !g_nw_pend) return 0;
+    if (g_occ_us < 0 && !g_occ_skip && !g_occ_gw && !g_sp_on && !g_nw_on && !g_nw_pend && !g_nw_tail) return 0;
     const bool lifted_only = g_occ_us < 0 && !g_occ_skip;   /* R2_OCC_BLOCKING=1: count + RSX_ZCULL_GUEST_WAIT, then the lifted body */
 
     /* same address arithmetic as the lifted entry; anything unexpected runs the lifted body */
@@ -1128,7 +1133,7 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
             h->real = 1;
             return 0;
         }
-        if (g_nw_on || g_nw_pend) {   /* R2_OCC_NOWAIT (see occ_nw_drain) */
+        if (g_nw_on || g_nw_pend || g_nw_tail) {   /* R2_OCC_NOWAIT (see occ_nw_drain) */
             const uint32_t frame = ld_be32(gs + 0x6C);
             if (g_nw_pend && frame != g_nw_frame) {
                 if (g_nw_try_frame != frame) {   /* first read of a later frame: one drain */
@@ -1143,14 +1148,41 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
                         fprintf(stderr, "[occ] R2_OCC_NOWAIT: no RPCS3 renderer fence, off\n");
                     } else {
                         g_nw_drain_to.fetch_add(1, std::memory_order_relaxed);
-                        if (++g_nw_fail >= 3 && g_nw_on) {
-                            g_nw_on = 0;
-                            fprintf(stderr, "[occ] R2_OCC_NOWAIT: %d drains in a row timed out (%lld ms): no new sets skipped\n",
+                        if (++g_nw_fail >= 3) {
+                            /* give up: no more drains. The skipped reports are still in flight, so until the RSX has
+                               been idle on its own (non-blocking fence) and two more frames began, every set waits
+                               the game's way (consumed) and is drawn visible; then the plain lifted wait. */
+                            g_nw_on = 0; g_nw_pend = 0;
+                            g_nw_tail = 1; g_nw_tail_settle = 0;
+                            g_nw_tail_seq = r2rsx_occ_nw_arm();
+                            if (g_nw_tail_seq == UINT64_MAX) g_nw_tail = 0;
+                            fprintf(stderr, "[occ] R2_OCC_NOWAIT: %d drains in a row timed out (%lld ms): off, back to the "
+                                            "game's own wait (all-visible until the RSX has caught up once)\n",
                                     g_nw_fail, g_nw_drain_us / 1000);
                         }
                     }
                 }
                 if (g_nw_pend) {   /* not drained yet: a ready report may be a stale late write */
+                    if (r2_occ_write_visible(obj, b, count, list, nullptr)) {
+                        g_nw_forced.fetch_add(1, std::memory_order_relaxed);
+                        return 1;
+                    }
+                    return 0;
+                }
+            }
+            if (g_nw_tail) {
+                if (frame != g_nw_tail_frame) {
+                    g_nw_tail_frame = frame;
+                    if (!g_nw_tail_settle) {
+                        const int p = r2rsx_occ_nw_passed(g_nw_tail_seq);
+                        if (p) { g_nw_tail_settle = 1; g_nw_tail_settle_frame = frame; r2rsx_occ_nw_disarm(); }
+                    } else if (frame - g_nw_tail_settle_frame >= 2) {
+                        g_nw_tail = 0;
+                        fprintf(stderr, "[occ] R2_OCC_NOWAIT: in-flight reports settled, the game's own wait from now on\n");
+                    }
+                }
+                if (g_nw_tail) {
+                    if (!*ts) { r2rsx_occ_guest_wait(rep); occ_native_wait(ts, 1000000); }
                     if (r2_occ_write_visible(obj, b, count, list, nullptr)) {
                         g_nw_forced.fetch_add(1, std::memory_order_relaxed);
                         return 1;
