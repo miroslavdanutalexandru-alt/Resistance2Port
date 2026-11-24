@@ -4625,21 +4625,45 @@ static void spu_indirect_branch_full(spu_context* ctx)
                       if (InterlockedIncrement(&nn) <= 8)
                           fprintf(stderr, "[jobmod-unlifted] pc=0x%05X: no C0DEC0DE header below\n", jpc);
                   } }
+                /* SPU_UNLIFTED_SCOPED (default 1): a lifted caller reached
+                 * this code through a call (r0 = its return point), so
+                 * interpret only the callee and hand back when it returns
+                 * there with the caller's stack pointer; the lifted caller's
+                 * drain then resumes compiled code. Without it the whole rest
+                 * of the job runs interpreted: R2 img 222 "mesh" calls an
+                 * empty unlifted stub (`bi $r0`) through a table and took
+                 * 33-143 ms per run (issue #20 spikes). 0 = old behaviour. */
+                static int s_scoped = -1;
+                if (s_scoped < 0) { const char* e = getenv("SPU_UNLIFTED_SCOPED"); s_scoped = e ? atoi(e) : 1; }
+                const uint32_t ulr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+                const int scoped = s_scoped && ulr != jpc && ulr >= 0x4000u && ulr < 0x3E000u;
                 uji_busy = 1;
-                g_spu_interp_norejoin = 1; g_spu_interp_stop_sp = 0xFFFFFFFFu; g_spu_interp_maxsteps = 0;
+                g_spu_interp_norejoin = 1; g_spu_interp_stop_sp = scoped ? ctx->gpr[1]._u32[0] : 0xFFFFFFFFu;
+                g_spu_interp_maxsteps = 0;
                 g_spu_interp_nowall = 1; g_spu_interp_jobonly = 1;
-                /* Interpretation does not hand back until the job returns to
-                 * the job manager, so everything after this pc runs here
-                 * (Bryce Canyon swarm: one switch case made img 217 ~2000x
-                 * slower). [spu-jobs] reports the time as INTERPRETED. */
+                /* Unscoped, interpretation does not hand back until the job
+                 * returns to the job manager, so everything after this pc runs
+                 * here (Bryce Canyon swarm: one switch case made img 217
+                 * ~2000x slower). [spu-jobs] reports the time as INTERPRETED. */
+                uint32_t ures;
 #ifdef _WIN32
                 LARGE_INTEGER uq0, uq1; QueryPerformanceCounter(&uq0);
-                spu_interp_run_until(ctx, jpc, 0);
+                ures = spu_interp_run_until(ctx, jpc, scoped ? ulr : 0);
                 QueryPerformanceCounter(&uq1);
                 { extern void spu_jobtime_interp(long long); spu_jobtime_interp(uq1.QuadPart - uq0.QuadPart); }
 #else
-                spu_interp_run_until(ctx, jpc, 0);
+                ures = spu_interp_run_until(ctx, jpc, scoped ? ulr : 0);
 #endif
+                if (scoped) {
+                    static volatile LONG n_sc = 0, n_ret = 0;
+                    const LONG sc_n = InterlockedIncrement(&n_sc);
+                    const int back = (ures & SPU_LS_MASK) == ulr;
+                    const LONG ret_n = back ? InterlockedIncrement(&n_ret) : n_ret;
+                    if (sc_n <= 8 || (sc_n & (sc_n - 1)) == 0)
+                        fprintf(stderr, "[spu] unlifted call 0x%05X %s (lr=0x%05X, scoped #%ld, %ld returned to lifted caller)\n",
+                                jpc, back ? "returned to lifted caller" : "left via job manager",
+                                ulr, (long)sc_n, (long)ret_n);
+                }
                 g_spu_interp_norejoin = 0; g_spu_interp_nowall = 0; g_spu_interp_jobonly = 0;
                 uji_busy = 0;
                 ctx->pc &= SPU_LS_MASK;
