@@ -987,7 +987,7 @@ int main(int argc, char** argv)
 #endif
     {
         printf("[ppu-fp] fres/frsqrte: %s (PS3_PPU_HW_ESTIMATE=%d) | fmadds: %s (PS3_PPU_FMADDS_INTERP=%d)\n",
-               ppu_fp_hw_estimate ? "Cell table estimate" : "exact", ppu_fp_hw_estimate,
+               ppu_fp_hw_estimate ? "Cell table estimate (opt-in)" : "exact (default)", ppu_fp_hw_estimate,
                ppu_fp_fmadds_interp ? "unfused, RPCS3 interpreter" : "fused", ppu_fp_fmadds_interp);
     }
     {   /* defaults: r2_hot.cpp, r2_native_jobs.c, r2_native_audio.c, tiled_dma_copy_fast.hpp. edge-zlib
