@@ -202,6 +202,7 @@ static void dump_threads(const char* label, HMODULE self)
  * with, which is the useful half of that.
  */
 static FILE* s_dbg_out = NULL;
+static volatile int s_dbg_file_only = 0;   /* no-flip watchdog: the full dump goes to its file only */
 
 static void dbg_printf(const char* fmt, ...)
 {
@@ -215,7 +216,7 @@ static void dbg_printf(const char* fmt, ...)
         return;
     }
     if (s_dbg_out) { va_list c; va_copy(c, ap); vfprintf(s_dbg_out, fmt, c); va_end(c); }
-    vfprintf(stderr, fmt, ap);
+    if (!s_dbg_file_only) vfprintf(stderr, fmt, ap);
     va_end(ap);
 }
 
@@ -1559,6 +1560,114 @@ static DWORD WINAPI movie_watchdog(LPVOID)
         if (s_dbg_out) { fclose(s_dbg_out); s_dbg_out = NULL; }
         fprintf(stderr, "[moviehang] movie ended %u s ago and the game has not moved on -- state in %s%c",
                 secs, fn, 10); fflush(stderr);
+    }
+}
+
+/* R2 respawn stall (Bryce Canyon, RTX 4070 laptop): after a death the screen stayed black ~20 s with
+ * no flip, the main thread idle (not in [thrcpu]), no file reads, the RSX FIFO empty -- and the game
+ * went on the moment the window lost focus, before its frame loop reached the focus pause.
+ * PORT_NOFLIP_WATCHDOG=<secs> (default 5; 0 = off): when the game has not flipped for that long
+ * while it is not paused on purpose, say once per stall what the main thread waits on -- the HLE
+ * each guest thread is inside and every guest thread's lr (both in the log), the main thread's
+ * guest waits over the next second (usleep spin / sleep, lwmutex, lwcond, yields), whether the game
+ * still polls the pad and the port 0 pad state it last read -- and write the thread stacks (twice,
+ * 1 s apart) and the SPU state to logs\noflip_<tick>.txt (the first 3 stalls of a run).
+ * PORT_NOFLIP_NUDGE=<ms> (default 500; 0 = off): then release all input for that long, the only
+ * game-visible part of an alt-tab before the focus pause parks the frame loop, and report whether
+ * the flips came back -- so the next log tells whether the input was what the game waited on. */
+extern "C" volatile unsigned long long g_pad_release_until;   /* cellPad.c */
+extern "C" volatile long g_pad_getdata_n;                      /* cellPad.c */
+static void noflip_file_only(const char* s) { if (s_dbg_out) fputs(s, s_dbg_out); }
+static DWORD WINAPI noflip_watchdog(LPVOID)
+{
+    static const unsigned secs = [] { const char* e = getenv("PORT_NOFLIP_WATCHDOG"); return (e && *e) ? (unsigned)atoi(e) : 5u; }();
+    static const unsigned nudge_ms = [] { const char* e = getenv("PORT_NOFLIP_NUDGE"); const int v = (e && *e) ? atoi(e) : 500;
+                                          return v <= 0 ? 0u : (unsigned)(v > 5000 ? 5000 : v); }();
+    if (!secs) return 0;
+    SetThreadDescription(GetCurrentThread(), L"noflip watchdog");
+    HMODULE self = NULL;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&noflip_watchdog, &self);
+    unsigned last = 0, dumps = 0;
+    ULONGLONG since = GetTickCount64(), nudged = 0, told_nudge = 0;
+    int reported = 0;
+    for (;;) {
+        Sleep(250);
+        const unsigned f = cellGcm_flip_request_count();
+        const ULONGLONG now = GetTickCount64();
+        if (f != last || f < 200 || g_r2pc_paused) {
+            if (reported && f != last)
+                fprintf(stderr, "[noflip] flips resumed after %.1f s without one%s%c", (double)(now - since) / 1000.0,
+                        nudged ? (now - nudged <= 1500 ? " -- right after the input release (the game waited on its input)"
+                                                       : " -- not right after the input release")
+                               : (g_r2pc_paused ? " (paused meanwhile)" : ""), 10);
+            last = f; since = now; reported = 0; nudged = told_nudge = 0;
+            continue;
+        }
+        if (nudged && !told_nudge && now - nudged > 3000) {
+            told_nudge = 1;
+            fprintf(stderr, "[noflip] still no flip 3 s after the input release: input is not what the game waits on%c", 10);
+        }
+        if (reported || now - since < (ULONGLONG)secs * 1000ull) continue;
+        reported = 1;
+        /* main thread's guest waits over one second */
+        ps3_waitstat a = {}, b = {};
+        int slot = -1;
+        for (int k = 0; k < PS3_WAITSTAT_MAX; k++) if (g_ps3_waitstat[k].tid == s_dbg_main_tid && s_dbg_main_tid) { slot = k; break; }
+        if (slot >= 0) memcpy(&a, (const void*)&g_ps3_waitstat[slot], sizeof a);
+        const long pad0 = g_pad_getdata_n;
+        char file[64] = "";
+        if (dumps < 3) {
+            snprintf(file, sizeof file, "logs\\noflip_%lu.txt", (unsigned long)GetTickCount());
+            s_dbg_out = fopen(file, "wb");
+            if (!s_dbg_out) file[0] = 0;
+        }
+        if (s_dbg_out) {
+            s_dbg_file_only = 1;
+            dbg_printf("[noflip] no flip for %u s (flip %u), not paused%c", secs, f, 10);
+            dump_threads("noflip #1", self);
+            s_dbg_file_only = 0;
+        } else {
+            fprintf(stderr, "[noflip] guest threads, by guest lr:%c", 10);
+            ppu_report_guest_lrs();
+        }
+        Sleep(1000);
+        if (slot >= 0 && g_ps3_waitstat[slot].tid == s_dbg_main_tid) memcpy(&b, (const void*)&g_ps3_waitstat[slot], sizeof b);
+        else memcpy(&b, &a, sizeof b);
+        const long pad1 = g_pad_getdata_n;
+        char hle[512]; int hp = 0; hle[0] = 0;
+        for (unsigned t = 0; t < 64u && hp < (int)sizeof hle - 64; t++)
+            if (const char* n = g_hle_inflight[t]) hp += snprintf(hle + hp, sizeof hle - hp, "%s%u:%s", hp ? " " : "", t, n);
+        char pad[128] = "no pad read yet";
+        if (const uint32_t ea = g_pad_data_ea0) {
+            uint16_t w[8];
+            for (int i = 0; i < 8; i++) w[i] = (uint16_t)((vm_base[(size_t)ea + 4 + 2 * i] << 8) | vm_base[(size_t)ea + 5 + 2 * i]);
+            snprintf(pad, sizeof pad, "port 0 last read: buttons %04X %04X, sticks R %u,%u L %u,%u",
+                     w[2], w[3], w[4] & 0xFF, w[5] & 0xFF, w[6] & 0xFF, w[7] & 0xFF);
+        }
+        const double qms = (double)ps3_qpc_freq() / 1000.0;
+        fprintf(stderr, "[noflip] no flip for %u s (flip %u), not paused | guest threads in an HLE: %s | main over 1 s: usleep spin %llu (%.0f ms) "
+                        "sleep %llu (%.0f ms), lwmutex %llu (%.0f ms), lwcond %llu (%.0f ms), yields %llu%s | pad GetData calls %ld/s, %s%s%s%c",
+                secs, f, hp ? hle : "none",
+                b.short_n - a.short_n, (double)(b.short_qpc - a.short_qpc) / qms, b.long_n - a.long_n, (double)(b.long_qpc - a.long_qpc) / qms,
+                b.lwm_block_n - a.lwm_block_n, (double)(b.lwm_block_qpc - a.lwm_block_qpc) / qms,
+                b.lwc_wait_n - a.lwc_wait_n, (double)(b.lwc_wait_qpc - a.lwc_wait_qpc) / qms, b.yield_n - a.yield_n,
+                slot < 0 ? " (no wait slot)" : "", pad1 - pad0, pad, file[0] ? " | stacks in " : "", file, 10);
+        if (s_dbg_out) {
+            s_dbg_file_only = 1;
+            dump_threads("noflip #2 (1 s later)", self);
+            spu_dbg_dump_all(noflip_file_only);
+            s_dbg_file_only = 0;
+            fclose(s_dbg_out); s_dbg_out = NULL;
+            dumps++;
+        }
+        fflush(stderr);
+        if (nudge_ms && cellGcm_flip_request_count() == f && !g_r2pc_paused) {
+            nudged = GetTickCount64();
+            g_pad_release_until = nudged + nudge_ms;
+            fprintf(stderr, "[noflip] releasing all input for %u ms, as an alt-tab does (PORT_NOFLIP_NUDGE=0 off)%c", nudge_ms, 10);
+        }
     }
 }
 
