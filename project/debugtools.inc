@@ -50,6 +50,36 @@ static __declspec(thread) size_t s_dbg_capn = 0;
 extern "C" const char* g_hle_inflight[];   /* ppu_hle.cpp; 64 entries */
 extern "C" void ppu_report_guest_lrs(void); /* ppu_loader.cpp */
 
+/* One report at a time. The diagnostic threads (debug console, freeze relauncher, hang / movie /
+ * no-flip watchdogs) share s_dbg_out and s_dbg_file_only, and each suspends every other thread in
+ * dump_threads: two reports at once lost output, closed one FILE* twice, or left two dumpers
+ * suspending each other for good (no freeze relaunch then). Every report section -- the s_dbg_out
+ * setup, dump_threads, spu_dbg_dump_all and the fclose -- holds s_diag_lock, and dump_threads
+ * never suspends a registered diagnostic thread. */
+static SRWLOCK s_diag_lock = SRWLOCK_INIT;
+static volatile LONG s_diag_tids[8];
+static void diag_thread_register(void)
+{
+    const LONG me = (LONG)GetCurrentThreadId();
+    for (int i = 0; i < 8; i++)
+        if (s_diag_tids[i] == me || InterlockedCompareExchange(&s_diag_tids[i], me, 0) == 0) return;
+}
+static int diag_thread_is(DWORD tid)
+{
+    for (int i = 0; i < 8; i++) if ((DWORD)s_diag_tids[i] == tid) return 1;
+    return 0;
+}
+/* Take the report lock, waiting at most wait_ms (0 = only if free). 1 = got it. */
+static int diag_lock(DWORD wait_ms)
+{
+    for (DWORD waited = 0;; waited += 50) {
+        if (TryAcquireSRWLockExclusive(&s_diag_lock)) return 1;
+        if (wait_ms != INFINITE && waited >= wait_ms) return 0;
+        Sleep(50);
+    }
+}
+static void diag_unlock(void) { ReleaseSRWLockExclusive(&s_diag_lock); }
+
 static void dump_threads(const char* label, HMODULE self)
 {
     dbg_printf( "[WATCHDOG] %s; last HLE call = 0x%08X (%s)\n",
@@ -94,7 +124,7 @@ static void dump_threads(const char* label, HMODULE self)
     THREADENTRY32 te; te.dwSize = sizeof te;
     if (snap != INVALID_HANDLE_VALUE && Thread32First(snap, &te)) {
         do {
-            if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == me || diag_thread_is(te.th32ThreadID)) continue;
             HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
                                    FALSE, te.th32ThreadID);
             if (!th) continue;
@@ -1183,6 +1213,7 @@ static DWORD WINAPI pad_watch_thread(LPVOID) { pad_watch_run(); return 0; }
 static DWORD WINAPI debug_console(LPVOID param)
 {
     const char* path = (const char*)param;
+    diag_thread_register();
     char outpath[1024];
     snprintf(outpath, sizeof outpath, "%s.out", path);
 
@@ -1256,6 +1287,7 @@ static DWORD WINAPI debug_console(LPVOID param)
           const int edge = down && !f11_was;
           f11_was = down;
           if (edge && s_dbg_main_tid) {
+              diag_lock(INFINITE);
               s_dbg_out = fopen(outpath, "ab");
               dbg_printf("%c[dbg] > F11: prof main %lu 6 + render, FIFO, raw SPUs, SPURS lanes together%c", 10, (unsigned long)s_dbg_main_tid, 10);
               fprintf(stderr, "[dbg] F11: profiling main/render/FIFO/raw SPUs/SPURS lanes for 6 s%c", 10);
@@ -1267,6 +1299,7 @@ static DWORD WINAPI debug_console(LPVOID param)
               dbg_prof_frame_threads_cpu(6);
               dbg_fifo_mhist(3);
               if (s_dbg_out) { fclose(s_dbg_out); s_dbg_out = NULL; }
+              diag_unlock();
               fprintf(stderr, "[dbg] F11 profile written%c", 10);
               f11_was = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
               continue;
@@ -1303,6 +1336,7 @@ static DWORD WINAPI debug_console(LPVOID param)
             if (ap_low >= 2 || ap_hot >= 3) {
                 if (ap_hot >= 3) ap_hot_done = 1; else ap_done++;
                 ap_low = 0; ap_hot = 0;
+                diag_lock(INFINITE);
                 s_dbg_out = fopen(outpath, "ab");
                 dbg_printf("%c[dbg] > F11: prof main %lu 6 (auto, %u fps, render load %d%%) + render, FIFO, raw SPUs, SPURS lanes together%c",
                            10, (unsigned long)s_dbg_main_tid, d, rsx_perf_render_load(), 10);
@@ -1316,6 +1350,7 @@ static DWORD WINAPI debug_console(LPVOID param)
                  * then the main thread */
                 dbg_prof_frame_threads_cpu(6);
                 if (s_dbg_out) { fclose(s_dbg_out); s_dbg_out = NULL; }
+                diag_unlock();
                 fprintf(stderr, "[dbg] auto-profile written%c", 10);
                 ap_last = cellGcm_flip_request_count();
                 continue;
@@ -1331,6 +1366,7 @@ static DWORD WINAPI debug_console(LPVOID param)
         if (!cmd[0]) continue;
         FILE* t = fopen(path, "wb"); if (t) fclose(t);   /* consume it */
 
+        diag_lock(INFINITE);
         s_dbg_out = fopen(outpath, "ab");
         dbg_printf("%c[dbg] > %s%c", 10, cmd, 10);
 
@@ -1483,6 +1519,7 @@ static DWORD WINAPI debug_console(LPVOID param)
         }
 
         if (s_dbg_out) { fclose(s_dbg_out); s_dbg_out = NULL; }
+        diag_unlock();
     }
     return 0;
 }
@@ -1498,6 +1535,7 @@ static DWORD WINAPI freeze_relauncher(LPVOID)
     const char* e = getenv("FREEZE_RELAUNCH");
     const unsigned secs = e ? (unsigned)atoi(e) : 0;
     if (!secs) return 0;
+    diag_thread_register();
     HMODULE self = NULL;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -1510,12 +1548,17 @@ static DWORD WINAPI freeze_relauncher(LPVOID)
         if (++still < secs) continue;
         static int n = 0;
         { char fn[64]; snprintf(fn, sizeof fn, "logs\\freeze_%lu_%d.txt", (unsigned long)GetTickCount(), n++);
-          s_dbg_out = fopen(fn, "wb");
-          dbg_printf("[freeze] frame counter stuck at %u for %u s%c", f, secs, 10);
-          dump_threads("freeze", self);
-          spu_dbg_dump_all(dbg_out_str);
-          if (s_dbg_out) { fclose(s_dbg_out); s_dbg_out = NULL; }
-          fprintf(stderr, "[freeze] stuck at flip %u -- state in %s, relaunching%c", f, fn, 10); fflush(stderr); }
+          /* another report may be running; wait for it, but never let it stop the relaunch */
+          if (diag_lock(15000)) {
+              s_dbg_out = fopen(fn, "wb");
+              dbg_printf("[freeze] frame counter stuck at %u for %u s%c", f, secs, 10);
+              dump_threads("freeze", self);
+              spu_dbg_dump_all(dbg_out_str);
+              if (s_dbg_out) { fclose(s_dbg_out); s_dbg_out = NULL; }
+              diag_unlock();
+          } else fn[0] = 0;
+          fprintf(stderr, "[freeze] stuck at flip %u -- state in %s, relaunching%c", f,
+                  fn[0] ? fn : "(none: another report held the lock)", 10); fflush(stderr); }
         STARTUPINFOA si; PROCESS_INFORMATION pi;
         ZeroMemory(&si, sizeof si); si.cb = sizeof si;
         si.dwFlags = STARTF_USESTDHANDLES;
@@ -1546,6 +1589,7 @@ static DWORD WINAPI movie_watchdog(LPVOID)
     const char* e = getenv("PORT_MOVIE_WATCHDOG");
     const unsigned secs = e ? (unsigned)atoi(e) : 20u;
     if (!secs) return 0;
+    diag_thread_register();
     HMODULE self = NULL;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -1560,6 +1604,7 @@ static DWORD WINAPI movie_watchdog(LPVOID)
         /* a movie that ended properly hands the screen back to gameplay
          * (SetFlipMode 1); York's hang stayed in movie mode (2) */
         if (cellGcm_get_flip_mode() != 2) { done_for = t; continue; }
+        if (!diag_lock(0)) continue;   /* another report is running: try again next second */
         done_for = t;
         char fn[64]; snprintf(fn, sizeof fn, "logs\\moviehang_%lu.txt", (unsigned long)GetTickCount());
         s_dbg_out = fopen(fn, "wb");
@@ -1568,6 +1613,7 @@ static DWORD WINAPI movie_watchdog(LPVOID)
         dump_threads("moviehang", self);
         spu_dbg_dump_all(dbg_out_str);
         if (s_dbg_out) { fclose(s_dbg_out); s_dbg_out = NULL; }
+        diag_unlock();
         fprintf(stderr, "[moviehang] movie ended %u s ago and the game has not moved on -- state in %s%c",
                 secs, fn, 10); fflush(stderr);
     }
@@ -1595,6 +1641,7 @@ static DWORD WINAPI noflip_watchdog(LPVOID)
     static const unsigned nudge_ms = [] { const char* e = getenv("PORT_NOFLIP_NUDGE"); const int v = (e && *e) ? atoi(e) : 500;
                                           return v <= 0 ? 0u : (unsigned)(v > 5000 ? 5000 : v); }();
     if (!secs) return 0;
+    diag_thread_register();
     SetThreadDescription(GetCurrentThread(), L"noflip watchdog");
     HMODULE self = NULL;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -1623,6 +1670,7 @@ static DWORD WINAPI noflip_watchdog(LPVOID)
             fprintf(stderr, "[noflip] still no flip 3 s after the input release: input is not what the game waits on%c", 10);
         }
         if (reported || now - since < (ULONGLONG)secs * 1000ull) continue;
+        if (!diag_lock(0)) continue;   /* another report is running: try again next tick */
         reported = 1;
         /* main thread's guest waits over one second */
         ps3_waitstat a = {}, b = {};
@@ -1675,6 +1723,7 @@ static DWORD WINAPI noflip_watchdog(LPVOID)
             fclose(s_dbg_out); s_dbg_out = NULL;
             dumps++;
         }
+        diag_unlock();
         fflush(stderr);
         /* Release input only where it can matter and cannot hurt: the game must have read the pad in
          * the last second (if it does not read input, releasing it cannot be what it waits on), and
@@ -1698,6 +1747,7 @@ static DWORD WINAPI noflip_watchdog(LPVOID)
 
 static DWORD WINAPI hang_watchdog(LPVOID)
 {
+    diag_thread_register();
     HMODULE self = NULL;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -1710,9 +1760,11 @@ static DWORD WINAPI hang_watchdog(LPVOID)
       if (e && sscanf(e, "%d,%d", &a, &b) == 2 && a > 0 && b > a) { t1 = a; t2 = b; } }
     char lbl[64];
     Sleep((DWORD)t1 * 1000);
-    snprintf(lbl, sizeof lbl, "%ds sample", t1); dump_threads(lbl, self);
+    snprintf(lbl, sizeof lbl, "%ds sample", t1);
+    if (diag_lock(15000)) { dump_threads(lbl, self); diag_unlock(); }
     Sleep((DWORD)(t2 - t1) * 1000);
-    snprintf(lbl, sizeof lbl, "%ds sample", t2); dump_threads(lbl, self);
+    snprintf(lbl, sizeof lbl, "%ds sample", t2);
+    if (diag_lock(15000)) { dump_threads(lbl, self); diag_unlock(); }
     return 0;
 }
 #endif
