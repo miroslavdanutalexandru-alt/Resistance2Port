@@ -1639,7 +1639,7 @@ static void noflip_file_only(const char* s) { if (s_dbg_out) fputs(s, s_dbg_out)
  * GET has not moved for that long while PUT is elsewhere (report #153831: the game's "GPU sit and spin
  * timeout" after ~20 min), say once per stall in run.log what the puller sits on -- decoded command at
  * GET, a jump-to-self park or a semaphore acquire with the label's value -- and the raw SPUs' state. */
-extern "C" int r2rsx_stall_poll(unsigned stall_ms, char* out, unsigned cap);   /* rpcs3_bridge */
+extern "C" int r2rsx_stall_poll(unsigned stall_ms, int may_report, char* out, unsigned cap);   /* rpcs3_bridge */
 extern "C" int spu_raw_dbg_line(unsigned n, char* out, unsigned cap);          /* spu_raw.c */
 static char s_rsx_stall_last[2048];
 static void rsx_stall_raw_spus(void (*out)(const char*))
@@ -1657,8 +1657,8 @@ static void rsx_stall_poll_once(unsigned stall_ms)
 {
     static unsigned reports = 0;
     char buf[2048];
-    if (!stall_ms || !r2rsx_stall_poll(stall_ms, buf, sizeof buf)) return;
-    if (g_r2pc_paused || reports >= 8) return;
+    /* only a logged stall is used up and gets a "GET moves again" line, so both stay within the cap */
+    if (!stall_ms || !r2rsx_stall_poll(stall_ms, !g_r2pc_paused && reports < 8, buf, sizeof buf)) return;
     reports++;
     snprintf(s_rsx_stall_last, sizeof s_rsx_stall_last, "%s", buf);
     fprintf(stderr, "%s (RSX_STALL_DIAG_MS=0 off)%c", buf, 10);

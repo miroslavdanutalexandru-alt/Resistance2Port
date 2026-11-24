@@ -1520,7 +1520,7 @@ extern "C" void r2rsx_set_zcull(uint32_t index, uint32_t offset, uint32_t width,
 }
 
 // R2PORT RSX_STALL_DIAG (report #153831: "GPU sit and spin timeout", GET fixed while PUT moved on). Called every
-// ~250 ms from the port's watchdog thread. Returns 1 once per stall -- GET unchanged for stall_ms with PUT elsewhere --
+// ~250 ms from the port's watchdog thread. Returns 1 once per logged stall (may_report = 0: paused or out of reports) -- GET unchanged for stall_ms with PUT elsewhere --
 // with a one-line report in out: the puller's position and state (parked on a jump-to-self / in a semaphore acquire),
 // the decoded command at it and the words around it, and the last semaphore and its value. Racy reads, never writes.
 namespace
@@ -1548,7 +1548,7 @@ namespace
 	}
 }
 
-extern "C" int r2rsx_stall_poll(unsigned stall_ms, char* out, unsigned cap)
+extern "C" int r2rsx_stall_poll(unsigned stall_ms, int may_report, char* out, unsigned cap)
 {
 	static u32 s_get = umax;
 	static u64 s_since = 0;
@@ -1564,6 +1564,12 @@ extern "C" int r2rsx_stall_poll(unsigned stall_ms, char* out, unsigned cap)
 		return 0;
 	}
 	if (s_told || now - s_since < stall_ms) return 0;
+	if (!may_report)
+	{
+		// paused or out of reports: not logged, so no "moves again" either; a stall still there afterwards counts from now
+		s_since = now;
+		return 0;
+	}
 	s_told = true;
 
 	auto* f = s_render->fifo_ctrl.get();
