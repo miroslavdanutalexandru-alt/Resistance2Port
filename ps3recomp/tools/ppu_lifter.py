@@ -163,6 +163,10 @@ static inline void vm_raw_st16(uint64_t ea, const void* src) {
 extern int      vm_inline_ok;
 extern uint32_t ppu_vm_size;
 extern uint32_t ppu_hle_inject_base;
+/* FP semantics switches, read once at start-up (runtime/ppu/ppu_loader.cpp):
+ * PS3_PPU_HW_ESTIMATE / PS3_PPU_FMADDS_INTERP. */
+extern int      ppu_fp_hw_estimate;
+extern int      ppu_fp_fmadds_interp;
 #ifdef __cplusplus
 }
 #endif
@@ -405,6 +409,83 @@ static inline double ppu_fmadd_core(double a, double c, double b, int neg_b, int
 static inline double ppu_fp_single(double r)
 {
     return (double)(float)r;
+}
+/* fmadds. Fused with one rounding to double, then to single (hardware, RPCS3's
+ * LLVM recompiler). ppu_fp_fmadds_interp (PS3_PPU_FMADDS_INTERP=1): a*c is
+ * rounded to double before the add, as RPCS3's PPU interpreter does for fmadds
+ * only (its fmsubs / fnmadds / fnmsubs stay fused). Separate statements, so no
+ * compiler contraction mode can fuse them back. */
+static inline double ppu_fmadds(double a, double c, double b)
+{
+    if (__builtin_expect(ppu_fp_fmadds_interp, 0)) {
+        if (a != a) return ppu_fp_single(ppu_fp_quiet(a));
+        if (b != b) return ppu_fp_single(ppu_fp_quiet(b));
+        if (c != c) return ppu_fp_single(ppu_fp_quiet(c));
+        volatile double p = a * c;
+        double r = p + b;
+        if (r != r) return ppu_fp_default_qnan();
+        return ppu_fp_single(r);
+    }
+    return ppu_fp_single(ppu_fmadd_core(a, c, b, 0, 0));
+}
+/* fres / frsqrte estimates (Book I 4.6.5.1: "an estimate", 1/256 and 1/32 of the
+ * true value). Cell returns fixed table values, which RPCS3's interpreter and
+ * LLVM recompiler both reproduce bit for bit (rpcs3/Emu/Cell/Common.h:
+ * ppu_fres_mantissas, ppu_frqrte_lut; PPUInterpreter.cpp FRES / FRSQRTE); the
+ * same computation follows. Game code refines them with Newton-Raphson steps,
+ * whose result depends on the estimate. ppu_fp_hw_estimate = 0
+ * (PS3_PPU_HW_ESTIMATE=0): the exact 1/x and 1/sqrt(x) of earlier builds. */
+static const uint32_t ppu_fres_mant[128] = {
+    0x7f0000, 0x7d0800, 0x7b1800, 0x793000, 0x775000, 0x757000, 0x73a000, 0x71e000,
+    0x700000, 0x6e4000, 0x6ca000, 0x6ae000, 0x694000, 0x678000, 0x660000, 0x646000,
+    0x62c000, 0x614000, 0x5fc000, 0x5e4000, 0x5cc000, 0x5b4000, 0x59c000, 0x584000,
+    0x570000, 0x558000, 0x540000, 0x52c000, 0x518000, 0x500000, 0x4ec000, 0x4d8000,
+    0x4c0000, 0x4b0000, 0x498000, 0x488000, 0x474000, 0x460000, 0x44c000, 0x438000,
+    0x428000, 0x418000, 0x400000, 0x3f0000, 0x3e0000, 0x3d0000, 0x3bc000, 0x3ac000,
+    0x398000, 0x388000, 0x378000, 0x368000, 0x358000, 0x348000, 0x338000, 0x328000,
+    0x318000, 0x308000, 0x2f8000, 0x2ec000, 0x2e0000, 0x2d0000, 0x2c0000, 0x2b0000,
+    0x2a0000, 0x298000, 0x288000, 0x278000, 0x26c000, 0x260000, 0x250000, 0x244000,
+    0x238000, 0x228000, 0x220000, 0x210000, 0x200000, 0x1f8000, 0x1e8000, 0x1e0000,
+    0x1d0000, 0x1c8000, 0x1b8000, 0x1b0000, 0x1a0000, 0x198000, 0x190000, 0x180000,
+    0x178000, 0x168000, 0x160000, 0x158000, 0x148000, 0x140000, 0x138000, 0x128000,
+    0x120000, 0x118000, 0x108000, 0x100000, 0x0f8000, 0x0f0000, 0x0e0000, 0x0d8000,
+    0x0d0000, 0x0c8000, 0x0b8000, 0x0b0000, 0x0a8000, 0x0a0000, 0x098000, 0x090000,
+    0x080000, 0x078000, 0x070000, 0x068000, 0x060000, 0x058000, 0x050000, 0x048000,
+    0x040000, 0x038000, 0x030000, 0x028000, 0x020000, 0x018000, 0x010000, 0x000000,
+};
+static const uint32_t ppu_frsqrte_mant[16] = {
+    0x0f1000, 0x0d8000, 0x0c0000, 0x0a8000, 0x098000, 0x088000, 0x080000, 0x070000,
+    0x060000, 0x04c000, 0x03c000, 0x030000, 0x020000, 0x018000, 0x010000, 0x008000,
+};
+static inline double ppu_fres_hw(double a)
+{
+    uint64_t b; memcpy(&b, &a, 8);
+    const uint64_t e = (b >> 52) & 0x7ff, i = (b >> 45) & 0x7f;
+    const uint64_t r = e >= (0x3ff + 0x80) ? 0 : (0x7ffull - 2 - e) << 52 | (uint64_t)ppu_fres_mant[i] << (32 - 3);
+    const uint64_t o = (a == a) ? (b & 0x8000000000000000ull) | r : (0x0008000000000000ull | b);
+    double d; memcpy(&d, &o, 8);
+    return (double)(float)d;
+}
+static inline double ppu_frsqrte_hw(double a)
+{
+    uint64_t b; memcpy(&b, &a, 8);
+    const uint64_t i = b >> 49, sign = i >> 14, expv = (i >> 3) & 0x7ff;
+    uint32_t hi;
+    if (expv == 0) hi = 0x7ff00000u | (uint32_t)(sign << 31);      /* +-0 / denormal: +-inf */
+    else if (expv == 0x7ff) hi = (i == (0x7ffull << 3)) ? 0u : 0x7ff80000u;
+    else if (sign) hi = 0x7ff80000u;
+    else hi = ppu_frsqrte_mant[8 ^ (i & 0xf)] | (uint32_t)(0x3fe00000ull - (((expv + 0x1c01) >> 1) << 20));
+    const uint64_t o = (uint64_t)hi << 32;
+    double d; memcpy(&d, &o, 8);
+    return d;
+}
+static inline double ppu_fres(double a)
+{
+    return __builtin_expect(ppu_fp_hw_estimate, 1) ? ppu_fres_hw(a) : (double)(float)(1.0 / a);
+}
+static inline double ppu_frsqrte(double a)
+{
+    return __builtin_expect(ppu_fp_hw_estimate, 1) ? ppu_frsqrte_hw(a) : 1.0 / sqrt(a);
 }
 /* frsp of a NaN (Book I 4.6.6): FRB[0:34] quieted, then 29 zero bits -- the
  * payload truncated to the single fraction. Explicit, not host conversion. */
@@ -2315,6 +2396,9 @@ class PPULifter:
         if mn_base in fma_map:
             frd, fra, frc, frb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2]), _reg_idx(ops[3])
             neg_b, neg_res = fma_map[mn_base]
+            if mn_base == "fmadds":
+                return (f"ctx->fpr[{frd}] = ppu_fmadds(ctx->fpr[{fra}], ctx->fpr[{frc}], "
+                        f"ctx->fpr[{frb}]);")
             expr = (f"ppu_fmadd_core(ctx->fpr[{fra}], ctx->fpr[{frc}], "
                     f"ctx->fpr[{frb}], {neg_b}, {neg_res})")
             if mn_base.endswith("s"):
@@ -2363,18 +2447,21 @@ class PPULifter:
                 return f"ctx->fpr[{frd}] = (double)(float)sqrt(ctx->fpr[{frb}]);"
             return f"ctx->fpr[{frd}] = sqrt(ctx->fpr[{frb}]);"
 
+        # fres / frsqrte: the Cell's table estimates (ppu_fres / ppu_frsqrte in
+        # the preamble, PS3_PPU_HW_ESTIMATE). frsqrtes / fre are not Cell
+        # instructions (RPCS3 has neither) and stay exact.
         if mn_base in ("frsqrte", "frsqrtes"):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
             if mn_base == "frsqrtes":
                 return f"ctx->fpr[{frd}] = (double)(float)(1.0 / sqrt(ctx->fpr[{frb}]));"
-            return f"ctx->fpr[{frd}] = 1.0 / sqrt(ctx->fpr[{frb}]);"
+            return f"ctx->fpr[{frd}] = ppu_frsqrte(ctx->fpr[{frb}]);"
 
         if mn_base in ("fre", "fres"):
             frd = _reg_idx(ops[0])
             frb = _reg_idx(ops[1])
             if mn_base == "fres":
-                return f"ctx->fpr[{frd}] = (double)(float)(1.0 / ctx->fpr[{frb}]);"
+                return f"ctx->fpr[{frd}] = ppu_fres(ctx->fpr[{frb}]);"
             return f"ctx->fpr[{frd}] = 1.0 / ctx->fpr[{frb}];"
 
         if mn_base == "fsel":

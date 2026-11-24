@@ -90,6 +90,7 @@ int (*g_vm_access_violation_hook)(uint32_t guest_addr, int is_write) = nullptr;
 extern "C" void spu_jobtime_av(long long qpc_ticks);   /* spu_drain.c */
 extern "C" int spu_jobtime_cur_img(void);              /* spu_drain.c: [av-who] */
 extern "C" uint32_t g_sjt_link_b;                      /* spu_drain.c: WWS job-call return pc ([spu-jobs]) */
+extern "C" int ppu_fp_hw_estimate, ppu_fp_fmadds_interp;   /* ppu_loader.cpp: PS3_PPU_HW_ESTIMATE / PS3_PPU_FMADDS_INTERP */
 extern "C" int spu_sched_effective(void);              /* spu_channels.c: PORT_SPU_SCHED, [native] line */
 /* Unclaimed protection fault on a guarded page: the RSX page-guard registry
  * re-applies (or drops) the page's protection itself (rsx_page_guard_reconcile;
@@ -980,6 +981,11 @@ int main(int argc, char** argv)
 #ifdef _WIN32
     port_sys_report();
 #endif
+    {
+        printf("[ppu-fp] fres/frsqrte: %s (PS3_PPU_HW_ESTIMATE=%d) | fmadds: %s (PS3_PPU_FMADDS_INTERP=%d)\n",
+               ppu_fp_hw_estimate ? "Cell table estimate" : "exact", ppu_fp_hw_estimate,
+               ppu_fp_fmadds_interp ? "unfused, RPCS3 interpreter" : "fused", ppu_fp_fmadds_interp);
+    }
     {   /* defaults: r2_hot.cpp, r2_native_jobs.c, r2_native_audio.c, tiled_dma_copy_fast.hpp. edge-zlib
          * (native_edge_zlib.c) is native-jobs kernel 1 (mask bit 1, like R3's kernel bit 0) and water-jobs
          * are kernels 2..4: their state is the effective one from r2_native_jobs.c (R2_NATIVE_JOBS, _MASK,

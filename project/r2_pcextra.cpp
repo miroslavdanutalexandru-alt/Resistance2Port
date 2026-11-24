@@ -26,6 +26,8 @@
  *                    local IPC pipe (\\.\pipe\discord-ipc-N); silent if not running.
  *   Benchmark        R2_BENCH=1: scripted boot into the first level, measure
  *                    R2_BENCH_SECONDS, write logs\bench\R2_bench_<date>.txt, quit.
+ *   Script log       R2_LUA_LOG (default 1; 0 = off): the level scripts' prt() messages
+ *                    as [lua] lines (r2x_lua_prt).
  *
  * The menu, the photo-mode note, the controller-lost dialog and the crosshair are
  * drawn into the game's swapchain image (port_osd.h), so they show in exclusive
@@ -1286,6 +1288,37 @@ extern "C" uint64_t r2x_movie_seen(uint64_t seen)
     }
     if (s_skip_mech != 2) { s_skip_mech = 2; LOG("movie skip: not watched yet, watched-check overridden (func_002CAD1C @ 0x002CAFC8)"); }
     return 1;
+}
+/* Level-script log. The game's scripts define prt = screen_out (a Lua native, func_000CEAA8),
+ * whose print (func_0002C648) is compiled out of the retail EBOOT. Its progress messages
+ * ("cp elevator 1 trig", "is_dead(S07_POD_ALLZMB)", "ELEVATOR AT SECOND NODE", ...) say which
+ * step of a level script last ran, so a stuck objective can be placed. The hook in
+ * tools/hooks/r2.json passes the string (lua_tolstring's result) here: one "[lua]" line each.
+ * R2_LUA_LOG (default 1; 0 = off). Bounded: a repeat of the previous line is counted, not
+ * printed; at most 20 lines a second; 5000 lines a run. */
+extern "C" void r2x_lua_prt(uint64_t ea)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("R2_LUA_LOG"); on = !(e && (*e == '0' || !_stricmp(e, "off"))); }
+    if (!on) return;
+    const uint32_t a = (uint32_t)ea;
+    if (!vm_base || a < 0x10000u || a >= 0xE0000000u) return;
+    char msg[160]; size_t n = 0;
+    const char* s = (const char*)vm_base + a;
+    while (n < sizeof msg - 1 && s[n]) { const char c = s[n]; msg[n++] = (c >= 32 && c < 127) ? c : '?'; }
+    msg[n] = 0;
+    static std::mutex mu; std::lock_guard<std::mutex> lk(mu);
+    static char last[160] = ""; static unsigned rep = 0, total = 0, in_sec = 0; static ULONGLONG sec = 0;
+    if (total >= 5000) return;
+    if (!strcmp(msg, last)) { rep++; return; }
+    const ULONGLONG now = GetTickCount64();
+    if (now - sec >= 1000) { sec = now; in_sec = 0; }
+    if (in_sec >= 20) return;
+    in_sec++;
+    if (rep) fprintf(stderr, "[lua] (previous line %u more times)\n", rep);
+    rep = 0; strcpy(last, msg);
+    fprintf(stderr, "[lua] %s\n", msg);
+    if (++total == 5000) fprintf(stderr, "[lua] 5000 lines: R2_LUA_LOG stops here for this run\n");
 }
 static int s_want_pause = 0;
 extern "C" int r2x_want_pause(void) { return s_want_pause; }

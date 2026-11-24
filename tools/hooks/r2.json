@@ -1048,6 +1048,30 @@
      "        if (r2_hot_gcmvpc(ctx)) return;"
     ]
    }
+  ],
+  "func_000CEAA8": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_000CEAA8(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" void r2x_lua_prt(uint64_t ea);   /* R2: level-script prt() -> [lua] lines in run.log (project/r2_pcextra.cpp, R2_LUA_LOG) */",
+     "void func_000CEAA8(ppu_context* ctx) {"
+    ]
+   },
+   {
+    "at": 15,
+    "ctx": "        ctx->gpr[3] = R_3 = ppc_rldicl(R_3, 0, 32);",
+    "rm": [
+     "        ctx->lr = R_lr = 0x000CEACC; func_0002C648(ctx); DRAIN_TRAMPOLINE(ctx); _RCX_RL;"
+    ],
+    "add": [
+     "        r2x_lua_prt(R_3);   /* R2: screen_out = the scripts' prt(); its print is compiled out of the retail EBOOT */",
+     "        ctx->lr = R_lr = 0x000CEACC; func_0002C648(ctx); DRAIN_TRAMPOLINE(ctx); _RCX_RL;"
+    ]
+   }
   ]
  },
  "preamble": [],
