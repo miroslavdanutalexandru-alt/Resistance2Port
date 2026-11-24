@@ -74,6 +74,21 @@ static void dump_threads(const char* label, HMODULE self)
       if (!any) dbg_printf("[WATCHDOG] no guest thread is inside an HLE\n"); }
     dbg_printf("[WATCHDOG] guest threads, by guest lr:\n");
     ppu_report_guest_lrs();
+    /* While a thread is suspended, NOTHING here may take a lock that thread could
+     * hold: no loader calls (GetModuleHandleEx / GetModuleFileName take the
+     * loader / module-table lock, held by any thread inside LoadLibrary or a
+     * DLL thread attach/detach -- e.g. threads made and ended by a level
+     * reload), no heap, no CRT stream. Only GetThreadContext, VirtualQuery and
+     * plain reads of its stack, against the boot module's address range taken
+     * from its own PE header up front. The return addresses go to a local array;
+     * they are resolved and printed after ResumeThread. Otherwise a watchdog
+     * meant to report a stall could turn it into a permanent hang. */
+    uint64_t self_lo = (uint64_t)self, self_hi = self_lo;
+    if (self) {
+        const IMAGE_DOS_HEADER* dh = (const IMAGE_DOS_HEADER*)self;
+        const IMAGE_NT_HEADERS* nh = (const IMAGE_NT_HEADERS*)((const char*)self + dh->e_lfanew);
+        self_hi = self_lo + nh->OptionalHeader.SizeOfImage;
+    }
     DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te; te.dwSize = sizeof te;
@@ -83,30 +98,16 @@ static void dump_threads(const char* label, HMODULE self)
             HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
                                    FALSE, te.th32ThreadID);
             if (!th) continue;
-            s_dbg_capn = 0; s_dbg_capbuf[0] = 0; s_dbg_cap = s_dbg_capbuf;
-            SuspendThread(th);
+            uint64_t rets[40]; int nret = 0;
             CONTEXT ctx; ctx.ContextFlags = CONTEXT_CONTROL;
-            if (GetThreadContext(th, &ctx)) {
-                HMODULE m = NULL;
-                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   (LPCSTR)ctx.Rip, &m);
-                if (m == self) {
-                    dbg_printf( "[WATCHDOG]   tid %5lu BOOT rip rva=0x%llX\n",
-                            (unsigned long)te.th32ThreadID,
-                            (unsigned long long)((char*)ctx.Rip - (char*)self));
-                } else {
-                    char path[MAX_PATH] = "?";
-                    if (m) GetModuleFileNameA(m, path, sizeof path);
-                    const char* base = strrchr(path, '\\');
-                    dbg_printf( "[WATCHDOG]   tid %5lu in %s\n",
-                            (unsigned long)te.th32ThreadID, base ? base + 1 : path);
-                }
+            SuspendThread(th);
+            const BOOL got_ctx = GetThreadContext(th, &ctx);
+            if (got_ctx) {
                 /* Scan the suspended thread's stack for boot-module return
                  * addresses to reconstruct the lifted call chain — done for ALL
                  * threads (even when RIP is parked in ntdll inside a CriticalSection
                  * call), since that's exactly where the busy-spin's lwmutex churn
-                 * lands the main thread. Map RVAs -> func_ names via flow.map.
+                 * lands the main thread.
                  * (some false positives expected — these are stack-scan hits.) */
                 {
                     uint64_t* sp = (uint64_t*)ctx.Rsp;
@@ -125,15 +126,32 @@ static void dump_threads(const char* label, HMODULE self)
                         region_end = (uint64_t)mbi.BaseAddress + mbi.RegionSize;
                     int maxk = (int)((region_end - (uint64_t)sp) / 8);
                     if (maxk > 0x200000 / 8) maxk = 0x200000 / 8;   /* lifted SPU frames are big */
-                    int found = 0;
-                    for (int k = 0; k < maxk && found < 40; k++) {
-                        uint64_t v = sp[k];
-                        if (v < (uint64_t)self) continue;
-                        HMODULE mm = NULL;
-                        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                           (LPCSTR)v, &mm);
-                        if (mm == self) {
+                    for (int k = 0; k < maxk && nret < 40; k++) {
+                        const uint64_t v = sp[k];
+                        if (v >= self_lo && v < self_hi) rets[nret++] = v;
+                    }
+                }
+            }
+            ResumeThread(th);
+            CloseHandle(th);
+            if (!got_ctx) continue;
+            if ((uint64_t)ctx.Rip >= self_lo && (uint64_t)ctx.Rip < self_hi) {
+                dbg_printf( "[WATCHDOG]   tid %5lu BOOT rip rva=0x%llX\n",
+                        (unsigned long)te.th32ThreadID,
+                        (unsigned long long)(ctx.Rip - self_lo));
+            } else {
+                HMODULE m = NULL;
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)ctx.Rip, &m);
+                char path[MAX_PATH] = "?";
+                if (m) GetModuleFileNameA(m, path, sizeof path);
+                const char* base = strrchr(path, '\\');
+                dbg_printf( "[WATCHDOG]   tid %5lu in %s\n",
+                        (unsigned long)te.th32ThreadID, base ? base + 1 : path);
+            }
+            for (int r = 0; r < nret; r++) {
+                const uint64_t v = rets[r];
                             /* Resolve to the guest function containing this return
                              * address: the function_table entry with the largest host
                              * pointer <= it. A raw RVA needs symbols a release build
@@ -163,17 +181,9 @@ static void dump_threads(const char* label, HMODULE self)
                                     ? "[WATCHDOG]       tid %5lu ret rva=0x%llX  func_%08X+0x%llX\n"
                                     : "[WATCHDOG]       tid %5lu ret rva=0x%llX\n",
                                     (unsigned long)te.th32ThreadID,
-                                    (unsigned long long)(v - (uint64_t)self),
+                                    (unsigned long long)(v - self_lo),
                                     bestGuest, (unsigned long long)((uintptr_t)v - bestHost));
-                            found++;
-                        }
-                    }
-                }
             }
-            ResumeThread(th);
-            s_dbg_cap = NULL;
-            if (s_dbg_capn) dbg_printf("%s", s_dbg_capbuf);
-            CloseHandle(th);
         } while (Thread32Next(snap, &te));
     }
     if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
@@ -1577,6 +1587,7 @@ static DWORD WINAPI movie_watchdog(LPVOID)
  * the flips came back -- so the next log tells whether the input was what the game waited on. */
 extern "C" volatile unsigned long long g_pad_release_until;   /* cellPad.c */
 extern "C" volatile long g_pad_getdata_n;                      /* cellPad.c */
+extern "C" volatile long g_fs_guest_reads;                     /* ppu_fs.cpp */
 static void noflip_file_only(const char* s) { if (s_dbg_out) fputs(s, s_dbg_out); }
 static DWORD WINAPI noflip_watchdog(LPVOID)
 {
@@ -1591,6 +1602,7 @@ static DWORD WINAPI noflip_watchdog(LPVOID)
                        (LPCSTR)&noflip_watchdog, &self);
     unsigned last = 0, dumps = 0;
     ULONGLONG since = GetTickCount64(), nudged = 0, told_nudge = 0;
+    long fs_since = g_fs_guest_reads;
     int reported = 0;
     for (;;) {
         Sleep(250);
@@ -1603,6 +1615,7 @@ static DWORD WINAPI noflip_watchdog(LPVOID)
                                                        : " -- not right after the input release")
                                : (g_r2pc_paused ? " (paused meanwhile)" : ""), 10);
             last = f; since = now; reported = 0; nudged = told_nudge = 0;
+            fs_since = g_fs_guest_reads;
             continue;
         }
         if (nudged && !told_nudge && now - nudged > 3000) {
@@ -1663,10 +1676,22 @@ static DWORD WINAPI noflip_watchdog(LPVOID)
             dumps++;
         }
         fflush(stderr);
+        /* Release input only where it can matter and cannot hurt: the game must have read the pad in
+         * the last second (if it does not read input, releasing it cannot be what it waits on), and
+         * must not have read a file since the last flip (a load that shows no frame for a while is
+         * legitimate; leave it alone). */
+        const long fs_now = g_fs_guest_reads;
         if (nudge_ms && cellGcm_flip_request_count() == f && !g_r2pc_paused) {
-            nudged = GetTickCount64();
-            g_pad_release_until = nudged + nudge_ms;
-            fprintf(stderr, "[noflip] releasing all input for %u ms, as an alt-tab does (PORT_NOFLIP_NUDGE=0 off)%c", nudge_ms, 10);
+            if (pad1 == pad0)
+                fprintf(stderr, "[noflip] no input release: the game did not read the pad in that second%c", 10);
+            else if (fs_now != fs_since)
+                fprintf(stderr, "[noflip] no input release: the game read %ld file chunks since its last frame (loading)%c",
+                        fs_now - fs_since, 10);
+            else {
+                nudged = GetTickCount64();
+                g_pad_release_until = nudged + nudge_ms;
+                fprintf(stderr, "[noflip] releasing all input for %u ms, as an alt-tab does (PORT_NOFLIP_NUDGE=0 off)%c", nudge_ms, 10);
+            }
         }
     }
 }
