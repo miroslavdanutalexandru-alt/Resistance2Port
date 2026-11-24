@@ -950,6 +950,10 @@ int main(int argc, char** argv)
     if (!getenv("SPU_WWSJOB_LINK")) _putenv_s("SPU_WWSJOB_LINK", "0x35D8");
     if (!getenv("SPU_JOB_FOCUS")) _putenv_s("SPU_JOB_FOCUS", "0");
     if (!getenv("SPU_JOB_BOOST")) _putenv_s("SPU_JOB_BOOST", "0");
+    /* R2's movie player (func_006A531C) asks for the English voice tracks (20 + k) when the system language
+     * is 8..11 (Russian, Korean, Chinese), so the file layer's voice fallback must not rename them for those
+     * (lang_fallback.h). PS3_LANG_TITLE_ENGLISH=none restores 0.3.0's renaming. */
+    if (!getenv("PS3_LANG_TITLE_ENGLISH")) _putenv_s("PS3_LANG_TITLE_ENGLISH", "8-11");
     { g_sjt_link_b = (uint32_t)strtoul(getenv("SPU_WWSJOB_LINK"), 0, 0) & 0x3FFFFu; }
     { const char* e = getenv("PORT_SPU_JOB_TAGS"); if (!(e && *e == '0')) g_port_hitch_job_tag = r2_spu_job_tag; }
     g_port_hitch_site_name = r2_wait_site_name;
