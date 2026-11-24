@@ -590,7 +590,7 @@ static void dbg_prof_frame_threads(unsigned sec)
  * The sampling profiler above says WHERE eight chosen threads spend their
  * time; it cannot say which of the process's ~60 host threads are saturated,
  * or whether a "busy" thread is computing or spin-waiting. This does: every
- * PS3_THREAD_CPU seconds (default 5, 0 = off) one [thrcpu] line on stderr
+ * PS3_THREAD_CPU seconds (default 0 = off; 5 = every 5 s) one [thrcpu] line on stderr
  * with the busiest threads, and the full table in every F11 profile.
  *
  *   busy  = QueryThreadCycleTime delta / rdtsc delta (precise, includes
@@ -845,11 +845,11 @@ static DWORD WINAPI thrcpu_monitor(LPVOID param)
         cur ^= 1;
     }
 }
-/* PS3_THREAD_CPU=<seconds> (default 5; 0 = off) */
+/* PS3_THREAD_CPU=<seconds> (default 0 = off: a diagnostic; also gives the [perf] verdict lines) */
 static void thrcpu_start(void)
 {
     const char* e = getenv("PS3_THREAD_CPU");
-    const int sec = e && *e ? atoi(e) : 5;
+    const int sec = e && *e ? atoi(e) : 0;
     if (sec > 0) { HANDLE h = CreateThread(NULL, 0, thrcpu_monitor, (LPVOID)(uintptr_t)sec, 0, NULL); if (h) CloseHandle(h); }
 }
 /* The F11 / auto profile, plus the per-thread CPU table over the same window. */
@@ -1635,7 +1635,7 @@ extern "C" volatile unsigned long long g_pad_release_until;   /* cellPad.c */
 extern "C" volatile long g_pad_getdata_n;                      /* cellPad.c */
 extern "C" volatile long g_fs_guest_reads;                     /* ppu_fs.cpp */
 static void noflip_file_only(const char* s) { if (s_dbg_out) fputs(s, s_dbg_out); }
-/* RSX_STALL_DIAG_MS=<ms> (default 3000; 0 = off): polled from the noflip watchdog thread. When the RSX's
+/* RSX_STALL_DIAG_MS=<ms> (default 0 = off: a diagnostic; 3000 = the old default): polled from the noflip watchdog thread. When the RSX's
  * GET has not moved for that long while PUT is elsewhere (report #153831: the game's "GPU sit and spin
  * timeout" after ~20 min), say once per stall in run.log what the puller sits on -- decoded command at
  * GET, a jump-to-self park or a semaphore acquire with the label's value -- and the raw SPUs' state. */
@@ -1670,7 +1670,7 @@ static DWORD WINAPI noflip_watchdog(LPVOID)
     static const unsigned secs = [] { const char* e = getenv("PORT_NOFLIP_WATCHDOG"); return (e && *e) ? (unsigned)atoi(e) : 5u; }();
     static const unsigned nudge_ms = [] { const char* e = getenv("PORT_NOFLIP_NUDGE"); const int v = (e && *e) ? atoi(e) : 500;
                                           return v <= 0 ? 0u : (unsigned)(v > 5000 ? 5000 : v); }();
-    static const unsigned stall_ms = [] { const char* e = getenv("RSX_STALL_DIAG_MS"); const int v = (e && *e) ? atoi(e) : 3000;
+    static const unsigned stall_ms = [] { const char* e = getenv("RSX_STALL_DIAG_MS"); const int v = (e && *e) ? atoi(e) : 0;
                                           return v <= 0 ? 0u : (unsigned)(v < 500 ? 500 : v); }();
     if (!secs && !stall_ms) return 0;
     diag_thread_register();

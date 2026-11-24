@@ -1,5 +1,5 @@
 /*
- * ps3recomp - frame hitch logger (PORT_HITCH_LOG, default on; PORT_HITCH_LOG=0 turns it off).
+ * ps3recomp - frame hitch logger (PORT_HITCH_LOG=1 turns it on; default off, a diagnostic).
  *
  * Hot paths (game, RSX, render, mixer threads) add the time they spent in a few
  * known-blocking places to per-category accumulators: one rdtsc pair and one
@@ -186,7 +186,7 @@ static __inline uint64_t port_hitch_t0(void) { return __rdtsc(); }
 
 static __inline void port_hitch_add_ticks(int cat, int64_t d)
 {
-    if (d <= 0) return;
+    if (d <= 0 || g_port_hitch.off) return;
     _InterlockedExchangeAdd64((volatile long long*)&g_port_hitch.acc[cat], d);
     _InterlockedIncrement(&g_port_hitch.cnt[cat]);
     if (g_port_hsplit.on) {
@@ -194,6 +194,14 @@ static __inline void port_hitch_add_ticks(int cat, int64_t d)
         _InterlockedIncrement(&g_port_hsplit.cnt[cat]);
     }
     if (d > g_port_hitch.mx[cat]) g_port_hitch.mx[cat] = d;   /* racy max: diagnostics only */
+}
+
+/* PORT_HITCH_LOG=1 turns the logger on (default off). The game's main sets g_port_hitch.off from it before any
+ * thread starts, so while it is off the timed sites below cost one load and branch after their rdtsc. */
+static __inline int port_hitch_env_on(void)
+{
+    const char* e = getenv("PORT_HITCH_LOG");
+    return e && *e && *e != '0';
 }
 
 /* Time since port_hitch_t0() into a category. */
@@ -207,6 +215,7 @@ static __inline void port_hitch_end(int cat, uint64_t t0)
  * gap starts a new wait (the event count). */
 static __inline void port_hitch_poll_step(int cat, uint64_t* last)
 {
+    if (g_port_hitch.off) return;
     const uint64_t now = __rdtsc();
     const double k = g_port_hitch.tsc_per_ns;
     const int64_t d = (int64_t)(now - *last);
@@ -230,6 +239,7 @@ static __inline void port_hitch_add_ns(int cat, uint64_t ns)
 /* Longest-interval categories (PH_RSX): keeps the max only. */
 static __inline void port_hitch_max_ticks(int cat, int64_t d)
 {
+    if (g_port_hitch.off) return;
     if (d > g_port_hitch.mx[cat]) g_port_hitch.mx[cat] = d;
     _InterlockedIncrement(&g_port_hitch.cnt[cat]);
 }
@@ -286,7 +296,7 @@ static __inline void port_hitch_guest_wait(uint32_t lr, int64_t qpc)
 
 /* ------------------------------------------------------------------------- */
 /* rsx::thread CPU time by category (PORT_RSX_CPU_PROF, default off; 1 = every frame;
- * N = 1 in N; also off with PORT_HITCH_LOG=0).
+ * N = 1 in N; needs PORT_HITCH_LOG=1).
  * Exclusive time: the thread is always in exactly one category. Scopes (port_rcpu_scope) switch the current one
  * and restore the previous on exit; everything outside a scope is RC_FIFO (command decode / method handlers,
  * which also holds the FIFO-empty and semaphore-acquire waits: the summary subtracts PH_FIFOIDLE and PH_LABEL
@@ -385,7 +395,7 @@ static __inline void port_rcpu_bind(void)
 #if defined(_M_X64) || defined(__x86_64__)
     const char* e = getenv("PORT_RSX_CPU_PROF");
     const char* h = getenv("PORT_HITCH_LOG");
-    if ((e && *e == '0') || (h && *h == '0')) return;
+    if ((e && *e == '0') || !(h && *h && *h != '0')) return;
     /* unset: off (diagnostic; 1 = every frame, N >= 2: 1 in N; two rdtsc per scope cost ~0.4 ms per sampled frame
      * at 2400 draws). PORT_HITCH_RSX_SPLIT also turns it on (every frame unless this is set). */
     const char* sp = getenv("PORT_HITCH_RSX_SPLIT");
@@ -807,8 +817,7 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
     static double prev_ft = 0.0;
     if (!init) {
         init = 1;
-        const char* e = getenv("PORT_HITCH_LOG");
-        on = !(e && *e == '0');
+        on = port_hitch_env_on();
         g_port_hitch.off = !on;
         { const char* s = getenv("PORT_SPIKE_LOG"); spike_on = !(s && *s == '0'); }
         { const char* s = getenv("PORT_SPIKE_CAUSE"); cause_on = !(s && *s == '0'); }

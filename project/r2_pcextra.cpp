@@ -26,7 +26,7 @@
  *                    local IPC pipe (\\.\pipe\discord-ipc-N); silent if not running.
  *   Benchmark        R2_BENCH=1: scripted boot into the first level, measure
  *                    R2_BENCH_SECONDS, write logs\bench\R2_bench_<date>.txt, quit.
- *   Script log       R2_LUA_LOG (default 1; 0 = off): the level scripts' prt() messages
+ *   Script log       R2_LUA_LOG (default 0; 1 = on, a diagnostic): the level scripts' prt() messages
  *                    as [lua] lines (r2x_lua_prt).
  *
  * The menu, the photo-mode note, the controller-lost dialog and the crosshair are
@@ -1294,13 +1294,13 @@ extern "C" uint64_t r2x_movie_seen(uint64_t seen)
  * ("cp elevator 1 trig", "is_dead(S07_POD_ALLZMB)", "ELEVATOR AT SECOND NODE", ...) say which
  * step of a level script last ran, so a stuck objective can be placed. The hook in
  * tools/hooks/r2.json passes the string (lua_tolstring's result) here: one "[lua]" line each.
- * R2_LUA_LOG (default 1; 0 = off). Bounded: a repeat of the previous line is counted, not
+ * R2_LUA_LOG (default 0; 1 = on). Bounded: a repeat of the previous line is counted, not
  * printed; at most 20 lines a second; 5000 lines a run. */
 extern "C" int r2x_holar_prt(const char* msg);   /* r2_holar.cpp: [holar-assist] lines */
 extern "C" void r2x_lua_prt(uint64_t ea)
 {
     static int on = -1;
-    if (on < 0) { const char* e = getenv("R2_LUA_LOG"); on = !(e && (*e == '0' || !_stricmp(e, "off"))); }
+    if (on < 0) { const char* e = getenv("R2_LUA_LOG"); on = e && *e && *e != '0' && _stricmp(e, "off"); }
     const uint32_t a = (uint32_t)ea;
     if (!vm_base || a < 0x10000u || a >= 0xE0000000u) return;
     char msg[160]; size_t n = 0;

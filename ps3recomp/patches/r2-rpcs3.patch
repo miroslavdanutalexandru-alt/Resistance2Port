@@ -9394,7 +9394,7 @@ index 8f61814..68bdb39 100644
 +
 +		void ZCULL_control::r3_precise_report(u64 now)
 +		{
-+			if (!r3_precise_config().on) return;
++			static const bool r2_log = [] { const char* e = std::getenv("PORT_HITCH_LOG"); return e && *e && *e != '0'; }(); if (!r2_log || !r3_precise_config().on) return; // R2PORT: PORT_HITCH_LOG=1
 +			if (!m_pk_report_us) { m_pk_report_us = now; return; }
 +			if (now - m_pk_report_us < 5'000'000) return;
 +			u32 live = 0;
@@ -20697,7 +20697,7 @@ index 0000000..face2e6
 +				shown += st_ok && st.numFramesActuallyPresented ? st.numFramesActuallyPresented : 1;
 +			}
 +			else shown++;
-+			if (t - t0 >= 10000)
++			if (fgcfg().stats && t - t0 >= 10000) // R2_DLSS_FG_STATS=1
 +			{
 +				const double s = (t - t0) / 1000.0;
 +				fglog("DLSS-G %ux: on %.0f%% of frames | rendered %.1f fps -> presented %.1f fps | Reflex limit %u us%s%s%s",

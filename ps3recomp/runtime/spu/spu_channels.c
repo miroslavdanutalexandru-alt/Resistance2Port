@@ -1880,11 +1880,11 @@ static int s_sched_on = -1, s_sched_ms = 1, s_sched_idle_ms = SPU_SCHED_IDLE_DEF
 static SPU_THREAD_LOCAL int t_sched_quiet;   /* PORT_SPU_SCHED_IDLE_MS streak (spu_sched.h) */
 static volatile long g_sched_ms_peak;          /* longest lost-reservation timeout this 10 s window */
 static __declspec(align(64)) volatile long long g_sched_lr_sleeps, g_sched_missed;
-/* PORT_SPU_SCHED_STATS (default on; 0 = off): how long the lost-reservation
+/* PORT_SPU_SCHED_STATS (default off; 1 = on, a diagnostic): how long the lost-reservation
  * sleeps last, how many end on the timeout rather than a writer's wake, the
  * share per SPU image (the job queue workers, 403/406 in R3), and which line a
  * missed wake (a write that bypassed spu_coh_notify_write) was on -- appended
- * to the [spu-sched] 10 s line. Two QPC reads per sleep; nothing per spin. */
+ * to the [spu-sched] 10 s line, and the [spuwait] 10 s line. Two QPC reads per sleep; nothing per spin. */
 static int s_sched_stats = 0;
 static __declspec(align(64)) volatile long long g_sched_lr_qpc, g_sched_lr_tmo;
 enum { SPU_SCHED_IMGS = 8 };
@@ -1917,7 +1917,7 @@ static void spu_sched_init(void)
 {
     s_sched_ms = spu_sched_parse_ms(getenv("PORT_SPU_SCHED_MS"));
     const int on = spu_sched_parse_bool(getenv("PORT_SPU_SCHED"), 1);
-    s_sched_stats = spu_sched_parse_bool(getenv("PORT_SPU_SCHED_STATS"), 1);
+    s_sched_stats = spu_sched_parse_bool(getenv("PORT_SPU_SCHED_STATS"), 0);
     s_sched_idle_ms = spu_sched_parse_idle_ms(getenv("PORT_SPU_SCHED_IDLE_MS"));
     fprintf(stderr, "[spu-sched] PORT_SPU_SCHED=%d (lost-reservation waits re-poll every %d ms, others %d ms), stats %d (PORT_SPU_SCHED_STATS), "
                     "idle backoff to %d ms (PORT_SPU_SCHED_IDLE_MS opt-in, 0 = off)\n",
@@ -1933,6 +1933,7 @@ int spu_sched_effective(void)
 }
 static void spu_spinwait_report(void)
 {
+    if (!s_sched_stats) return;   /* PORT_SPU_SCHED_STATS=1 */
     static volatile long long s_next;
     const long long now = (long long)GetTickCount64();
     if (now < s_next) return;
