@@ -16,6 +16,9 @@ uint32_t r2rsx_get_flip_status(void) { return 0; }
 void r2rsx_set_flip_status(uint32_t s) { (void)s; }
 uint64_t r2rsx_last_flip_time(void) { return 0; }
 uint64_t r2rsx_flips_executed(void) { return UINT64_MAX; }   /* no renderer: r2_hot's frames-only fence */
+uint64_t r2rsx_occ_nw_arm(void) { return UINT64_MAX; }   /* no renderer: R2_OCC_NOWAIT stays off */
+int r2rsx_occ_nw_passed(uint64_t seq0) { (void)seq0; return -1; }
+void r2rsx_occ_nw_disarm(void) {}
 uint64_t r2rsx_vblank_count(void) { return 0; }
 uint32_t r2rsx_current_display_buffer(void) { return 0; }
 void r2rsx_set_flip_handler(uint32_t opd) { (void)opd; }

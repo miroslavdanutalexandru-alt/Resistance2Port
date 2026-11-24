@@ -39,6 +39,10 @@ void r2rsx_set_flip_status(uint32_t status);
 uint64_t r2rsx_last_flip_time(void);
 /* Flip commands rsx::thread has executed (r2_hot occlusion fence); UINT64_MAX = no RPCS3 renderer (stub, or not up). */
 uint64_t r2rsx_flips_executed(void);
+/* R2_OCC_NOWAIT catch-up fence (r2_hot): arm -> idle-pass count (UINT64_MAX = no renderer); passed: 1/0, -1 = no renderer. */
+uint64_t r2rsx_occ_nw_arm(void);
+int r2rsx_occ_nw_passed(uint64_t seq0);
+void r2rsx_occ_nw_disarm(void);
 uint64_t r2rsx_vblank_count(void);
 uint32_t r2rsx_current_display_buffer(void);
 
