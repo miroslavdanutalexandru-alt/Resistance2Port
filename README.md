@@ -663,6 +663,7 @@ When the frame rate drops, the game's own audio mixing (on the recompiled PPU/SP
 | `PS3_PPU_HW_ESTIMATE` | `1` | The PowerPC `fres` / `frsqrte` reciprocal estimates return the PS3's table values (bit for bit as RPCS3's interpreter and LLVM recompiler). `0` = the exact `1/x` and `1/sqrt(x)` of earlier builds. Logged at start: `[ppu-fp] ...`. |
 | `PS3_PPU_FMADDS_INTERP` | `0` | A/B test for the Holar Tower checkpoint. `1` = `fmadds` rounds `a*c` to double before the add, as RPCS3's PPU interpreter does (the PS3 and RPCS3's LLVM recompiler fuse them, the default). |
 | `R2_LUA_LOG` | `1` | The level scripts' progress messages (their `prt()`, silent in the retail game) as `[lua] ...` lines in `logs\run.log`; the last one shows which step a stuck level last reached. Repeats are counted, at most 20 lines a second and 5000 a run. `0` = off. |
+| `R2_HOLAR_ASSIST` | `1` | Holar Tower elevator lobby: when the crew has not reached the elevator 20 s after the script orders it there, the order is given again; if they are still not on it 45 s after the order and Hale has stood on the platform for 6 s, the ones missing are moved onto it; if the platform check still fails 10 s later, the elevator is started the way the script does. Added in memory to the retail `iceland2_seg7_b.lua` only (left alone if that file differs). Logged as `[holar-assist] ...`. `0` = off. |
 
 **Reading the log.** At start-up, `logs\run.log` shows `[audio] output: ... SoundTouch stretch (...)` with the MMCSS state and the mixer thread's affinity. Every 5 seconds there is a line like:
 
