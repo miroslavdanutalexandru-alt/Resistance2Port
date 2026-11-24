@@ -4565,9 +4565,7 @@ static void spu_indirect_branch_full(spu_context* ctx)
                 extern SPU_THREAD_LOCAL uint64_t g_spu_interp_maxsteps; extern SPU_THREAD_LOCAL int g_spu_interp_nowall;
                 extern SPU_THREAD_LOCAL int g_spu_interp_jobonly;
                 static volatile LONG n_uji = 0;
-                if (InterlockedIncrement(&n_uji) <= 16)
-                    fprintf(stderr, "[spu] img=%d ovl=%d unlifted job code at LS 0x%05X (lr=0x%05X) -- interpreting\n",
-                            ctx->image_id, (int)ctx->resident_ovl, jpc, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+                const LONG uji_n = InterlockedIncrement(&n_uji);
                 { extern void spu_lift_todo(const char*); char b[160]; int img = 0;
                   for (unsigned s = 0; s < SPU_RESIDENT_CODE_SLOTS; ++s)
                       if (ctx->resident_code[s].image_id && jpc >= ctx->resident_code[s].lsa &&
@@ -4586,6 +4584,11 @@ static void spu_indirect_branch_full(spu_context* ctx)
                       for (uint32_t k = 0; k < 32 && jpc + k < SPU_LS_SIZE && o < (int)sizeof b - 2; ++k)
                           o += snprintf(b + o, sizeof b - o, "%02X", ctx->ls[jpc + k]);
                   }
+                  /* the `entry ...` text names the module and offset to add
+                   * to tools/r2_spu_entries.json */
+                  if (uji_n <= 16)
+                      fprintf(stderr, "[spu] img=%d ovl=%d unlifted job code at LS 0x%05X (lr=0x%05X) -- interpreting [%s]\n",
+                              ctx->image_id, (int)ctx->resident_ovl, jpc, ctx->gpr[0]._u32[0] & SPU_LS_MASK, b);
                   spu_lift_todo(b); }
                 /* Identify the resident module: its C0DEC0DE magic sits at
                  * module+0x20; entry/size at module+0x10. Dump each distinct
@@ -4625,7 +4628,18 @@ static void spu_indirect_branch_full(spu_context* ctx)
                 uji_busy = 1;
                 g_spu_interp_norejoin = 1; g_spu_interp_stop_sp = 0xFFFFFFFFu; g_spu_interp_maxsteps = 0;
                 g_spu_interp_nowall = 1; g_spu_interp_jobonly = 1;
+                /* Interpretation does not hand back until the job returns to
+                 * the job manager, so everything after this pc runs here
+                 * (Bryce Canyon swarm: one switch case made img 217 ~2000x
+                 * slower). [spu-jobs] reports the time as INTERPRETED. */
+#ifdef _WIN32
+                LARGE_INTEGER uq0, uq1; QueryPerformanceCounter(&uq0);
                 spu_interp_run_until(ctx, jpc, 0);
+                QueryPerformanceCounter(&uq1);
+                { extern void spu_jobtime_interp(long long); spu_jobtime_interp(uq1.QuadPart - uq0.QuadPart); }
+#else
+                spu_interp_run_until(ctx, jpc, 0);
+#endif
                 g_spu_interp_norejoin = 0; g_spu_interp_nowall = 0; g_spu_interp_jobonly = 0;
                 uji_busy = 0;
                 ctx->pc &= SPU_LS_MASK;

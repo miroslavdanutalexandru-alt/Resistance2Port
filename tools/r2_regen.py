@@ -59,16 +59,54 @@ def placed_modules(ents):
 
 PIC_IMG = 600
 
+def pic_switch_targets(code):
+    """Case labels of the position-independent `switch` jump tables in one PIC
+    module. GCC emits, for a dense switch,
+
+        shli  rO, rI, 2 / clgti rD, rI, N / lqx + rotqby rE (table[rI])
+        a     rT, rE, rA      # rA = address of the table (PC-relative)
+        brnz  rD, default
+        bi    rT
+        .word case0 - table, ..., caseN - table   # right after the bi
+
+    The case labels are reached only through that `bi`, so --auto-functions
+    never registers them; at run time the miss went to the unlifted-job
+    interpreter, which then ran the REST of the job interpreted (Bryce Canyon
+    swarm, wwspic_DFF680/E00F00: img 217 ~66 ms per run, ~2000x slower).
+    Accepted only when the clgti bound gives the table length and every entry
+    lands on code inside the module. R2_PIC_SWITCH=0 turns it off."""
+    out = set()
+    n = len(code)
+    word = lambda a: struct.unpack_from('>I', code, a)[0]
+    for a in range(0x30, n - 8, 4):
+        if word(a) & 0xFFE00000 != 0x35000000: continue           # bi
+        cnt = None; lq = False
+        for b in range(a - 4, max(0x2C, a - 0x44), -4):
+            w = word(b)
+            if w >> 21 == 0x1C4: lq = True                          # lqx
+            if w >> 24 == 0x5C:                                     # clgti
+                i10 = (w >> 14) & 0x3FF
+                cnt = i10 + 1 if i10 < 0x200 else None
+                break
+        if not cnt or not lq or cnt > 256 or a + 4 + cnt * 4 > n: continue
+        tbl = a + 4
+        ts = [tbl + struct.unpack_from('>i', code, tbl + 4 * i)[0] for i in range(cnt)]
+        if all(0x30 <= t < n and not t & 3 for t in ts):
+            out |= set(ts)
+    return out
+
 def pic_modules(d, ents):
     """(name, va, file, size, entry offsets, image id) for every DEADDEAD-layout
     WWS plugin in the EBOOT, each lifted ONCE position-independently
     (spu_lifter.py --pic): the guest copies them to heap-dependent LS addresses,
     so per-address lifts never caught up. Entry offsets: every observed
     placement's entries rebased to the module start, plus runtime `entry pic`
-    offsets (ents[va]['pic'])."""
+    offsets (ents[va]['pic']), plus the module's switch case labels
+    (pic_switch_targets)."""
     sys.path.insert(0, HERE)
     from rpcs3_spu_map import programs
     progs, _ = programs(d)
+    switch = os.environ.get('R2_PIC_SWITCH', '1') != '0'
     out = []
     for k, s, e in progs:
         if k != 'dead': continue
@@ -79,6 +117,7 @@ def pic_modules(d, ents):
             b = int(pl, 16)
             offs |= {a - b for a in es if 0 <= a - b < e - s}
         offs |= {o for o in p.get('pic', []) if 0 <= o < e - s}
+        if switch: offs |= pic_switch_targets(d[s:e])
         out.append(('wwspic_%X' % va, va, s, e - s, sorted(offs), PIC_IMG + len(out)))
     return out
 
