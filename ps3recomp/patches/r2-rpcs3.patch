@@ -831,8 +831,263 @@ index b360209..02765bb 100644
  #define AVX512_SSE4_1_FUNC
  #define AVX512_AVX3_FUNC
  #define AVX512_ICL_FUNC
+diff --git a/rpcs3/Emu/RSX/Common/TextureUtils.cpp b/rpcs3/Emu/RSX/Common/TextureUtils.cpp
+index 41cee23..f6ed009 100644
+--- a/rpcs3/Emu/RSX/Common/TextureUtils.cpp
++++ b/rpcs3/Emu/RSX/Common/TextureUtils.cpp
+@@ -908,8 +908,13 @@ namespace rsx
+ 			false);
+ 	}
+ 
+-	texture_memory_info upload_texture_subresource(rsx::io_buffer& dst_buffer, const rsx::subresource_layout& src_layout, int format, bool is_swizzled, texture_uploader_capabilities& caps)
++	texture_memory_info upload_texture_subresource(rsx::io_buffer& dst_buffer, const rsx::subresource_layout& src_layout, int format, bool is_swizzled, texture_uploader_capabilities& caps,
++		std::vector<std::function<void()>>* deferred)
+ 	{
++		// R2PORT RSX_TEX_PAR_CONV: with a job sink the conversions below are queued instead of run (VKTexture.cpp
++		// upload_image runs them on r2_tex_par.h workers and joins before recording the copies). The destination is
++		// allocated here, on the calling thread and in the upstream order; the job only reads the source and writes it.
++#define R2_TEX_CONV(...) do { if (deferred) { dst_buffer.data(); deferred->emplace_back([=]() { __VA_ARGS__; }); } else { __VA_ARGS__; } } while (0)
+ 		u16 w = src_layout.width_in_block;
+ 		u16 h = src_layout.height_in_block;
+ 		u16 depth = src_layout.depth;
+@@ -937,13 +942,13 @@ namespace rsx
+ 
+ 		case CELL_GCM_TEXTURE_COMPRESSED_B8R8_G8R8:
+ 		{
+-			copy_decoded_rb_rg_block::copy_mipmap_level<true>(dst_buffer.as_span<u32>(), src_layout.data.as_span<const u32>(), w, h, depth, get_row_pitch_in_block<u32>(src_layout.width_in_texel, caps.alignment), src_layout.pitch_in_block);
++			R2_TEX_CONV(copy_decoded_rb_rg_block::copy_mipmap_level<true>(dst_buffer.as_span<u32>(), src_layout.data.as_span<const u32>(), w, h, depth, get_row_pitch_in_block<u32>(src_layout.width_in_texel, caps.alignment), src_layout.pitch_in_block));
+ 			break;
+ 		}
+ 
+ 		case CELL_GCM_TEXTURE_COMPRESSED_R8B8_R8G8:
+ 		{
+-			copy_decoded_rb_rg_block::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const u32>(), w, h, depth, get_row_pitch_in_block<u32>(src_layout.width_in_texel, caps.alignment), src_layout.pitch_in_block);
++			R2_TEX_CONV(copy_decoded_rb_rg_block::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const u32>(), w, h, depth, get_row_pitch_in_block<u32>(src_layout.width_in_texel, caps.alignment), src_layout.pitch_in_block));
+ 			break;
+ 		}
+ 
+@@ -951,9 +956,9 @@ namespace rsx
+ 		case CELL_GCM_TEXTURE_R6G5B5:
+ 		{
+ 			if (is_swizzled)
+-				copy_rgb655_block_swizzled::copy_mipmap_level(dst_buffer.as_span<u16>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u16>(w, caps.alignment));
++				R2_TEX_CONV(copy_rgb655_block_swizzled::copy_mipmap_level(dst_buffer.as_span<u16>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u16>(w, caps.alignment)));
+ 			else
+-				copy_rgb655_block::copy_mipmap_level(dst_buffer.as_span<u16>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u16>(w, caps.alignment), src_layout.pitch_in_block);
++				R2_TEX_CONV(copy_rgb655_block::copy_mipmap_level(dst_buffer.as_span<u16>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u16>(w, caps.alignment), src_layout.pitch_in_block));
+ 			break;
+ 		}
+ 
+@@ -967,49 +972,49 @@ namespace rsx
+ 		case CELL_GCM_TEXTURE_R6G5B5:
+ 		{
+ 			if (is_swizzled)
+-				convert_16_block_32_swizzled::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), &convert_rgb655_to_bgra8);
++				R2_TEX_CONV(convert_16_block_32_swizzled::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), &convert_rgb655_to_bgra8));
+ 			else
+-				convert_16_block_32::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block, &convert_rgb655_to_bgra8);
++				R2_TEX_CONV(convert_16_block_32::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block, &convert_rgb655_to_bgra8));
+ 			break;
+ 		}
+ 		case CELL_GCM_TEXTURE_D1R5G5B5:
+ 		{
+ 			if (is_swizzled)
+-				convert_16_block_32_swizzled::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), &convert_d1rgb5_to_bgra8);
++				R2_TEX_CONV(convert_16_block_32_swizzled::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), &convert_d1rgb5_to_bgra8));
+ 			else
+-				convert_16_block_32::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block, &convert_d1rgb5_to_bgra8);
++				R2_TEX_CONV(convert_16_block_32::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block, &convert_d1rgb5_to_bgra8));
+ 			break;
+ 		}
+ 		case CELL_GCM_TEXTURE_A1R5G5B5:
+ 		{
+ 			if (is_swizzled)
+-				convert_16_block_32_swizzled::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), &convert_a1rgb5_to_bgra8);
++				R2_TEX_CONV(convert_16_block_32_swizzled::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), &convert_a1rgb5_to_bgra8));
+ 			else
+-				convert_16_block_32::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block, &convert_a1rgb5_to_bgra8);
++				R2_TEX_CONV(convert_16_block_32::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block, &convert_a1rgb5_to_bgra8));
+ 			break;
+ 		}
+ 		case CELL_GCM_TEXTURE_A4R4G4B4:
+ 		{
+ 			if (is_swizzled)
+-				convert_16_block_32_swizzled::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), &convert_argb4_to_bgra8);
++				R2_TEX_CONV(convert_16_block_32_swizzled::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), &convert_argb4_to_bgra8));
+ 			else
+-				convert_16_block_32::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block, &convert_argb4_to_bgra8);
++				R2_TEX_CONV(convert_16_block_32::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block, &convert_argb4_to_bgra8));
+ 			break;
+ 		}
+ 		case CELL_GCM_TEXTURE_R5G5B5A1:
+ 		{
+ 			if (is_swizzled)
+-				convert_16_block_32_swizzled::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), &convert_rgb5a1_to_bgra8);
++				R2_TEX_CONV(convert_16_block_32_swizzled::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), &convert_rgb5a1_to_bgra8));
+ 			else
+-				convert_16_block_32::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block, &convert_rgb5a1_to_bgra8);
++				R2_TEX_CONV(convert_16_block_32::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block, &convert_rgb5a1_to_bgra8));
+ 			break;
+ 		}
+ 		case CELL_GCM_TEXTURE_R5G6B5:
+ 		{
+ 			if (is_swizzled)
+-				convert_16_block_32_swizzled::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), &convert_rgb565_to_bgra8);
++				R2_TEX_CONV(convert_16_block_32_swizzled::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), &convert_rgb565_to_bgra8));
+ 			else
+-				convert_16_block_32::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block, &convert_rgb565_to_bgra8);
++				R2_TEX_CONV(convert_16_block_32::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u16>>(), w, h, depth, src_layout.border, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block, &convert_rgb565_to_bgra8));
+ 			break;
+ 		}
+ #endif
+@@ -1066,7 +1071,7 @@ namespace rsx
+ 		{
+ 			if (!caps.supports_dxt)
+ 			{
+-				copy_decoded_bc1_block::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const u64>(), w, h, depth, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block);
++				R2_TEX_CONV(copy_decoded_bc1_block::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const u64>(), w, h, depth, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block));
+ 				break;
+ 			}
+ 
+@@ -1078,7 +1083,7 @@ namespace rsx
+ 				// PS3 uses the Nvidia VTC memory layout for compressed 3D textures.
+ 				// This is only supported using Nvidia OpenGL.
+ 				// Remove the VTC tiling to support ATI and Vulkan.
+-				copy_unmodified_block_vtc::copy_mipmap_level(dst_buffer.as_span<u64>(), src_layout.data.as_span<const u64>(), w, h, depth, get_row_pitch_in_block<u64>(w, caps.alignment), src_layout.pitch_in_block);
++				R2_TEX_CONV(copy_unmodified_block_vtc::copy_mipmap_level(dst_buffer.as_span<u64>(), src_layout.data.as_span<const u64>(), w, h, depth, get_row_pitch_in_block<u64>(w, caps.alignment), src_layout.pitch_in_block));
+ 				break;
+ 			}
+ 
+@@ -1086,7 +1091,7 @@ namespace rsx
+ 			{
+ 				// In this case, hardware expects us to feed it a VTC input, but on PS3 we only have a linear one.
+ 				// We need to compress the 2D-planar DXT input into a VTC output
+-				copy_linear_block_to_vtc::copy_mipmap_level(dst_buffer.as_span<u64>(), src_layout.data.as_span<const u64>(), w, h, depth, get_row_pitch_in_block<u64>(w, caps.alignment), src_layout.pitch_in_block);
++				R2_TEX_CONV(copy_linear_block_to_vtc::copy_mipmap_level(dst_buffer.as_span<u64>(), src_layout.data.as_span<const u64>(), w, h, depth, get_row_pitch_in_block<u64>(w, caps.alignment), src_layout.pitch_in_block));
+ 				break;
+ 			}
+ 
+@@ -1097,7 +1102,7 @@ namespace rsx
+ 				break;
+ 			}
+ 
+-			copy_unmodified_block::copy_mipmap_level(dst_buffer.as_span<u64>(), src_layout.data.as_span<const u64>(), 1, w, h, depth, 0, get_row_pitch_in_block<u64>(w, caps.alignment), src_layout.pitch_in_block);
++			R2_TEX_CONV(copy_unmodified_block::copy_mipmap_level(dst_buffer.as_span<u64>(), src_layout.data.as_span<const u64>(), 1, w, h, depth, 0, get_row_pitch_in_block<u64>(w, caps.alignment), src_layout.pitch_in_block));
+ 			break;
+ 		}
+ 
+@@ -1105,7 +1110,7 @@ namespace rsx
+ 		{
+ 			if (!caps.supports_dxt)
+ 			{
+-				copy_decoded_bc2_block::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const x128>(), w, h, depth, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block);
++				R2_TEX_CONV(copy_decoded_bc2_block::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const x128>(), w, h, depth, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block));
+ 				break;
+ 			}
+ 			[[fallthrough]];
+@@ -1114,7 +1119,7 @@ namespace rsx
+ 		{
+ 			if (!caps.supports_dxt)
+ 			{
+-				copy_decoded_bc3_block::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const x128>(), w, h, depth, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block);
++				R2_TEX_CONV(copy_decoded_bc3_block::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const x128>(), w, h, depth, get_row_pitch_in_block<u32>(w, caps.alignment), src_layout.pitch_in_block));
+ 				break;
+ 			}
+ 
+@@ -1128,11 +1133,11 @@ namespace rsx
+ 				// Remove the VTC tiling to support ATI and Vulkan.
+ 				if (src_layout.data.is_naturally_aligned<u128>())
+ 				{
+-					copy_unmodified_block_vtc::copy_mipmap_level(dst_buffer.as_span<u128>(), src_layout.data.as_span<const u128>(), w, h, depth, get_row_pitch_in_block<u128>(w, caps.alignment), src_layout.pitch_in_block);
++					R2_TEX_CONV(copy_unmodified_block_vtc::copy_mipmap_level(dst_buffer.as_span<u128>(), src_layout.data.as_span<const u128>(), w, h, depth, get_row_pitch_in_block<u128>(w, caps.alignment), src_layout.pitch_in_block));
+ 					break;
+ 				}
+ 
+-				copy_unmodified_block_vtc::copy_mipmap_level(dst_buffer.as_span<x128>(), src_layout.data.as_span<const x128>(), w, h, depth, get_row_pitch_in_block<u128>(w, caps.alignment), src_layout.pitch_in_block);
++				R2_TEX_CONV(copy_unmodified_block_vtc::copy_mipmap_level(dst_buffer.as_span<x128>(), src_layout.data.as_span<const x128>(), w, h, depth, get_row_pitch_in_block<u128>(w, caps.alignment), src_layout.pitch_in_block));
+ 				break;
+ 			}
+ 
+@@ -1142,11 +1147,11 @@ namespace rsx
+ 				// We need to compress the 2D-planar DXT input into a VTC output
+ 				if (src_layout.data.is_naturally_aligned<u128>())
+ 				{
+-					copy_linear_block_to_vtc::copy_mipmap_level(dst_buffer.as_span<u128>(), src_layout.data.as_span<const u128>(), w, h, depth, get_row_pitch_in_block<u128>(w, caps.alignment), src_layout.pitch_in_block);
++					R2_TEX_CONV(copy_linear_block_to_vtc::copy_mipmap_level(dst_buffer.as_span<u128>(), src_layout.data.as_span<const u128>(), w, h, depth, get_row_pitch_in_block<u128>(w, caps.alignment), src_layout.pitch_in_block));
+ 					break;
+ 				}
+ 
+-				copy_linear_block_to_vtc::copy_mipmap_level(dst_buffer.as_span<x128>(), src_layout.data.as_span<const x128>(), w, h, depth, get_row_pitch_in_block<u128>(w, caps.alignment), src_layout.pitch_in_block);
++				R2_TEX_CONV(copy_linear_block_to_vtc::copy_mipmap_level(dst_buffer.as_span<x128>(), src_layout.data.as_span<const x128>(), w, h, depth, get_row_pitch_in_block<u128>(w, caps.alignment), src_layout.pitch_in_block));
+ 				break;
+ 			}
+ 
+@@ -1159,11 +1164,11 @@ namespace rsx
+ 
+ 			if (src_layout.data.is_naturally_aligned<u128>())
+ 			{
+-				copy_unmodified_block::copy_mipmap_level(dst_buffer.as_span<u128>(), src_layout.data.as_span<const u128>(), 1, w, h, depth, 0, get_row_pitch_in_block<u128>(w, caps.alignment), src_layout.pitch_in_block);
++				R2_TEX_CONV(copy_unmodified_block::copy_mipmap_level(dst_buffer.as_span<u128>(), src_layout.data.as_span<const u128>(), 1, w, h, depth, 0, get_row_pitch_in_block<u128>(w, caps.alignment), src_layout.pitch_in_block));
+ 				break;
+ 			}
+ 
+-			copy_unmodified_block::copy_mipmap_level(dst_buffer.as_span<x128>(), src_layout.data.as_span<const x128>(), 1, w, h, depth, 0, get_row_pitch_in_block<u128>(w, caps.alignment), src_layout.pitch_in_block);
++			R2_TEX_CONV(copy_unmodified_block::copy_mipmap_level(dst_buffer.as_span<x128>(), src_layout.data.as_span<const x128>(), 1, w, h, depth, 0, get_row_pitch_in_block<u128>(w, caps.alignment), src_layout.pitch_in_block));
+ 			break;
+ 		}
+ 
+@@ -1198,15 +1203,15 @@ namespace rsx
+ 			}
+ 			else if (word_size == 1)
+ 			{
+-				copy_unmodified_block::copy_mipmap_level(dst_buffer.as_span<u8>(), src_layout.data.as_span<const u8>(), words_per_block, w, h, depth, src_layout.border, dst_pitch_in_block, src_layout.pitch_in_block);
++				R2_TEX_CONV(copy_unmodified_block::copy_mipmap_level(dst_buffer.as_span<u8>(), src_layout.data.as_span<const u8>(), words_per_block, w, h, depth, src_layout.border, dst_pitch_in_block, src_layout.pitch_in_block));
+ 			}
+ 			else if (word_size == 2)
+ 			{
+-				copy_unmodified_block::copy_mipmap_level(dst_buffer.as_span<u16>(), src_layout.data.as_span<const u16>(), words_per_block, w, h, depth, src_layout.border, dst_pitch_in_block, src_layout.pitch_in_block);
++				R2_TEX_CONV(copy_unmodified_block::copy_mipmap_level(dst_buffer.as_span<u16>(), src_layout.data.as_span<const u16>(), words_per_block, w, h, depth, src_layout.border, dst_pitch_in_block, src_layout.pitch_in_block));
+ 			}
+ 			else if (word_size == 4)
+ 			{
+-				copy_unmodified_block::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const u32>(), words_per_block, w, h, depth, src_layout.border, dst_pitch_in_block, src_layout.pitch_in_block);
++				R2_TEX_CONV(copy_unmodified_block::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const u32>(), words_per_block, w, h, depth, src_layout.border, dst_pitch_in_block, src_layout.pitch_in_block));
+ 			}
+ 
+ 			return result;
+@@ -1215,24 +1220,25 @@ namespace rsx
+ 		if (word_size == 1)
+ 		{
+ 			ensure(is_swizzled);
+-			copy_unmodified_block_swizzled::copy_mipmap_level(dst_buffer.as_span<u8>(), src_layout.data.as_span<const u8>(), words_per_block, w, h, depth, src_layout.border, dst_pitch_in_block);
++			R2_TEX_CONV(copy_unmodified_block_swizzled::copy_mipmap_level(dst_buffer.as_span<u8>(), src_layout.data.as_span<const u8>(), words_per_block, w, h, depth, src_layout.border, dst_pitch_in_block));
+ 		}
+ 		else if (word_size == 2)
+ 		{
+ 			if (is_swizzled)
+-				copy_unmodified_block_swizzled::copy_mipmap_level(dst_buffer.as_span<u16>(), src_layout.data.as_span<const be_t<u16>>(), words_per_block, w, h, depth, src_layout.border, dst_pitch_in_block);
++				R2_TEX_CONV(copy_unmodified_block_swizzled::copy_mipmap_level(dst_buffer.as_span<u16>(), src_layout.data.as_span<const be_t<u16>>(), words_per_block, w, h, depth, src_layout.border, dst_pitch_in_block));
+ 			else
+-				copy_unmodified_block::copy_mipmap_level(dst_buffer.as_span<u16>(), src_layout.data.as_span<const be_t<u16>>(), words_per_block, w, h, depth, src_layout.border, dst_pitch_in_block, src_layout.pitch_in_block);
++				R2_TEX_CONV(copy_unmodified_block::copy_mipmap_level(dst_buffer.as_span<u16>(), src_layout.data.as_span<const be_t<u16>>(), words_per_block, w, h, depth, src_layout.border, dst_pitch_in_block, src_layout.pitch_in_block));
+ 		}
+ 		else if (word_size == 4)
+ 		{
+ 			if (is_swizzled)
+-				copy_unmodified_block_swizzled::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u32>>(), words_per_block, w, h, depth, src_layout.border, dst_pitch_in_block);
++				R2_TEX_CONV(copy_unmodified_block_swizzled::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u32>>(), words_per_block, w, h, depth, src_layout.border, dst_pitch_in_block));
+ 			else
+-				copy_unmodified_block::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u32>>(), words_per_block, w, h, depth, src_layout.border, dst_pitch_in_block, src_layout.pitch_in_block);
++				R2_TEX_CONV(copy_unmodified_block::copy_mipmap_level(dst_buffer.as_span<u32>(), src_layout.data.as_span<const be_t<u32>>(), words_per_block, w, h, depth, src_layout.border, dst_pitch_in_block, src_layout.pitch_in_block));
+ 		}
+ 
+ 		return result;
++#undef R2_TEX_CONV
+ 	}
+ 
+ 	bool is_compressed_host_format(const texture_uploader_capabilities& caps, u32 texture_format)
 diff --git a/rpcs3/Emu/RSX/Common/TextureUtils.h b/rpcs3/Emu/RSX/Common/TextureUtils.h
-index 4205e71..26a9948 100644
+index 4205e71..d03070a 100644
 --- a/rpcs3/Emu/RSX/Common/TextureUtils.h
 +++ b/rpcs3/Emu/RSX/Common/TextureUtils.h
 @@ -236,6 +236,7 @@ namespace rsx
@@ -843,6 +1098,16 @@ index 4205e71..26a9948 100644
  
  		u32 src_gcm_format = 0;
  		u32 dst_gcm_format = 0;
+@@ -357,7 +358,8 @@ namespace rsx
+ 	std::vector<subresource_layout> get_subresources_layout(const rsx::context* ctx, const rsx::vertex_texture &texture);
+ 	std::vector<subresource_layout> get_subresources_layout(const image_section_attributes_t& attrs, texture_dimension_extended type);
+ 
+-	texture_memory_info upload_texture_subresource(rsx::io_buffer& dst_buffer, const subresource_layout &src_layout, int format, bool is_swizzled, texture_uploader_capabilities& caps);
++	texture_memory_info upload_texture_subresource(rsx::io_buffer& dst_buffer, const subresource_layout &src_layout, int format, bool is_swizzled, texture_uploader_capabilities& caps,
++		std::vector<std::function<void()>>* deferred = nullptr); // R2PORT RSX_TEX_PAR_CONV: queue the CPU conversion instead of running it
+ 
+ 	u8 get_format_block_size_in_bytes(int format);
+ 	u8 get_format_block_size_in_texel(int format);
 diff --git a/rpcs3/Emu/RSX/Common/r2_hd_ui.h b/rpcs3/Emu/RSX/Common/r2_hd_ui.h
 new file mode 100644
 index 0000000..6f6ec5a
@@ -1416,6 +1681,244 @@ index 0000000..6f6ec5a
 +		return true;
 +	}
 +}
+diff --git a/rpcs3/Emu/RSX/Common/r2_tex_par.h b/rpcs3/Emu/RSX/Common/r2_tex_par.h
+new file mode 100644
+index 0000000..5d14805
+--- /dev/null
++++ b/rpcs3/Emu/RSX/Common/r2_tex_par.h
+@@ -0,0 +1,232 @@
++#pragma once
++// R2PORT RSX_TEX_PAR_CONV (experimental, default off): the CPU side of one texture upload (VKTexture.cpp upload_image) - the
++// upload_texture_subresource conversions of its mip levels / faces / layers and the guest-memory snapshots of its
++// zero-copy levels - runs on a small worker pool instead of one after another on rsx::thread. Every destination slice
++// of the upload heap is still reserved on rsx::thread in the same order as before, the workers only read guest memory
++// (through the unprotected sudo mapping or host memory) and write their own slice, and rsx::thread joins the pool
++// before it records any copy command of that upload. Same bytes, same heap offsets, same command stream; guest memory
++// is still read inside the same upload_image call.
++//   RSX_TEX_PAR_CONV=1          on (default off: the conversions are memory-bandwidth bound, a pool gained ~0-15%
++//                               in a standalone benchmark and lost on 4 MB copies; unset/0 = upstream order)
++//   RSX_TEX_PAR_THREADS=<n>     threads including rsx::thread (default min(4, logical CPUs / 3), 1 = off)
++//   RSX_TEX_PAR_MIN_KB=<kb>     uploads with less guest data stay on rsx::thread (default 256)
++//   RSX_TEX_PAR_SPIN_US=<us>    workers poll this long for the next job before sleeping (default 200)
++// No RPCS3 dependencies; port_rt_cpu_auth-style bool parsing (0/off/false/no = off).
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <exception>
++#include <functional>
++#include <mutex>
++#include <thread>
++#include <vector>
++#include <emmintrin.h>
++
++namespace r2texpar
++{
++	struct config
++	{
++		bool on = false;
++		unsigned threads = 1;          // including the calling thread
++		std::size_t min_bytes = 256 * 1024;
++		unsigned spin_us = 200;        // workers poll this long after a job before sleeping
++	};
++
++	inline bool parse_off(const char* e)
++	{
++		if (!e) return false;
++		while (*e == ' ' || *e == '\t') e++;
++		std::size_t n = std::strlen(e);
++		while (n && (e[n - 1] == ' ' || e[n - 1] == '\t' || e[n - 1] == '\r' || e[n - 1] == '\n')) n--;
++		const auto is = [&](const char* w)
++		{
++			if (std::strlen(w) != n) return false;
++			for (std::size_t i = 0; i < n; i++)
++				if ((e[i] | 0x20) != w[i] && e[i] != w[i]) return false;
++			return true;
++		};
++		return is("0") || is("off") || is("false") || is("no");
++	}
++
++	inline const config& cfg()
++	{
++		static const config c = []
++		{
++			config r;
++			const char* e = std::getenv("RSX_TEX_PAR_CONV");
++			r.on = e && *e && !parse_off(e);
++			const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
++			r.threads = std::clamp(hw / 3, 1u, 4u);
++			if (const char* t = std::getenv("RSX_TEX_PAR_THREADS"))
++			{
++				const int v = std::atoi(t);
++				if (v >= 1) r.threads = std::min(static_cast<unsigned>(v), 16u);
++			}
++			if (const char* m = std::getenv("RSX_TEX_PAR_MIN_KB"))
++			{
++				const long v = std::atol(m);
++				if (v >= 0) r.min_bytes = static_cast<std::size_t>(v) * 1024;
++			}
++			if (const char* m = std::getenv("RSX_TEX_PAR_SPIN_US"))
++			{
++				const long v = std::atol(m);
++				if (v >= 0) r.spin_us = static_cast<unsigned>(std::min(v, 100000L));
++			}
++			if (r.threads < 2) r.on = false;
++			return r;
++		}();
++		return c;
++	}
++
++	// One upload's jobs. Lives on the caller's stack until run() returns.
++	struct batch
++	{
++		std::vector<std::function<void()>> jobs;
++		std::atomic<std::size_t> next{ 0 };
++		std::atomic<int> helpers{ 0 };       // helpers that took a ticket and have not left yet
++		std::mutex err_lock;
++		std::exception_ptr err;
++
++		void work()
++		{
++			for (;;)
++			{
++				const std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
++				if (i >= jobs.size()) return;
++				try
++				{
++					jobs[i]();
++				}
++				catch (...)
++				{
++					std::lock_guard lk(err_lock);
++					if (!err) err = std::current_exception();
++				}
++			}
++		}
++	};
++
++	class pool
++	{
++		std::mutex m_lock;
++		std::condition_variable m_cv;
++		std::deque<batch*> m_tickets;
++		std::vector<std::thread> m_workers;
++		std::atomic<int> m_pending{ 0 };   // tickets in m_tickets (spinning workers poll this, not the lock)
++		int m_sleepers = 0;                // workers blocked on m_cv (under m_lock)
++
++		// Under m_lock
++		batch* take_locked()
++		{
++			batch* b = m_tickets.front();
++			m_tickets.pop_front();
++			m_pending.fetch_sub(1, std::memory_order_relaxed);
++			b->helpers.fetch_add(1, std::memory_order_acq_rel);
++			return b;
++		}
++
++		void worker_main()
++		{
++			const auto spin = std::chrono::microseconds(cfg().spin_us);
++			for (;;)
++			{
++				// Uploads come in bursts: poll for a while after each job before sleeping, since a condition-variable
++				// wake costs about as much as copying a few hundred KB
++				batch* b = nullptr;
++				const auto until = std::chrono::steady_clock::now() + spin;
++				for (unsigned i = 0; !b; i++)
++				{
++					if (m_pending.load(std::memory_order_relaxed) > 0)
++					{
++						std::lock_guard lk(m_lock);
++						if (!m_tickets.empty()) b = take_locked();
++						continue;
++					}
++					if ((i & 63) == 63 && std::chrono::steady_clock::now() >= until)
++					{
++						std::unique_lock lk(m_lock);
++						m_sleepers++;
++						m_cv.wait(lk, [&] { return !m_tickets.empty(); });
++						m_sleepers--;
++						b = take_locked();
++						break;
++					}
++					_mm_pause();
++				}
++				b->work();
++				b->helpers.fetch_sub(1, std::memory_order_acq_rel); // b may be gone after this
++			}
++		}
++
++	public:
++		explicit pool(unsigned helpers)
++		{
++			for (unsigned i = 0; i < helpers; i++)
++				m_workers.emplace_back([this] { worker_main(); });
++			for (auto& t : m_workers) t.detach(); // never joined: the pool lives for the whole process
++		}
++
++		unsigned helpers() const { return static_cast<unsigned>(m_workers.size()); }
++
++		// Runs every job of b (calling thread included) and returns when all of them finished. Rethrows the first
++		// exception a job threw, on the calling thread.
++		void run(batch& b)
++		{
++			const std::size_t n = b.jobs.size();
++			const unsigned want = static_cast<unsigned>(std::min<std::size_t>(helpers(), n ? n - 1 : 0));
++			int sleepers = 0;
++			if (want)
++			{
++				std::lock_guard lk(m_lock);
++				for (unsigned i = 0; i < want; i++) m_tickets.push_back(&b);
++				m_pending.fetch_add(static_cast<int>(want), std::memory_order_relaxed);
++				sleepers = m_sleepers;
++			}
++			if (sleepers == 1 || (sleepers && want == 1)) m_cv.notify_one(); else if (sleepers) m_cv.notify_all();
++
++			b.work();
++
++			if (want)
++			{
++				// Tickets no worker took yet are withdrawn; then wait for the helpers still finishing a job
++				std::lock_guard lk(m_lock);
++				const auto it = std::remove(m_tickets.begin(), m_tickets.end(), &b);
++				m_pending.fetch_sub(static_cast<int>(m_tickets.end() - it), std::memory_order_relaxed);
++				m_tickets.erase(it, m_tickets.end());
++			}
++			for (unsigned spin = 0; b.helpers.load(std::memory_order_acquire) != 0; spin++)
++			{
++				if (spin < 2000) _mm_pause(); else std::this_thread::yield();
++			}
++
++			if (b.err) std::rethrow_exception(b.err);
++		}
++	};
++
++	inline pool& get_pool()
++	{
++		static pool* p = new pool(cfg().threads - 1); // leaked on purpose: no join at process exit
++		return *p;
++	}
++
++	// Splits a plain copy into chunks of at least 256 KB so one large level spreads over the pool.
++	inline void push_copy(batch& b, void* dst, const void* src, std::size_t len)
++	{
++		constexpr std::size_t chunk = 256 * 1024;
++		const unsigned parts = static_cast<unsigned>(std::clamp<std::size_t>(len / chunk, 1, cfg().threads));
++		const std::size_t step = (len / parts + 63) & ~std::size_t(63);
++		for (std::size_t off = 0; off < len; off += step)
++		{
++			const std::size_t l = std::min(step, len - off);
++			auto* d = static_cast<std::uint8_t*>(dst) + off;
++			auto* s = static_cast<const std::uint8_t*>(src) + off;
++			b.jobs.emplace_back([d, s, l] { std::memcpy(d, s, l); });
++		}
++	}
++}
 diff --git a/rpcs3/Emu/RSX/Common/r3_flush_keep_newer.h b/rpcs3/Emu/RSX/Common/r3_flush_keep_newer.h
 new file mode 100644
 index 0000000..78bca09
@@ -1645,7 +2148,7 @@ index 0000000..964f1e1
 +	}
 +}
 diff --git a/rpcs3/Emu/RSX/Common/ring_buffer_helper.h b/rpcs3/Emu/RSX/Common/ring_buffer_helper.h
-index 0e71b96..aacc233 100644
+index 0e71b96..926f789 100644
 --- a/rpcs3/Emu/RSX/Common/ring_buffer_helper.h
 +++ b/rpcs3/Emu/RSX/Common/ring_buffer_helper.h
 @@ -2,6 +2,7 @@
@@ -1656,7 +2159,17 @@ index 0e71b96..aacc233 100644
  
  namespace rsx
  {
-@@ -81,6 +82,7 @@ namespace rsx
+@@ -78,9 +79,17 @@ namespace rsx
+ 		data_heap(const data_heap&) = delete;
+ 		data_heap(data_heap&&) = delete;
+ 
++		// R2PORT RSX_TEX_PAR_CONV: whether alloc<Alignment>(size) fits without grow() (which unmaps the heap)
++		template<int Alignment>
++		bool r2_fits(usz size) const
++		{
++			return can_alloc<Alignment>(size);
++		}
++
  		void init(usz heap_size, const char* buffer_name = nullptr, usz min_guard_size = 0x10000)
  		{
  			m_name = const_cast<char*>(buffer_name ? buffer_name : "<unnamed>");
@@ -1664,7 +2177,7 @@ index 0e71b96..aacc233 100644
  
  			m_size = heap_size;
  			m_put_pos = 0;
-@@ -151,11 +153,13 @@ namespace rsx
+@@ -151,11 +160,13 @@ namespace rsx
  		inline void set_get_pos(usz value)
  		{
  			m_get_pos = value;
@@ -9095,6 +9608,34 @@ index c33ad4c..ff8671b 100644
  
  		// Access to this method must be externally synchronized.
  		// Offloader is guaranteed to never call this for async flushes.
+diff --git a/rpcs3/Emu/RSX/VK/VKCompute.cpp b/rpcs3/Emu/RSX/VK/VKCompute.cpp
+index b7dd795..5b90546 100644
+--- a/rpcs3/Emu/RSX/VK/VKCompute.cpp
++++ b/rpcs3/Emu/RSX/VK/VKCompute.cpp
+@@ -3,6 +3,7 @@
+ #include "VKRenderPass.h"
+ #include "vkutils/buffer_object.h"
+ #include "VKPipelineCompiler.h"
++#include "../../../../../../include/ps3emu/port_hitch.h" // R2PORT: [spike] tex-upload cs-compile
+ 
+ #define VK_MAX_COMPUTE_TASKS 8192   // Max number of jobs per frame
+ 
+@@ -114,6 +115,7 @@ namespace vk
+ 	{
+ 		if (!m_program)
+ 		{
++			const uint64_t r2_t0 = port_hitch_t0(); // R2PORT: [spike] tex-upload cs-compile (port_hitch.h g_port_texsplit)
+ 			m_shader.create(::glsl::program_domain::glsl_compute_program, m_src);
+ 			auto handle = m_shader.compile();
+ 
+@@ -130,6 +132,7 @@ namespace vk
+ 
+ 			auto compiler = vk::get_pipe_compiler();
+ 			m_program = compiler->compile(create_info, vk::pipe_compiler::COMPILE_INLINE, {}, get_inputs());
++			_InterlockedExchangeAdd64(reinterpret_cast<volatile long long*>(&g_port_texsplit.cs_mono), static_cast<long long>(port_hitch_t0() - r2_t0));
+ 		}
+ 
+ 		bind_resources(cmd);
 diff --git a/rpcs3/Emu/RSX/VK/VKCompute.h b/rpcs3/Emu/RSX/VK/VKCompute.h
 index 44cc1c6..83421ed 100644
 --- a/rpcs3/Emu/RSX/VK/VKCompute.h
@@ -42299,10 +42840,10 @@ index 0000000..109bf25
 +	}
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKTexture.cpp b/rpcs3/Emu/RSX/VK/VKTexture.cpp
-index ac91c2e..3be1b49 100644
+index ac91c2e..a6488ae 100644
 --- a/rpcs3/Emu/RSX/VK/VKTexture.cpp
 +++ b/rpcs3/Emu/RSX/VK/VKTexture.cpp
-@@ -1,1631 +1,1871 @@
+@@ -1,1631 +1,1956 @@
 -#include "stdafx.h"
 -#include "VKAsyncScheduler.h"
 -#include "VKCompute.h"
@@ -43949,6 +44490,7 @@ index ac91c2e..3be1b49 100644
 +#include "../GCM.h"
 +#include "../Utils/rsx_utils.h"
 +#include "../Common/r3_rt_cpu_auth.h"
++#include "../Common/r2_tex_par.h"
 +#include "../Host/MM.h"
 +#include "../../../../../../include/ps3emu/port_hitch.h" // R2PORT: [spike] depth scale copy counts
 +#include "Utilities/deferred_op.hpp"
@@ -45243,12 +45785,65 @@ index ac91c2e..3be1b49 100644
 +		std::vector<std::pair<VkBuffer, u32>> upload_commands;
 +		copy_regions.reserve(subresource_layout.size());
 +
++		// R2PORT: [spike] tex-upload split (port_hitch.h g_port_texsplit), from here (prepare_for_transfer counts as rec)
++		const bool r2_timed = !g_port_hitch.off;
++		const auto r2_now = [r2_timed]() -> s64 { return r2_timed ? static_cast<s64>(port_hitch_t0()) : 0; };
++		const s64 r2_t_begin = r2_now();
++		const s64 r2_cs_begin = g_port_texsplit.cs_mono;
++
 +		auto& cmd2 = prepare_for_transfer(cmd, dst_image, image_setup_flags);
++
++		// R2PORT: RSX_TEX_PAR_CONV (Common/r2_tex_par.h): the CPU conversions / guest snapshots of this upload are queued
++		// while the loop below reserves their upload-heap slices in the usual order, and run on the worker pool at r2_join
++		// (before the copy commands are recorded, or before a heap grow would unmap their destination).
++		s64 r2_conv = 0, r2_heap = 0, r2_mm = 0;
++		u64 r2_bytes = 0;
++		int r2_grew = 0;
++		bool r2_par = false;
++		r2texpar::batch r2_jobs;
++		std::vector<std::function<void()>>* r2_sink = nullptr;
++		{
++			// Only sources that cannot fault (host memory, or guest memory through the unprotected sudo mapping) go to workers
++			bool safe = !(image_setup_flags & source_is_gpu_resident) && !upload_heap.has_shadow();
++			const u64 sudo = reinterpret_cast<u64>(vm::g_sudo_addr);
++			for (const auto& layout : subresource_layout)
++			{
++				const auto [ptr, size] = layout.data.raw();
++				if (image_setup_flags & source_is_gpu_resident) break; // (buffer, offset), no CPU source
++				const u64 p = reinterpret_cast<u64>(ptr);
++				r2_bytes += size;
++				if (size && !(image_setup_flags & source_is_userptr) && !(p >= sudo && p - sudo + size <= 0x1'0000'0000ull)) safe = false;
++			}
++			const auto& pc = r2texpar::cfg();
++			if (pc.on && safe && r2_bytes >= pc.min_bytes) r2_sink = &r2_jobs.jobs;
++		}
++		const auto r2_join = [&]()
++		{
++			if (r2_jobs.jobs.empty()) return;
++			const s64 t0 = r2_now();
++			r2_par |= r2_jobs.jobs.size() > 1;
++			r2texpar::get_pool().run(r2_jobs);
++			r2_jobs.jobs.clear();
++			r2_jobs.next = 0;
++			r2_conv += r2_now() - t0;
++		};
++		const auto r2_heap_alloc = [&](usz size) -> usz
++		{
++			if (!r2_jobs.jobs.empty() && !upload_heap.r2_fits<512>(size)) r2_join();
++			const s64 t0 = r2_now();
++			const auto* before = upload_heap.heap.get();
++			const usz off = upload_heap.alloc<512>(size);
++			r2_grew += upload_heap.heap.get() != before;
++			r2_heap += r2_now() - t0;
++			return off;
++		};
 +
 +		// R2PORT RSX_GUEST_SRC_MMFLUSH: the section protection queued by create_new_texture takes effect before guest memory is read
 +		if (!(image_setup_flags & (source_is_gpu_resident | source_is_userptr)))
 +		{
++			const s64 t0 = r2_now();
 +			guest_src_mm_flush_layouts(subresource_layout);
++			r2_mm += r2_now() - t0;
 +		}
 +
 +		for (const rsx::subresource_layout &layout : subresource_layout)
@@ -45288,13 +45883,18 @@ index ac91c2e..3be1b49 100644
 +				}
 +
 +				// Map with extra padding bytes in case of realignment
-+				offset_in_upload_buffer = upload_heap.alloc<512>(image_linear_size + 8);
++				offset_in_upload_buffer = r2_heap_alloc(image_linear_size + 8);
 +				void* mapped_buffer = upload_heap.map(offset_in_upload_buffer, image_linear_size + 8);
 +				return { mapped_buffer, image_linear_size };
 +			};
 +
 +			auto io_buf = rsx::io_buffer(buf_allocator);
-+			opt = upload_texture_subresource(io_buf, layout, format, is_swizzled, caps);
++			{
++				const s64 t0 = r2_now(), heap0 = r2_heap, conv0 = r2_conv;
++				opt = upload_texture_subresource(io_buf, layout, format, is_swizzled, caps, r2_sink);
++				// conversion = the call minus the heap allocation inside it (a join inside it is conversion time already)
++				r2_conv = conv0 + (r2_now() - t0) - (r2_heap - heap0);
++			}
 +			upload_heap.unmap();
 +
 +			if (image_setup_flags & source_is_gpu_resident)
@@ -45347,9 +45947,24 @@ index ac91c2e..3be1b49 100644
 +				const bool s_guest_src = rsx::detile_guest_src_enabled();
 +				if (s_guest_src)
 +				{
-+					guest_src_mm_flush(static_cast<u32>(src_address), data_length);
-+					offset_in_upload_buffer = upload_heap.alloc<512>(data_length);
-+					std::memcpy(upload_heap.map(offset_in_upload_buffer, data_length), vm::get_super_ptr<const u8>(static_cast<u32>(src_address)), data_length);
++					{
++						const s64 t0 = r2_now();
++						guest_src_mm_flush(static_cast<u32>(src_address), data_length);
++						r2_mm += r2_now() - t0;
++					}
++					offset_in_upload_buffer = r2_heap_alloc(data_length);
++					void* const snap_dst = upload_heap.map(offset_in_upload_buffer, data_length);
++					const u8* const snap_src = vm::get_super_ptr<const u8>(static_cast<u32>(src_address));
++					if (r2_sink)
++					{
++						r2texpar::push_copy(r2_jobs, snap_dst, snap_src, data_length);
++					}
++					else
++					{
++						const s64 t0 = r2_now();
++						std::memcpy(snap_dst, snap_src, data_length);
++						r2_conv += r2_now() - t0;
++					}
 +					upload_heap.unmap();
 +					upload_buffer = upload_heap.heap.get();
 +				}
@@ -45393,7 +46008,9 @@ index ac91c2e..3be1b49 100644
 +						scratch_buf_size += (image_linear_size * 5) / 4;
 +					}
 +
++					const s64 t0 = r2_now();
 +					scratch_buf = vk::get_scratch_buffer(cmd2, scratch_buf_size, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
++					r2_heap += r2_now() - t0;
 +					buffer_copies.reserve(subresource_layout.size());
 +				}
 +
@@ -45447,6 +46064,9 @@ index ac91c2e..3be1b49 100644
 +		}
 +
 +		ensure(upload_buffer);
++
++		// R2PORT RSX_TEX_PAR_CONV: every queued conversion / snapshot is written before any copy reading it is recorded
++		r2_join();
 +
 +		if (opt.require_swap || opt.require_deswizzle || requires_depth_processing)
 +		{
@@ -45526,6 +46146,12 @@ index ac91c2e..3be1b49 100644
 +		if (auto rsxthr = static_cast<VKGSRender*>(rsx::get_current_render_backend()))
 +		{
 +			rsxthr->on_guest_texture_read(cmd2);
++		}
++
++		if (r2_timed)
++		{
++			port_texsplit_add(r2_conv, r2_heap, r2_mm, g_port_texsplit.cs_mono - r2_cs_begin, r2_now() - r2_t_begin,
++				static_cast<s64>(r2_bytes), r2_par, r2_grew);
 +		}
 +	}
 +

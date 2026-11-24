@@ -122,6 +122,45 @@ __declspec(selectany) port_hitch_jobmax_state g_port_hitch_jobmax = {};
 __declspec(selectany) port_hitch_jobmax_state g_port_hitch_jobmax = { 0 };
 #endif
 
+/* [spike] tex-upload split: where the time of the texture uploads (VKTexture.cpp upload_image, rsx::thread) went
+ * since the last frame, in TSC ticks. conv = CPU conversion / guest-memory snapshot into the upload heap (with
+ * RSX_TEX_PAR_CONV, the wall time the thread spent dispatching and joining the workers), heap = upload-heap and
+ * scratch-buffer allocation (a heap grow syncs DMA and creates a new buffer), mm = applying the queued page
+ * protection before the guest read (RSX_GUEST_SRC_MMFLUSH), cs = compute-shader pipelines compiled on first use
+ * (deswizzle / byteswap variants), total = the whole upload_image call; rec = total minus the rest (command
+ * recording, barriers, layout transitions). mx_* = the split of the longest upload (racy, diagnostics only).
+ * cs_mono is never reset (VKCompute.cpp adds every compute compile; upload_image takes the delta).
+ * Separate from g_port_hitch so the shared state's layout does not change. */
+typedef struct port_texsplit_state {
+    volatile int64_t conv, heap, mm, cs, total, bytes;
+    volatile long    n, par, grows;
+    volatile int64_t mx_total, mx_conv, mx_heap, mx_mm, mx_cs, mx_bytes;
+    volatile int64_t cs_mono;
+} port_texsplit_state;
+#ifdef __cplusplus
+__declspec(selectany) port_texsplit_state g_port_texsplit = {};
+#else
+__declspec(selectany) port_texsplit_state g_port_texsplit = { 0 };
+#endif
+
+static __inline void port_texsplit_add(int64_t conv, int64_t heap, int64_t mm, int64_t cs, int64_t total, int64_t bytes,
+                                       int par, int grew)
+{
+    _InterlockedExchangeAdd64((volatile long long*)&g_port_texsplit.conv, conv);
+    _InterlockedExchangeAdd64((volatile long long*)&g_port_texsplit.heap, heap);
+    _InterlockedExchangeAdd64((volatile long long*)&g_port_texsplit.mm, mm);
+    _InterlockedExchangeAdd64((volatile long long*)&g_port_texsplit.cs, cs);
+    _InterlockedExchangeAdd64((volatile long long*)&g_port_texsplit.total, total);
+    _InterlockedExchangeAdd64((volatile long long*)&g_port_texsplit.bytes, bytes);
+    _InterlockedIncrement(&g_port_texsplit.n);
+    if (par) _InterlockedIncrement(&g_port_texsplit.par);
+    if (grew) _InterlockedExchangeAdd(&g_port_texsplit.grows, grew);
+    if (total > g_port_texsplit.mx_total) {
+        g_port_texsplit.mx_conv = conv; g_port_texsplit.mx_heap = heap; g_port_texsplit.mx_mm = mm;
+        g_port_texsplit.mx_cs = cs; g_port_texsplit.mx_bytes = bytes; g_port_texsplit.mx_total = total;
+    }
+}
+
 /* PORT_HITCH_RSX_SPLIT (default off; 1 = rsx::thread flip intervals over 25 ms, <ms> >= 5 = that threshold): a
  * "[hitch] rsx flip" line per long flip-to-flip interval of rsx::thread (the [hitch] line only has its length,
  * rsx-iv): the rsx-cpu split of that interval (PORT_RSX_CPU_PROF, forced to every frame unless set), the thread's
@@ -858,6 +897,32 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
         const int64_t q = _InterlockedExchange64((volatile long long*)&g_port_hitch_jobmax.qpc, 0);
         if (q > 0) { jmax_ms = (double)q * 1000.0 / (double)qf.QuadPart; jmax_img = g_port_hitch_jobmax.img; }
     }
+    /* tex-upload split since the last frame (g_port_texsplit) */
+    enum { TS_CONV, TS_HEAP, TS_MM, TS_CS, TS_TOTAL, TS_N };
+    double ts[TS_N] = {}, tsx[TS_N] = {}, ts_mb = 0.0, tsx_kb = 0.0;
+    long ts_n = 0, ts_par = 0, ts_grows = 0;
+    static double sm_ts[TS_N] = {}, sm_ts_mb = 0.0, sm_tsx[TS_N] = {}, sm_tsx_kb = 0.0;
+    static long sm_ts_n = 0, sm_ts_par = 0, sm_ts_grows = 0;
+    {
+        volatile int64_t* const src[TS_N] = { &g_port_texsplit.conv, &g_port_texsplit.heap, &g_port_texsplit.mm,
+                                              &g_port_texsplit.cs, &g_port_texsplit.total };
+        volatile int64_t* const srcx[TS_N] = { &g_port_texsplit.mx_conv, &g_port_texsplit.mx_heap, &g_port_texsplit.mx_mm,
+                                               &g_port_texsplit.mx_cs, &g_port_texsplit.mx_total };
+        const double f = k > 0.0 ? 1.0 / (k * 1e6) : 0.0;
+        for (int i = 0; i < TS_N; i++) ts[i] = (double)_InterlockedExchange64((volatile long long*)src[i], 0) * f;
+        /* the longest upload: mx_total last, so the writer's next compare starts from 0 */
+        for (int i = 0; i < TS_N; i++) tsx[i] = (double)_InterlockedExchange64((volatile long long*)srcx[i], 0) * f;
+        ts_mb = (double)_InterlockedExchange64((volatile long long*)&g_port_texsplit.bytes, 0) / (1024.0 * 1024.0);
+        tsx_kb = (double)_InterlockedExchange64((volatile long long*)&g_port_texsplit.mx_bytes, 0) / 1024.0;
+        ts_n = _InterlockedExchange(&g_port_texsplit.n, 0);
+        ts_par = _InterlockedExchange(&g_port_texsplit.par, 0);
+        ts_grows = _InterlockedExchange(&g_port_texsplit.grows, 0);
+        if (ts_n && !discard) {
+            for (int i = 0; i < TS_N; i++) sm_ts[i] += ts[i];
+            if (tsx[TS_TOTAL] > sm_tsx[TS_TOTAL]) { for (int i = 0; i < TS_N; i++) sm_tsx[i] = tsx[i]; sm_tsx_kb = tsx_kb; }
+            sm_ts_mb += ts_mb; sm_ts_n += ts_n; sm_ts_par += ts_par; sm_ts_grows += ts_grows;
+        }
+    }
     /* CPU time the frame-loop thread actually ran: "game" minus this = preempted / not scheduled */
     double cpu_ms = -1.0;
     {
@@ -1012,6 +1077,16 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
                                   " ads %ld present %ld hard-sync %ld other %ld | depth scale copies: direct %ld carrier %ld\n",
                         cnt[PH_SW_BINDDMA], cnt[PH_SW_AV], cnt[PH_SW_ZHINT], cnt[PH_SW_ZHARD], cnt[PH_SW_BLIT], cnt[PH_SW_LABEL],
                         cnt[PH_SW_ADS], cnt[PH_SW_PRESENT], cnt[PH_SW_HARD], cnt[PH_SW_OTHER], cnt[PH_DSDIRECT], cnt[PH_DSCARRIER]);
+                if (ts_n) {
+                    const double rec = (std::max)(0.0, ts[TS_TOTAL] - ts[TS_CONV] - ts[TS_HEAP] - ts[TS_MM] - ts[TS_CS]);
+                    const double xrec = (std::max)(0.0, tsx[TS_TOTAL] - tsx[TS_CONV] - tsx[TS_HEAP] - tsx[TS_MM] - tsx[TS_CS]);
+                    port_log_async(1, "[spike] tex-upload %.1f ms/%ld (conv %.1f / heap-wait %.1f / mm-protect %.1f / cs-compile %.1f"
+                                      " / rec %.1f) %.1f MB, %ld parallel, %ld heap grows | longest %.1f ms (conv %.1f heap %.1f mm %.1f"
+                                      " cs %.1f rec %.1f, %.0f KB)\n",
+                            ts[TS_TOTAL], ts_n, ts[TS_CONV], ts[TS_HEAP], ts[TS_MM], ts[TS_CS], rec, ts_mb, ts_par, ts_grows,
+                            tsx[TS_TOTAL], tsx[TS_CONV], tsx[TS_HEAP], tsx[TS_MM], tsx[TS_CS], xrec, tsx_kb);
+                }
+
             }
         } else dropped++;
     }
@@ -1097,6 +1172,17 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
             port_log_async(1, "[spike] causes 5 s: %u frames >= %.0f ms, largest frame-loop part: %s (PORT_SPIKE_CAUSE=0 off)\n",
                     ctally_frames, cause_ms, ts);
         }
+        if (sm_ts_n) {
+            const double rec = (std::max)(0.0, sm_ts[TS_TOTAL] - sm_ts[TS_CONV] - sm_ts[TS_HEAP] - sm_ts[TS_MM] - sm_ts[TS_CS]);
+            const double xrec = (std::max)(0.0, sm_tsx[TS_TOTAL] - sm_tsx[TS_CONV] - sm_tsx[TS_HEAP] - sm_tsx[TS_MM] - sm_tsx[TS_CS]);
+            port_log_async(1, "[spike] tex-upload 5 s: %.1f ms/%ld (conv %.1f / heap-wait %.1f / mm-protect %.1f / cs-compile %.1f"
+                              " / rec %.1f) %.1f MB, %ld parallel (RSX_TEX_PAR_CONV), %ld heap grows | longest %.1f ms (conv %.1f"
+                              " heap %.1f mm %.1f cs %.1f rec %.1f, %.0f KB)\n",
+                    sm_ts[TS_TOTAL], sm_ts_n, sm_ts[TS_CONV], sm_ts[TS_HEAP], sm_ts[TS_MM], sm_ts[TS_CS], rec, sm_ts_mb, sm_ts_par,
+                    sm_ts_grows, sm_tsx[TS_TOTAL], sm_tsx[TS_CONV], sm_tsx[TS_HEAP], sm_tsx[TS_MM], sm_tsx[TS_CS], xrec, sm_tsx_kb);
+        }
+        for (int i = 0; i < TS_N; i++) { sm_ts[i] = 0.0; sm_tsx[i] = 0.0; }
+        sm_ts_mb = sm_tsx_kb = 0.0; sm_ts_n = sm_ts_par = sm_ts_grows = 0;
         nctally = 0; ctally_frames = 0; cause_lines = 0;
         sm_game = sm_gw = sm_cpu = sm_fifo = sm_label = sm_zcull = sm_hard = sm_rlim = sm_sub = sm_lim = 0.0;
         sm_mrsx = sm_ring = sm_av = 0.0;
