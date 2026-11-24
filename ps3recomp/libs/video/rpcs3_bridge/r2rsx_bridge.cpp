@@ -1437,6 +1437,34 @@ extern "C" uint32_t r2rsx_occ_spec_pending(void)
 	return n;
 }
 
+// PORT: R2_OCC_NOWAIT catch-up fence (RSXZCULL.h guest_wait_state nw_*). The guest answered occlusion sets without
+// consuming their reports; they can still land after the game zeroed and reused the slots. arm() asks rsx::thread to
+// report FIFO-idle passes and returns the pass count now (UINT64_MAX when the renderer is not up). passed(seq0) = 1 once
+// two idle passes followed (the second one saw every command the guest had put before arm() executed, so every report
+// issued before it is claimed) and every claim up to that pass is written; 0 not yet; -1 renderer not up.
+extern "C" uint64_t r2rsx_occ_nw_arm(void)
+{
+	if (!s_up) return UINT64_MAX;
+	auto& gw = rsx::reports::g_guest_wait;
+	gw.nw_want.store(1, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	return gw.nw_idle_seq.load(std::memory_order_acquire);
+}
+
+extern "C" int r2rsx_occ_nw_passed(uint64_t seq0)
+{
+	if (!s_up) return -1;
+	auto& gw = rsx::reports::g_guest_wait;
+	if (gw.nw_idle_seq.load(std::memory_order_acquire) < seq0 + 2) return 0;
+	const u64 need = gw.nw_idle_claims.load(std::memory_order_relaxed);
+	return gw.nw_done.load(std::memory_order_acquire) >= need ? 1 : 0;
+}
+
+extern "C" void r2rsx_occ_nw_disarm(void)
+{
+	if (s_up) rsx::reports::g_guest_wait.nw_want.store(0, std::memory_order_relaxed);
+}
+
 extern "C" uint32_t r2rsx_current_display_buffer(void)
 {
 	return s_up ? s_render->get_context()->current_display_buffer : 0;

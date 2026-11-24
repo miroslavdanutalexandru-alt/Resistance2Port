@@ -667,6 +667,9 @@ extern "C" void r2rsx_occ_guest_wait(uint32_t ea);            /* rpcs3_bridge: R
 extern "C" int r2rsx_occ_guest_wait_stats(uint64_t out[11]);  /* rpcs3_bridge: 0 when off */
 extern "C" int r2rsx_occ_spec_arm(uint32_t ea);               /* rpcs3_bridge: RSX_OCC_SPEC_VISIBLE report fence */
 extern "C" uint32_t r2rsx_occ_spec_pending(void);
+extern "C" uint64_t r2rsx_occ_nw_arm(void);                   /* rpcs3_bridge: R2_OCC_NOWAIT catch-up fence */
+extern "C" int r2rsx_occ_nw_passed(uint64_t seq0);
+extern "C" void r2rsx_occ_nw_disarm(void);
 namespace {
 int g_occ_init = 0;
 int g_occ_gw = 1;     /* RSX_ZCULL_GUEST_WAIT */
@@ -696,6 +699,13 @@ int g_sp_mark = 0;                /* global unproven period: every set read is w
 uint32_t g_sp_mark_frame = 0, g_sp_settle_frame = 0;
 int g_sp_settling = 0;
 std::atomic<long long> g_sp_avoided{0}, g_sp_forced{0}, g_sp_refused{0}, g_sp_mwait{0}, g_sp_episodes{0}, g_sp_mframes{0};
+int g_nw_on = 0;               /* R2_OCC_NOWAIT (see occ_nw_drain) */
+long long g_nw_us = 2000;      /* R2_OCC_NOWAIT_US */
+long long g_nw_drain_us = 100000;   /* R2_OCC_NOWAIT_DRAIN_MS */
+int g_nw_pend = 0, g_nw_fail = 0;   /* main thread only */
+uint32_t g_nw_frame = 0, g_nw_try_frame = 0;
+std::atomic<long long> g_nw_skips{0}, g_nw_budget_ok{0}, g_nw_periods{0}, g_nw_drains{0}, g_nw_drain_ns{0}, g_nw_drain_max_ns{0},
+    g_nw_drain_to{0}, g_nw_forced{0};
 
 inline uint32_t ld_be32(uint32_t ea) { uint32_t v; memcpy(&v, vm_base + ea, 4); return _byteswap_ulong(v); }
 inline uint16_t ld_be16(uint32_t ea) { uint16_t v; memcpy(&v, vm_base + ea, 2); return _byteswap_ushort(v); }
@@ -774,6 +784,17 @@ void occ_report()
                         "unproven frames %lld: sets forced visible %lld, native waits %lld (RSX_OCC_SPEC_VISIBLE=1, need %d)\n",
                 a - la, ep - le, rf - lrf, mf - lmf, fo - lf, mw - lmw, g_sp_need);
         la = a; lf = fo; lrf = rf; lmw = mw; le = ep; lmf = mf;
+    }
+    if (g_nw_on || g_nw_skips.load()) {
+        static long long lsk, lbo, lpe, ldr, ldn, lto, lfo;
+        const long long sk = g_nw_skips.load(), bo = g_nw_budget_ok.load(), pe = g_nw_periods.load(), dr = g_nw_drains.load(),
+                        dn = g_nw_drain_ns.load(), to = g_nw_drain_to.load(), fo = g_nw_forced.load();
+        const long long mx = g_nw_drain_max_ns.exchange(0);
+        fprintf(stderr, "[occ] nowait 10 s: late sets drawn visible %lld in %lld frames, in within %lld us %lld; drains %lld "
+                        "(%.2f ms avg, max %.2f ms, timeouts %lld), sets visible while undrained %lld (R2_OCC_NOWAIT=%d)\n",
+                sk - lsk, pe - lpe, g_nw_us, bo - lbo, dr - ldr, dr - ldr ? (double)(dn - ldn) / 1e6 / (double)(dr - ldr) : 0.0,
+                (double)mx / 1e6, to - lto, fo - lfo, g_nw_on);
+        lsk = sk; lbo = bo; lpe = pe; ldr = dr; ldn = dn; lto = to; lfo = fo;
     }
     occ_gw_report();
 }
@@ -921,6 +942,43 @@ void sp_update_mark(uint32_t frame)
     if (!g_sp_settling) { g_sp_settling = 1; g_sp_settle_frame = frame; return; }
     if (frame - g_sp_settle_frame >= 2) { g_sp_mark = 0; g_sp_settling = 0; }
 }
+
+/* ---- R2_OCC_NOWAIT (default 1; R2_OCC_BLOCKING=1 and RSX_OCC_SPEC_VISIBLE=0 only) --------------------------------
+   Frame S: a per-object set (caller 0x001723C8; =2 also the global set 0x0026C1E0) whose last report is still not
+   written after R2_OCC_NOWAIT_US (default 2000) is answered at once with r2_occ_write_visible (every flag 1 -- the
+   object is drawn and the depth test hides it if it really is occluded; never hidden). Sets that are ready in S keep
+   their exact results (nothing stale can exist yet). The skipped reports can still land after the game zeroed and
+   reused their slots (scratch\cpu_occ.md "Popping root cause"), so at the FIRST set read of frame S+1 the main thread
+   drains the RSX once (occ_nw_drain): it waits until rsx::thread has executed every command put so far and every
+   report claimed by then is written. No game reset runs during that wait, so afterwards every slot holds its last
+   issued report (writes are in order) and the game's own wait/results are exact again from that read on. A drain that
+   does not finish in R2_OCC_NOWAIT_DRAIN_MS (default 100) answers that frame visible and retries next frame; after 3
+   failed drains in a row no new sets are skipped. =0: the old blocking wait, exactly. */
+int occ_nw_drain(long long* ns_out)   /* 0 passed, 1 timed out, -1 no RPCS3 renderer */
+{
+    LARGE_INTEGER f, q0, q; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&q0);
+    const uint64_t seq0 = r2rsx_occ_nw_arm();
+    if (seq0 == UINT64_MAX) { *ns_out = 0; return -1; }
+    const long long lim = g_nw_drain_us * f.QuadPart / 1000000;
+    int r;
+    for (unsigned i = 0;; i++) {
+        const int p = r2rsx_occ_nw_passed(seq0);
+        if (p) { r = p > 0 ? 0 : -1; break; }
+        QueryPerformanceCounter(&q);
+        if (q.QuadPart - q0.QuadPart >= lim) { r = 1; break; }
+        if (i < 64) _mm_pause();
+        else if (q.QuadPart - q0.QuadPart < f.QuadPart / 5000 || !occ_timer()) SwitchToThread();
+        else {
+            LARGE_INTEGER due; due.QuadPart = -300;
+            if (SetWaitableTimer(occ_timer(), &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(occ_timer(), 5);
+            else SwitchToThread();
+        }
+    }
+    r2rsx_occ_nw_disarm();
+    QueryPerformanceCounter(&q);
+    *ns_out = (q.QuadPart - q0.QuadPart) * 1000000000 / f.QuadPart;
+    return r;
+}
 }  // namespace
 
 extern "C" int r2_occ_wait(ppu_context* ctx)
@@ -954,6 +1012,24 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
         g_occ_fence = env_int("R2_OCC_FENCE_FLIPS", 3);
         if (g_occ_fence < 1) g_occ_fence = 1;
         g_occ_gw = env_int("RSX_ZCULL_GUEST_WAIT", 1) != 0;
+        {
+            const int nw = env_int("R2_OCC_NOWAIT", 1);
+            g_nw_on = (g_occ_block == 1 && !g_sp_on) ? (nw < 0 ? 0 : nw > 2 ? 2 : nw) : 0;
+            const char* u = getenv("R2_OCC_NOWAIT_US");
+            g_nw_us = (u && *u) ? atoll(u) : 2000;
+            if (g_nw_us < 0) g_nw_us = 0;
+            long long dm = env_int("R2_OCC_NOWAIT_DRAIN_MS", 100);
+            if (dm < 1) dm = 1;
+            g_nw_drain_us = dm * 1000;
+            if (g_nw_on)
+                fprintf(stderr, "[occ] R2_OCC_NOWAIT=%d: an occlusion set still late after %lld us (R2_OCC_NOWAIT_US) is drawn "
+                                "visible instead of stalling the frame (%s); the next frame drains the RSX once (<= %lld ms, "
+                                "R2_OCC_NOWAIT_DRAIN_MS) so results stay exact. 0 = the game's own wait\n",
+                        g_nw_on, g_nw_us, g_nw_on == 2 ? "per-object and global sets" : "per-object sets 0x001723C8",
+                        g_nw_drain_us / 1000);
+            else if (nw)
+                fprintf(stderr, "[occ] R2_OCC_NOWAIT: off (needs R2_OCC_BLOCKING=1 and RSX_OCC_SPEC_VISIBLE=0)\n");
+        }
         g_occ_init = 1;
         if (m && !_stricmp(m, "partial"))
             fprintf(stderr, "[occ] R2_OCC_SKIP_MODE=partial is not available (a pending report's slot can hold another "
@@ -968,7 +1044,7 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
             fprintf(stderr, "[occ] R2_OCC_SYNC_SITES: sets read from caller 0x%08X are never skipped\n", g_occ_sync_lr[i]);
         g_occ_next.store(GetTickCount64() + 10000);
     }
-    if (g_occ_us < 0 && !g_occ_skip && !g_occ_gw && !g_sp_on) return 0;
+    if (g_occ_us < 0 && !g_occ_skip && !g_occ_gw && !g_sp_on && !g_nw_on && !g_nw_pend) return 0;
     const bool lifted_only = g_occ_us < 0 && !g_occ_skip;   /* R2_OCC_BLOCKING=1: count + RSX_ZCULL_GUEST_WAIT, then the lifted body */
 
     /* same address arithmetic as the lifted entry; anything unexpected runs the lifted body */
@@ -1051,6 +1127,56 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
             }
             h->real = 1;
             return 0;
+        }
+        if (g_nw_on || g_nw_pend) {   /* R2_OCC_NOWAIT (see occ_nw_drain) */
+            const uint32_t frame = ld_be32(gs + 0x6C);
+            if (g_nw_pend && frame != g_nw_frame) {
+                if (g_nw_try_frame != frame) {   /* first read of a later frame: one drain */
+                    g_nw_try_frame = frame;
+                    long long dns = 0;
+                    const int r = occ_nw_drain(&dns);
+                    g_nw_drain_ns.fetch_add(dns, std::memory_order_relaxed);
+                    if (dns > g_nw_drain_max_ns.load(std::memory_order_relaxed)) g_nw_drain_max_ns.store(dns, std::memory_order_relaxed);
+                    if (r == 0) { g_nw_pend = 0; g_nw_fail = 0; g_nw_drains.fetch_add(1, std::memory_order_relaxed); }
+                    else if (r < 0) {
+                        g_nw_pend = 0; g_nw_on = 0;
+                        fprintf(stderr, "[occ] R2_OCC_NOWAIT: no RPCS3 renderer fence, off\n");
+                    } else {
+                        g_nw_drain_to.fetch_add(1, std::memory_order_relaxed);
+                        if (++g_nw_fail >= 3 && g_nw_on) {
+                            g_nw_on = 0;
+                            fprintf(stderr, "[occ] R2_OCC_NOWAIT: %d drains in a row timed out (%lld ms): no new sets skipped\n",
+                                    g_nw_fail, g_nw_drain_us / 1000);
+                        }
+                    }
+                }
+                if (g_nw_pend) {   /* not drained yet: a ready report may be a stale late write */
+                    if (r2_occ_write_visible(obj, b, count, list, nullptr)) {
+                        g_nw_forced.fetch_add(1, std::memory_order_relaxed);
+                        return 1;
+                    }
+                    return 0;
+                }
+            }
+            const uint32_t site_lr = (uint32_t)ctx->lr;
+            if (!*ts && g_nw_on && (site_lr == 0x001723C8u || (g_nw_on == 2 && site_lr == 0x0026C1E0u)) &&
+                (!g_nw_pend || frame == g_nw_frame)) {
+                g_occ_waited.fetch_add(1, std::memory_order_relaxed);
+                r2rsx_occ_guest_wait(rep);
+                if (g_nw_us > 0 && !occ_native_wait(ts, g_nw_us)) {
+                    g_nw_budget_ok.fetch_add(1, std::memory_order_relaxed);
+                    return 0;   /* in within the budget: the lifted body reads the exact results */
+                }
+                long long pend = 0;
+                if (r2_occ_write_visible(obj, b, count, list, &pend)) {
+                    if (!g_nw_pend) g_nw_periods.fetch_add(1, std::memory_order_relaxed);
+                    g_nw_pend = 1; g_nw_frame = frame;
+                    g_nw_skips.fetch_add(1, std::memory_order_relaxed);
+                    g_occ_pend.fetch_add(pend, std::memory_order_relaxed);
+                    return 1;
+                }
+                return 0;   /* layout unexpected: the lifted wait */
+            }
         }
         if (*ts) g_occ_ready.fetch_add(1, std::memory_order_relaxed);
         else {
