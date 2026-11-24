@@ -6,6 +6,7 @@
 #else
 #include "VKR2FrameGenLogic.h"
 #include "VKR2DeformLogic.h"
+#include "VKR2DlssQuality.h"
 #endif
 #include <algorithm>
 #include <cctype>
@@ -426,6 +427,32 @@ static void test_pair_nearest()
 	calls = 0;
 	CHECK(run(std::vector<double>(40, 9.0), 20, 16, 10, nullptr, &calls) == -1 && calls == 32);
 }
+
+// R2_FG_CAM_SANITY bit 1: the world's (widest) depth range, not the weapon's, among the well-used transforms
+static void test_s_pick_wide()
+{
+	pdq_s_tally t{};
+	CHECK(pdq_s_pick_wide(&t) == -1);
+	const auto put = [&](unsigned k, float sz, float n, float f, unsigned cnt, unsigned dw)
+	{
+		for (int i = 0; i < 8; ++i) t.v[k][i] = 0.f;
+		t.v[k][4] = sz; t.v[k][6] = n; t.v[k][7] = f;
+		t.n[k] = cnt; t.dw[k] = dw;
+		t.cnt = std::max(t.cnt, k + 1);
+	};
+	put(0, 1.f, 0.f, 1.f, 900, 900);  // world
+	put(1, 0.2f, 0.f, 0.2f, 40, 30);  // weapon, drawn last
+	CHECK(pdq_s_pick_wide(&t) == 0);
+	put(1, 0.2f, 0.f, 0.2f, 900, 900);
+	CHECK(pdq_s_pick_wide(&t) == 0);  // the weapon dominating still loses to the full range
+	put(2, 4.f, 0.f, 4.f, 10, 10);    // a rare odd range (< 1/8 of the top depth writes): ignored
+	CHECK(pdq_s_pick_wide(&t) == 0);
+	put(0, 1.f, 0.f, 1.f, 900, 0);    // no depth writes: not eligible
+	CHECK(pdq_s_pick_wide(&t) == 1);
+	put(1, 0.f, 0.f, 0.f, 0, 0);
+	put(2, 0.f, 0.f, 0.f, 0, 0);
+	CHECK(pdq_s_pick_wide(&t) == -1); // no depth-writing draw: caller keeps its transform
+}
 #endif
 
 int main()
@@ -440,6 +467,7 @@ int main()
 	test_deform();
 	test_vp_pick();
 	test_pair_nearest();
+	test_s_pick_wide();
 #endif
 	std::printf("fg_logic_test: %d checks, %d failed\n", g_checks, g_fail);
 	return g_fail ? 1 : 0;

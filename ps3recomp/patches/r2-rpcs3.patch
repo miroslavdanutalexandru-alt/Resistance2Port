@@ -14975,10 +14975,10 @@ index 0000000..eaec754
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2DlssQuality.h b/rpcs3/Emu/RSX/VK/VKR2DlssQuality.h
 new file mode 100644
-index 0000000..55d726f
+index 0000000..2a10de8
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2DlssQuality.h
-@@ -0,0 +1,912 @@
+@@ -0,0 +1,935 @@
 +/* port_dlss_quality.h -- pure (no GPU / no OS) helpers for three opt-in DLSS quality items, shared by the
 + * Resistance ports (same file in R1 ps3recomp\libs\video, R2/R3 RPCS3 Emu\RSX\VK\VKR2DlssQuality.h) and unit-tested
 + * by scratch\dlss_quality\test_dlss_quality.cpp. C99 and C++ compatible, header only.
@@ -15873,6 +15873,29 @@ index 0000000..55d726f
 +    {
 +        if (!t->n[k]) continue;
 +        if (b < 0 || t->dw[k] > t->dw[b] || (t->dw[k] == t->dw[b] && t->n[k] > t->n[b])) b = (int)k;
++    }
++    return b;
++}
++
++/* R2_FG_CAM_SANITY bit 1: slot of the world camera's transform, the widest depth range (|sz|, then |far - near|)
++   among the transforms at least 1/8 as many depth-writing draws used as the most-used one; ties: pdq_s_pick's order.
++   The R2 weapon is drawn last on some frames with its own depth range (sz 0.2): taken as the frame's transform, the
++   world's depth reprojected behind the camera (cut resets, 'offscreen' motion 1e9). -1: no depth-writing draw. */
++static inline int pdq_s_pick_wide(const pdq_s_tally* t)
++{
++    unsigned k, top = 0;
++    int b = -1;
++    for (k = 0; k < t->cnt; ++k)
++        if (t->n[k] && t->dw[k] > top) top = t->dw[k];
++    if (!top) return -1;
++    for (k = 0; k < t->cnt; ++k)
++    {
++        if (!t->n[k] || t->dw[k] * 8u < top) continue;
++        if (b < 0) { b = (int)k; continue; }
++        const float ek = fabsf(t->v[k][4]), eb = fabsf(t->v[b][4]);
++        const float rk = fabsf(t->v[k][7] - t->v[k][6]), rb = fabsf(t->v[b][7] - t->v[b][6]);
++        if (ek > eb || (ek == eb && (rk > rb || (rk == rb && (t->dw[k] > t->dw[b] || (t->dw[k] == t->dw[b] && t->n[k] > t->n[b]))))))
++            b = (int)k;
 +    }
 +    return b;
 +}
@@ -17355,10 +17378,10 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..33ffe06
+index 0000000..face2e6
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
-@@ -0,0 +1,3246 @@
+@@ -0,0 +1,3361 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation, two backends:
 +//  * NVIDIA DLSS Frame Generation through Streamline (manual hooking): sl.interposer.dll is loaded at run time
@@ -17488,6 +17511,7 @@ index 0000000..33ffe06
 +		int stats = 0;    // R2_DLSS_FG_STATS (or R2_FG_DEBUG): 10 s [fg-stats] line (inputs pairing, HUD split, motion vectors)
 +		int fx_mv = 0;    // R2_DLSS_FG_FX_MV: motion of effect-covered pixels: 0 as rendered, 1 camera only, 2 zero
 +		bool hud_hold = true; // R2_DLSS_FG_HUD_HOLD: frames without a HUD split keep the last split's HUD area as UI
++		bool mv_debug = false; // R2_DLSS_FG_MV_DEBUG (or R2_FG_DEBUG=2): tint frame generation's motion: object (green) / camera only (blue) / invalid (magenta)
 +	};
 +
 +	const fg_config& fgcfg()
@@ -17527,7 +17551,8 @@ index 0000000..33ffe06
 +			r.stats = std::max(penv_int("DLSS_FG_STATS", 0), penv_int("FG_DEBUG", 0));
 +			r.fx_mv = std::clamp(penv_int("DLSS_FG_FX_MV", 0), 0, 2);
 +			r.hud_hold = penv_int("DLSS_FG_HUD_HOLD", 1) != 0;
-+			if (r.want) std::fprintf(stderr, "[fg-vk] DLSS_FG_STATS=%d DLSS_FG_FX_MV=%d DLSS_FG_HUD_HOLD=%d\n", r.stats, r.fx_mv, r.hud_hold ? 1 : 0);
++			r.mv_debug = penv_int("DLSS_FG_MV_DEBUG", 0) != 0 || penv_int("FG_DEBUG", 0) >= 2;
++			if (r.want) std::fprintf(stderr, "[fg-vk] DLSS_FG_STATS=%d DLSS_FG_FX_MV=%d DLSS_FG_HUD_HOLD=%d DLSS_FG_MV_DEBUG=%d\n", r.stats, r.fx_mv, r.hud_hold ? 1 : 0, r.mv_debug ? 1 : 0);
 +			return r;
 +		}();
 +		return c;
@@ -18775,6 +18800,100 @@ index 0000000..33ffe06
 +			compute_task::run(cmd, (w + 7) / 8, (h + 7) / 8, 1);
 +		}
 +	};
++
++	// R2_DLSS_FG_MV_DEBUG: tints the swapchain-sized image Img (the HUD-less frame) with frame generation's motion
++	// vectors, classified as r2fg_stats_pass does: object motion (green, stronger with more motion), camera-only motion
++	// (blue), invalid / behind the camera (magenta); still pixels untouched. a: game rectangle on the swapchain;
++	// b: motion-vector size (w, h), zA, zB; c: jitter (ndc), view size; d: inverted, swapchain size (w, h).
++	template <bool HDR10>
++	struct r2fg_mv_tint_pass : compute_task
++	{
++		const vk::image_view* in_depth = nullptr;
++		const vk::image_view* in_mv = nullptr;
++		const vk::image_view* img = nullptr;
++		std::unique_ptr<vk::sampler> m_sampler;
++
++		r2fg_mv_tint_pass()
++		{
++			m_src = std::string(
++				"#version 450\n"
++				"layout(local_size_x = 8, local_size_y = 8) in;\n"
++				"layout(set=0, binding=0) uniform sampler2D DepthIn;\n"
++				"layout(set=0, binding=1) uniform sampler2D MvIn;\n"
++				"layout(set=0, binding=2, ") + (HDR10 ? "rgb10_a2" : "rgba8") + ") uniform image2D Img;\n"
++				"layout(push_constant) uniform PC { mat4 T; vec4 a; vec4 b; vec4 c; vec4 d; };\n"
++				"void main()\n"
++				"{\n"
++				"	ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
++				"	if (p.x >= int(d.y) || p.y >= int(d.z)) return;\n"
++				"	vec2 q = (vec2(p) + 0.5 - a.xy) / a.zw;\n"
++				"	if (any(lessThan(q, vec2(0.0))) || any(greaterThanEqual(q, vec2(1.0)))) return;\n"
++				"	ivec2 sz = ivec2(b.xy);\n"
++				"	ivec2 t = min(ivec2(q * b.xy), sz - 1);\n"
++				"	float z = texelFetch(DepthIn, t, 0).r;\n"
++				"	vec2 mv = texelFetch(MvIn, t, 0).rg;\n"
++				"	vec3 tint = vec3(1.0, 0.0, 1.0);\n"
++				"	float k = 0.5;\n"
++				"	if (!any(isnan(mv)) && !any(isinf(mv)))\n"
++				"	{\n"
++				"		if (length(mv * c.zw) <= 0.5) return;\n"
++				"		tint = vec3(0.1, 0.3, 1.0);\n"
++				"		k = 0.35;\n"
++				"		if (!(d.x > 0.5 ? z <= 1e-7 : z >= 0.9999999))\n"
++				"		{\n"
++				"			vec2 ndc = (vec2(t) + 0.5) / c.zw * 2.0 - 1.0 - c.xy;\n"
++				"			vec4 r = T * vec4(ndc, z * b.z + b.w, 1.0);\n"
++				"			vec2 cm = (r.xy / r.w - ndc) * 0.5;\n"
++				"			if (!(abs(r.w) > 1e-7) || any(isnan(cm)) || any(isinf(cm))) { tint = vec3(1.0, 0.0, 1.0); k = 0.5; }\n"
++				"			else\n"
++				"			{\n"
++				"				float om = length((mv - cm) * c.zw);\n"
++				"				if (om > 1.0) { tint = vec3(0.0, 1.0, 0.0); k = clamp(0.3 + om / 32.0, 0.3, 0.75); }\n"
++				"			}\n"
++				"		}\n"
++				"	}\n"
++				"	vec4 col = imageLoad(Img, p);\n"
++				"	imageStore(Img, p, vec4(mix(col.rgb, tint, k), col.a));\n"
++				"}\n";
++			ssbo_count = 0;
++			use_push_constants = true;
++			push_constants_size = 128;
++			create();
++		}
++
++		std::vector<glsl::program_input> get_inputs() override
++		{
++			auto r = compute_task::get_inputs();
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "DepthIn", vk::glsl::input_type_texture, 0, 0));
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "MvIn", vk::glsl::input_type_texture, 0, 1));
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "Img", vk::glsl::input_type_storage_texture, 0, 2));
++			return r;
++		}
++
++		void bind_resources(const vk::command_buffer&) override
++		{
++			if (!m_sampler)
++			{
++				m_sampler = std::make_unique<vk::sampler>(*vk::get_current_renderer(),
++					VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
++					VK_FALSE, 0.f, 1.f, 0.f, 0.f, VK_FILTER_NEAREST, VK_FILTER_NEAREST, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE);
++			}
++			m_program->bind_uniform({ *in_depth, *m_sampler }, 0, 0);
++			m_program->bind_uniform({ *in_mv, *m_sampler }, 0, 1);
++			m_program->bind_uniform({ *img }, 0, 2);
++		}
++
++		void run(const vk::command_buffer& cmd, const double* T, const float* tail, u32 w, u32 h)
++		{
++			if (!m_program) load_program(cmd);
++			float k[32]{};
++			for (int c = 0; c < 4; ++c)
++				for (int r = 0; r < 4; ++r) k[c * 4 + r] = static_cast<float>(T[r * 4 + c]);
++			std::memcpy(k + 16, tail, 16 * sizeof(float));
++			vkCmdPushConstants(cmd, m_program->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, push_constants_size, k);
++			compute_task::run(cmd, (w + 7) / 8, (h + 7) / 8, 1);
++		}
++	};
 +}
 +
 +namespace
@@ -18798,6 +18917,7 @@ index 0000000..33ffe06
 +		bool scene = false;
 +		u32 rw = 0, rh = 0;
 +		float jx = 0.f, jy = 0.f, mvsx = 1.f, mvsy = 1.f, zA = 1.f, zB = 0.f;
++		float dbg_jx = 0.f, dbg_jy = 0.f, mv_w = 0.f, mv_h = 0.f; // R2_DLSS_FG_MV_DEBUG: jitter (ndc) and view size of the tagged vectors
 +		bool inverted = false, reset = false;
 +		double T[16] = {};
 +		image_ptr depth, mv;
@@ -19121,6 +19241,8 @@ index 0000000..33ffe06
 +		f.jx = jx; f.jy = jy;
 +		f.mvsx = mv_w / static_cast<float>(rw);
 +		f.mvsy = mv_h / static_cast<float>(rh);
++		f.mv_w = mv_w; f.mv_h = mv_h;
++		if (fgcfg().mv_debug) r2fg_jitter_ndc(f.dbg_jx, f.dbg_jy);
 +		f.inverted = inverted;
 +		f.reset = f.reset || reset;
 +		double moved = 0.0;
@@ -19308,7 +19430,7 @@ index 0000000..33ffe06
 +		f.have_ui = false;
 +		f.split = false;
 +		fg_decide();
-+		f.debug_view = fgcfg().hud_debug;
++		f.debug_view = fgcfg().hud_debug || fgcfg().mv_debug;
 +		if (!(f.want_on || f.debug_view) || !f.have_b0 || !src || !target || x2 <= x1 || y2 <= y1 || !buffer_w || !buffer_h) return;
 +
 +		const u32 W = f.sc_extent.width, H = f.sc_extent.height;
@@ -19390,7 +19512,7 @@ index 0000000..33ffe06
 +			static_cast<float>(std::min(buffer_h, src->height())) / static_cast<float>(src->height()),
 +			static_cast<float>(W), static_cast<float>(H),
 +			0.5f / 255.f, 0.25f / 1023.f, 0.3f * rect_w * rect_h,
-+			static_cast<float>((split ? 1 : 0) | (hdr10 ? 2 : 0) | (f.debug_view ? 4 : 0) | (hold_on ? 8 : 0) | (hold_use ? 16 : 0)),
++			static_cast<float>((split ? 1 : 0) | (hdr10 ? 2 : 0) | (fgcfg().hud_debug ? 4 : 0) | (hold_on ? 8 : 0) | (hold_use ? 16 : 0)),
 +			hold_stamp, hold_max_age, 0.f, 0.f };
 +		const auto bind = [&](vk::r2fg_hud_pass_base* pass)
 +		{
@@ -19436,6 +19558,22 @@ index 0000000..33ffe06
 +			if (fgcfg().stats) g_fgst.held++;
 +		}
 +		if (fgcfg().stats) fg_stats_count(cmd, split, k[10]);
++		if (fgcfg().mv_debug && f.depth && f.mv && f.rw && f.rh && f.mv_w >= 1.f && f.mv_h >= 1.f)
++		{
++			vk::insert_global_memory_barrier(cmd);
++			const float tail[16] = { k[0], k[1], k[2], k[3], static_cast<float>(f.rw), static_cast<float>(f.rh), f.zA, f.zB,
++				f.dbg_jx, f.dbg_jy, f.mv_w, f.mv_h, f.inverted ? 1.f : 0.f, static_cast<float>(W), static_cast<float>(H), 0.f };
++			const auto tint = [&](auto* pass)
++			{
++				pass->in_depth = fg_view(f.depth.get());
++				pass->in_mv = fg_view(f.mv.get());
++				pass->img = fg_view(f.hudless.get());
++				pass->run(cmd, f.T, tail, W, H);
++			};
++			if (hdr10) tint(vk::get_compute_task<vk::r2fg_mv_tint_pass<true>>());
++			else tint(vk::get_compute_task<vk::r2fg_mv_tint_pass<false>>());
++			vk::insert_global_memory_barrier(cmd);
++		}
 +
 +		if (f.debug_view)
 +		{
@@ -26442,10 +26580,10 @@ index 0000000..db54a19
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..9719507
+index 0000000..4b1fcdf
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12036 @@
+@@ -0,0 +1,12091 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -26999,6 +27137,14 @@ index 0000000..9719507
 +		// (pdq_s_pick). Off: the R3 diner jolts it was meant for came with a changed game VP (its own log), and in R3 T1 it
 +		// picked the weapon draws' depth range (0.2) over the world's, so the reprojection read as camera cuts (DLSS resets).
 +		bool frame_s_vote = false;
++		// R2_FG_CAM_SANITY (default 3; 0 = old, bits): 1 = the frame's screen transform is the widest depth range most
++		// scene draws used (pdq_s_pick_wide), not the last draw's: the R2 weapon, drawn last on some frames with its own
++		// depth range 0.2, made the world's depth reproject behind the camera (false camera-cut resets 'offscreen' motion
++		// 1e9, upscaler and frame generation history lost, wrong near/far). 2 = a camera cut from a weak vote (under a
++		// quarter of the matched draws agree, the game's own VP not used) keeps the history like an untrusted parallax
++		// cut: frame generation still resets on it, and the depth check resets the upscaler a few frames later when
++		// neither the voted motion nor none fits (a real cut).
++		int cam_sanity = 3;
 +		// RSX_DLSS_OBJMV_DEADZONE_PX (default 0.01; 0 = off): an object velocity (RSX_DLSS_OBJMV=1, both modes) below
 +		// this many render pixels is written as exactly zero (float noise of the per-draw previous-frame evaluation)
 +		float om_deadzone = 0.01f;
@@ -27287,6 +27433,8 @@ index 0000000..9719507
 +		if (const char* e = std::getenv("RSX_AA_STATIC_SNAP"); e && *e) r.static_snap = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_AA_STATIC_SNAP_PX"); e && *e) r.static_snap_px = std::clamp(static_cast<float>(std::atof(e)), 0.f, 1.f);
 +		if (const char* e = std::getenv("RSX_AA_FRAME_S_VOTE"); e && *e) r.frame_s_vote = std::atoi(e) != 0;
++		for (const char* name : { "R2_FG_CAM_SANITY", "R3_FG_CAM_SANITY" })
++			if (const char* e = std::getenv(name); e && *e) { r.cam_sanity = std::clamp(std::atoi(e), 0, 3); break; }
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_DEADZONE_PX"); e && *e) r.om_deadzone = std::clamp(static_cast<float>(std::atof(e)), 0.f, 1.f);
 +		if (const char* e = std::getenv("RSX_AA_EVALS")) r.evals_max = static_cast<u32>(std::max(16, std::min(4096, std::atoi(e))));
 +		if (const char* e = std::getenv("RSX_AA_VOTE_HOLD")) r.vote_hold = std::max(-1, std::atoi(e));
@@ -29578,7 +29726,7 @@ index 0000000..9719507
 +		bool inverted = false;
 +		screen_xform frame_S, last_S;
 +		pdq_s_tally s_tal{}; // RSX_AA_FRAME_S_VOTE: this frame's scene-draw screen transforms
-+		u32 stat_s_mixed = 0, stat_s_voted = 0, stat_s_logged = 0, stat_snap_vp_same = 0;
++		u32 stat_s_mixed = 0, stat_s_voted = 0, stat_s_logged = 0, stat_snap_vp_same = 0, stat_s_wide = 0, stat_s_wide_logged = 0, stat_weak_cut = 0;
 +		// still-camera jolts: a kept camera motion after >= 30 still runs (and the run after it); the game VP of the
 +		// previous run's previous frame, to tell a VP that returns bit-exactly (A-B-A) from a real move
 +		m4 jolt_vpp{};
@@ -33554,9 +33702,9 @@ index 0000000..9719507
 +					r2log("camera static snap (RSX_AA_STATIC_SNAP_PX %.3f): %u frames snapped to zero motion, %u held/voted motions replaced (game VP unchanged), %u already identity; kept motion <0.1 px %u, <1 px %u, >=1 px %u (%u of them with the game VP unchanged: screen transform moved)",
 +						r2cfg().static_snap_px, st.stat_snap, st.stat_snap_ex, st.stat_snap_id, st.stat_snap_hist[0], st.stat_snap_hist[1], st.stat_snap_hist[2], st.stat_snap_vp_same);
 +				st.stat_snap = st.stat_snap_ex = st.stat_snap_id = st.stat_snap_hist[0] = st.stat_snap_hist[1] = st.stat_snap_hist[2] = st.stat_snap_vp_same = 0;
-+				r2log("frame screen transform (RSX_AA_FRAME_S_VOTE=%d%s): %u frames whose scene draws used more than one, %u where the voted one replaced the last draw's",
-+					r2cfg().frame_s_vote ? 1 : 0, r2cfg().frame_s_vote ? "" : ": off, the last scene draw's", st.stat_s_mixed, st.stat_s_voted);
-+				st.stat_s_mixed = st.stat_s_voted = 0;
++				r2log("frame screen transform (RSX_AA_FRAME_S_VOTE=%d%s): %u frames whose scene draws used more than one, %u where the voted one replaced the last draw's; R2_FG_CAM_SANITY=%d: %u replaced by the widest depth range",
++					r2cfg().frame_s_vote ? 1 : 0, r2cfg().frame_s_vote ? "" : ": off, the last scene draw's", st.stat_s_mixed, st.stat_s_voted, r2cfg().cam_sanity, st.stat_s_wide);
++				st.stat_s_mixed = st.stat_s_voted = st.stat_s_wide = 0;
 +				if (r2cfg().static_snap)
 +					r2log("still-camera jolts: %u kept camera motions after >= 30 still runs (or the run after one), %u where the game VP "
 +						"changed and came back bit-exactly to the one 2 frames before (A-B-A)", st.stat_jolt, st.stat_jolt_aba);
@@ -33569,9 +33717,13 @@ index 0000000..9719507
 +					r2log("camera MV confidence: %u checks, %u rejected (> %.0f%% of the depth samples off, worse than no motion), %u resets, %u frames with zero camera motion, %u reject runs without a reset (RSX_AA_MV_CONFIDENCE_GAP %u), %u cut resets (RSX_AA_CONF_CUT %u), %u rejects of the confirmed game camera ignored (RSX_AA_CONF_TRUST_EXACT %u)",
 +						st.stat_conf_n, st.stat_conf_rej, r2cfg().mv_conf_bad * 100.f, st.stat_conf_reset, st.stat_conf_zero, st.stat_conf_kept, r2cfg().mv_conf_gap, st.stat_conf_cut, r2cfg().conf_cut ? 1u : 0u, st.stat_conf_exact, r2cfg().conf_trust_exact ? 1u : 0u);
 +				if (r2cfg().cut_par_gap)
-+					r2log("camera cut: %u parallax-only cuts within RSX_AA_CUT_PARALLAX_GAP %u frames kept the history (%u untrusted: last trusted / no motion); depth check: %u real cuts reset, %u deferred, %u unchecked",
-+						st.stat_par_kept, r2cfg().cut_par_gap, st.stat_par_untrusted, st.stat_par_confirmed, st.stat_par_cut_gapped, st.stat_par_unchecked);
++					r2log("camera cut: %u parallax-only cuts within RSX_AA_CUT_PARALLAX_GAP %u frames kept the history (%u untrusted: last trusted / no motion); %u weak-vote cuts held (R2_FG_CAM_SANITY bit 2); depth check: %u real cuts reset, %u deferred, %u unchecked",
++						st.stat_par_kept, r2cfg().cut_par_gap, st.stat_par_untrusted, st.stat_weak_cut, st.stat_par_confirmed, st.stat_par_cut_gapped, st.stat_par_unchecked);
++				else if (st.stat_weak_cut)
++					r2log("camera cut: %u weak-vote cuts held (R2_FG_CAM_SANITY bit 2); depth check: %u real cuts reset, %u deferred, %u unchecked",
++						st.stat_weak_cut, st.stat_par_confirmed, st.stat_par_cut_gapped, st.stat_par_unchecked);
 +			}
++			st.stat_weak_cut = 0;
 +			st.stat_conf_n = st.stat_conf_rej = st.stat_conf_reset = st.stat_conf_zero = st.stat_conf_cut = st.stat_conf_exact = 0;
 +			st.stat_conf_kept = st.stat_par_kept = st.stat_par_confirmed = 0;
 +			st.stat_par_untrusted = st.stat_par_unchecked = st.stat_par_cut_gapped = 0;
@@ -35950,6 +36102,27 @@ index 0000000..9719507
 +				if (r2cfg().frame_s_vote) st.frame_S = v;
 +			}
 +		}
++		if (!r2cfg().frame_s_vote && (r2cfg().cam_sanity & 1))
++		{
++			const int kw = pdq_s_pick_wide(&st.s_tal);
++			if (kw >= 0)
++			{
++				float la[8];
++				s_to_arr(st.frame_S, la);
++				if (std::memcmp(la, st.s_tal.v[kw], sizeof(la)) != 0)
++				{
++					const screen_xform v = s_from_arr(st.s_tal.v[kw]);
++					if (st.stat_s_wide_logged < 4)
++					{
++						st.stat_s_wide_logged++;
++						r2log("frame screen transform f%u (R2_FG_CAM_SANITY bit 1): last scene draw's z %g*%+g replaced by the widest depth range (%u of %u draws, %u depth-writing) x %g*%+g y %g*%+g z %g*%+g",
++							st.frame, la[4], la[5], st.s_tal.n[kw], st.scene_draws, st.s_tal.dw[kw], v.sx, v.ox, v.sy, v.oy, v.sz, v.oz);
++					}
++					st.stat_s_wide++;
++					st.frame_S = v;
++				}
++			}
++		}
 +	}
 +	if (!st.scene_draws || !rt || !ds || !st.frame_S.valid || st.vw < 1 || st.vh < 1)
 +	{
@@ -36105,6 +36278,7 @@ index 0000000..9719507
 +	m4 T_check = m4_identity(); // RSX_AA_CUT_PARALLAX_GAP: a held parallax cut's depth check uses the voted motion
 +	bool check_voted = false;
 +	int fg_cut = 0; // R2PORT frame generation: a held parallax cut (pfg_cut_reset kind)
++	bool ex_used = false; // the game's own VP gave this frame's camera
 +	// RSX_AA_STATIC_SNAP: largest displacement (render pixels) of a 3x3 screen grid at far / mid / near depth under A
 +	// (1e9: a point behind the camera); ex_static: the game's verified VP is bit-identical to last frame's
 +	const auto snap_px = [&](const m4& A)
@@ -36311,6 +36485,7 @@ index 0000000..9719507
 +						members = exm;
 +						have_cam = true;
 +						ex_conf_ok = supported;
++						ex_used = true;
 +						st.stat_ex_used++;
 +					}
 +					if (r2cfg().debug && st.ex_logged < 32 && (disagree || (st.frame % 120) == 0))
@@ -36430,6 +36605,24 @@ index 0000000..9719507
 +				vk::r2fg_diag_cut(motion, par, members, matched);
 +				if (r2cfg().debug) r2log("parallax cut f%u held (motion %.3f, parallax %.3f, vote %u/%u): %s motion, no reset", st.frame, motion, par, members, matched,
 +					par_untrusted ? "last trusted / no" : "voted");
++			}
++			if (cut && rule != 6 && (r2cfg().cam_sanity & 2) && r2cfg().mv_conf && !ex_used && members * 4 < matched)
++			{
++				// R2_FG_CAM_SANITY bit 2: a cut from a weak vote is most likely a wrong transform: held like an untrusted
++				// parallax cut (last trusted / no motion, frame generation resets); the depth check on the voted motion
++				// resets a real cut a few frames later
++				cut = false;
++				par_untrusted = true;
++				ex_conf_ok = false;
++				fg_cut = 1;
++				T_check = T;
++				check_voted = true;
++				if (pdq_held_push(&st.par_held, st.frame)) st.stat_par_unchecked++;
++				st.stat_weak_cut++;
++				T = pdq_last_t_usable(r2cfg().vote_hold, st.frame, st.last_T_frame) ? st.last_T : m4_identity();
++				if (r2cfg().debug || st.stat_weak_cut <= 4)
++					r2log("camera cut f%u from a weak vote held (R2_FG_CAM_SANITY bit 2; rule %u, motion %.3g, zoom %.3g, vote %u/%u): depth check decides", st.frame, rule,
++						motion, zoom, members, matched);
 +			}
 +			if (cut)
 +			{
