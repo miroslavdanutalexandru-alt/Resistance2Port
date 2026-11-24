@@ -886,6 +886,19 @@ static const char* r2_spu_job_tag(int img)
     if (img >= 649 && img <= 671) return "pcf";
     return nullptr;
 }
+/* [spike] cause: R2 frame-loop guest wait sites (port_hitch.h g_port_hitch_site_name), "class:name".
+ * Sources: files\r2_spu_wait_1116.md, stubs.cpp R2_JOBWAIT_WAKE, r2_hot.cpp r2_occ_wait. */
+static const char* r2_wait_site_name(uint32_t lr)
+{
+    switch (lr) {
+    case 0x001723C8u: return "rsx:occlusion-report";   /* func_006483A8 via r2_occ_wait: last frame's reports */
+    case 0x0026C1E0u: return "rsx:occlusion-report";   /* r2_occ_wait's second caller */
+    case 0x006364A0u: return "rsx:frame-label";        /* func_00636268: RSX frame label poll */
+    case 0x006B8D3Cu: return "spu:job-list";           /* func_006B8BB4: usleep(128) poll of SPU job-list progress */
+    case 0x00B20AD4u: return "movie:bink";
+    default: return nullptr;
+    }
+}
 /* Resistance port: one [sys] line so a tester's run.log says what it ran on,
  * and a readable message instead of an illegal-instruction crash on CPUs
  * without the x86-64-v3 set (AVX2/FMA/BMI2) the lifted code is built for. */
@@ -939,6 +952,7 @@ int main(int argc, char** argv)
     if (!getenv("SPU_JOB_BOOST")) _putenv_s("SPU_JOB_BOOST", "0");
     { g_sjt_link_b = (uint32_t)strtoul(getenv("SPU_WWSJOB_LINK"), 0, 0) & 0x3FFFFu; }
     { const char* e = getenv("PORT_SPU_JOB_TAGS"); if (!(e && *e == '0')) g_port_hitch_job_tag = r2_spu_job_tag; }
+    g_port_hitch_site_name = r2_wait_site_name;
     /* Before anything starts: the profile sets env switches that the
      * subsystems read when they first run. R2_PRESET fills in the settings
      * that aren't set explicitly, before the profile reads them. */

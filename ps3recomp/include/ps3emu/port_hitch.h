@@ -107,6 +107,21 @@ static __inline const char* port_hitch_job_tag(int img)
     return t ? t : "";
 }
 
+/* Optional guest wait-site namer set by the game project (R2: main.cpp): "class:name" for a frame-loop
+ * guest call site ("rsx:occlusion-report", "spu:job-list", ...), or NULL. Used by the [spike] cause: line
+ * and its 5 s tally. */
+typedef const char* (*port_hitch_site_fn)(uint32_t lr);
+__declspec(selectany) port_hitch_site_fn g_port_hitch_site_name = 0;
+
+/* [spike] cause: the longest single SPU job since the last frame (racy max, diagnostics only). Separate from
+ * g_port_hitch so the shared state's layout does not change. */
+typedef struct port_hitch_jobmax_state { volatile int64_t qpc; volatile long img; } port_hitch_jobmax_state;
+#ifdef __cplusplus
+__declspec(selectany) port_hitch_jobmax_state g_port_hitch_jobmax = {};
+#else
+__declspec(selectany) port_hitch_jobmax_state g_port_hitch_jobmax = { 0 };
+#endif
+
 /* PORT_HITCH_RSX_SPLIT (default off; 1 = rsx::thread flip intervals over 25 ms, <ms> >= 5 = that threshold): a
  * "[hitch] rsx flip" line per long flip-to-flip interval of rsx::thread (the [hitch] line only has its length,
  * rsx-iv): the rsx-cpu split of that interval (PORT_RSX_CPU_PROF, forced to every frame unless set), the thread's
@@ -193,6 +208,7 @@ static __inline void port_hitch_spu_job(int img, int64_t qpc)
     if (img < 0 || img >= PORT_HITCH_JOB_IMGS) img = 0;
     _InterlockedExchangeAdd64((volatile long long*)&g_port_hitch.job_qpc[img], qpc);
     _InterlockedIncrement(&g_port_hitch.job_runs[img]);
+    if (qpc > g_port_hitch_jobmax.qpc) { g_port_hitch_jobmax.qpc = qpc; g_port_hitch_jobmax.img = img; }
 }
 
 /* 1 on the game's frame-loop thread (set by port_hitch_frame). */
@@ -742,6 +758,12 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
     static double sm_why[PH_SW_HARD - PH_DSDIRECT + 1] = {};
     static long sm_gpu_n = 0;
     static int spike_on = 1;
+    static int cause_on = 1;            /* PORT_SPIKE_CAUSE=0: no [spike] cause: lines / 5 s tally */
+    static double cause_ms = 30.0;      /* PORT_SPIKE_CAUSE_MS: frames at or over this go into the 5 s cause tally */
+    struct cause_tally { const char* n; unsigned c; double ms; };
+    static cause_tally ctally[16];
+    static int nctally = 0;
+    static unsigned ctally_frames = 0;
     static double prev_ft = 0.0;
     if (!init) {
         init = 1;
@@ -749,6 +771,8 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
         on = !(e && *e == '0');
         g_port_hitch.off = !on;
         { const char* s = getenv("PORT_SPIKE_LOG"); spike_on = !(s && *s == '0'); }
+        { const char* s = getenv("PORT_SPIKE_CAUSE"); cause_on = !(s && *s == '0'); }
+        if (const char* m = getenv("PORT_SPIKE_CAUSE_MS")) { const double v = atof(m); if (v >= 5.0) cause_ms = v; }
         if (const char* m = getenv("PORT_HITCH_MS")) { const double v = atof(m); if (v >= 5.0) thr_ms = v; }
         if (const char* m = getenv("PORT_HITCH_LINES")) { const int v = atoi(m); lines_cap = v < 0 ? 0u : v > 1000 ? 1000u : (unsigned)v; }
         { const char* a = getenv("PORT_HITCH_ADAPT"); adapt = !(a && *a == '0'); }
@@ -794,8 +818,10 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
     /* the guest call sites the frame loop waited at longest (top 3 for [spike]) */
     uint32_t top_lr = 0; double top_ms = 0.0;
     uint32_t t3_lr[3] = { 0, 0, 0 }; double t3_ms[3] = { 0.0, 0.0, 0.0 };
+    uint32_t all_lr[PORT_HITCH_LR_SLOTS]; double all_ms[PORT_HITCH_LR_SLOTS];   /* every slot, for [spike] cause: */
     for (int i = 0; i < PORT_HITCH_LR_SLOTS; i++) {
         const double v = (double)g_port_hitch.lr_qpc[i] * 1000.0 / (double)qf.QuadPart;
+        all_lr[i] = g_port_hitch.lr[i]; all_ms[i] = v;
         if (v > top_ms) { top_ms = v; top_lr = g_port_hitch.lr[i]; }
         for (int t = 0; t < 3; t++)
             if (v > t3_ms[t]) {
@@ -825,6 +851,11 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
             if (v > j4_ms[t]) {
                 for (int u = 3; u > t; u--) { j4_ms[u] = j4_ms[u - 1]; j4_img[u] = j4_img[u - 1]; j4_runs[u] = j4_runs[u - 1]; }
                 j4_ms[t] = v; j4_img[t] = i; j4_runs[t] = r; break; }
+    }
+    double jmax_ms = 0.0; long jmax_img = -1;
+    {
+        const int64_t q = _InterlockedExchange64((volatile long long*)&g_port_hitch_jobmax.qpc, 0);
+        if (q > 0) { jmax_ms = (double)q * 1000.0 / (double)qf.QuadPart; jmax_img = g_port_hitch_jobmax.img; }
     }
     /* CPU time the frame-loop thread actually ran: "game" minus this = preempted / not scheduled */
     double cpu_ms = -1.0;
@@ -866,6 +897,42 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
         sm_gpu += ms[PH_GPU]; sm_gpuraw += ms[PH_GPURAW]; sm_gpu_n += cnt[PH_GPU]; sm_spu += spu_ms; sm_draw += cnt[PH_DRAW]; sm_rb += ms[PH_READBACK];
         sm_rp += cnt[PH_RPASS]; sm_bar += cnt[PH_BARRIER];
         for (int i = PH_DSDIRECT; i <= PH_SW_HARD; i++) sm_why[i - PH_DSDIRECT] += cnt[i];
+    }
+    /* [spike] cause: the frame loop's own time split into serial parts (they add up to the frame time, unlike the
+     * [spike] top: list, where RSX / GPU / SPU-lane entries overlap the waits). The largest part is the cause; guest
+     * wait sites are named by g_port_hitch_site_name ("class:name"). SPU lane time is parallel work, so the SPU
+     * side is judged by the frame loop's waits on it (class "spu"), not by spu-jobs(lane-sum). */
+    struct cause_part { const char* n; uint32_t lr; double v; };
+    cause_part cp[PORT_HITCH_LR_SLOTS + 8];
+    int ncp = 0;
+    double cls_spu_wait = 0.0, cls_rsx_wait = 0.0;
+    const int cause_now = cause_on && ft >= cause_ms;
+    if (cause_now) {
+        const port_hitch_site_fn sf = g_port_hitch_site_name;
+        double slots = 0.0;
+        cp[ncp++] = { "ppu:game", 0, game };
+        cp[ncp++] = { "pc:extras(reflex)", 0, ms[PH_TICK] };
+        cp[ncp++] = { "pc:limiter", 0, ms[PH_LIMIT] };
+        cp[ncp++] = { "lv2:sync", 0, ms[PH_SYNC] };
+        cp[ncp++] = { "pad", 0, ms[PH_PAD] };
+        cp[ncp++] = { "rsx:ring/readback", 0, ms[PH_MAINRSX] };
+        for (int i = 0; i < PORT_HITCH_LR_SLOTS; i++) {
+            if (!all_lr[i] || all_ms[i] <= 0.0) continue;
+            const char* sn = sf ? sf(all_lr[i]) : 0;
+            if (!sn) sn = "guest:wait";
+            cp[ncp++] = { sn, all_lr[i], all_ms[i] };
+            slots += all_ms[i];
+            if (!strncmp(sn, "spu:", 4)) cls_spu_wait += all_ms[i];
+            else if (!strncmp(sn, "rsx:", 4)) cls_rsx_wait += all_ms[i];
+        }
+        if (ws_ms - slots > 0.05) cp[ncp++] = { "guest:other-waits", 0, ws_ms - slots };
+        std::sort(cp, cp + ncp, [](const cause_part& a, const cause_part& b) { return a.v > b.v; });
+        /* 5 s tally, every frame at or over PORT_SPIKE_CAUSE_MS (not capped like the per-frame lines) */
+        ctally_frames++;
+        int c = 0;
+        while (c < nctally && strcmp(ctally[c].n, cp[0].n)) c++;
+        if (c == nctally && nctally < 16) { ctally[nctally].n = cp[0].n; ctally[nctally].c = 0; ctally[nctally].ms = 0.0; nctally++; }
+        if (c < nctally) { ctally[c].c++; ctally[c].ms += cp[0].v; }
     }
     const double period = target_fps > 0.0 ? 1000.0 / target_fps : 0.0;
     /* adaptive: a game steadily over the fixed threshold (30-40 fps under 25 ms) lists only frames well above its
@@ -944,6 +1011,26 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
                                   " ads %ld present %ld hard-sync %ld other %ld | depth scale copies: direct %ld carrier %ld\n",
                         cnt[PH_SW_BINDDMA], cnt[PH_SW_AV], cnt[PH_SW_ZHINT], cnt[PH_SW_ZHARD], cnt[PH_SW_BLIT], cnt[PH_SW_LABEL],
                         cnt[PH_SW_ADS], cnt[PH_SW_PRESENT], cnt[PH_SW_HARD], cnt[PH_SW_OTHER], cnt[PH_DSDIRECT], cnt[PH_DSCARRIER]);
+                if (cause_now && ncp > 0) {
+                    char cs[512]; size_t co = 0;
+                    for (int i = 0; i < ncp && i < 3 && co < sizeof cs - 96; i++) {
+                        if (i && cp[i].v < 0.05) break;
+                        const char* sep = i == 0 ? "" : i == 1 ? " | then " : ", ";
+                        if (cp[i].lr) co += snprintf(cs + co, sizeof cs - co, "%s%s@0x%08X %.1f", sep, cp[i].n, cp[i].lr, cp[i].v);
+                        else co += snprintf(cs + co, sizeof cs - co, "%s%s %.1f", sep, cp[i].n, cp[i].v);
+                        if (i == 0) co += snprintf(cs + co, sizeof cs - co, " (%.0f%%)", ft > 0.0 ? cp[0].v * 100.0 / ft : 0.0);
+                    }
+                    char jm[64] = "none";
+                    if (jmax_img >= 0) {
+                        const char* tg = port_hitch_job_tag((int)jmax_img);
+                        snprintf(jm, sizeof jm, "img %ld%s%s %.1f ms", jmax_img, *tg ? ":" : "", tg, jmax_ms);
+                    }
+                    char gb[24] = "n/a";
+                    if (cnt[PH_GPU]) snprintf(gb, sizeof gb, "%.1f", ms[PH_GPU]);
+                    port_log_async(1, "[spike] cause: %s | spu: frame-loop waits %.1f, lane-sum %.1f/%ld (parallel, not frame time),"
+                                      " longest job %s | rsx: frame-loop waits %.1f, rsx-iv %.1f fifo-idle %.1f gpu-busy %s\n",
+                            cs, cls_spu_wait, spu_ms, spu_runs, jm, cls_rsx_wait, mxms[PH_RSX], ms[PH_FIFOIDLE], gb);
+                }
             }
         } else dropped++;
     }
@@ -999,6 +1086,16 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
                 n, p50, p99, mx, sqrt(sd / dn), thr, n_over, n_2x, extra,
                 sm_game / dn, sm_cpu / dn, sm_gw / dn, sm_mrsx / dn, sm_lim / dn, sm_fifo / dn, sm_label / dn, sm_zcull / dn, sm_hard / dn,
                 sm_rlim / dn, sm_sub / dn, sm_ring / dn, sm_av / dn, gpu_s, sm_spu / dn, sm_draw / dn, sm_rp / dn, sm_bar / dn, sm_rb / dn, rcpu_s, why_s);
+        if (cause_on && ctally_frames) {
+            std::sort(ctally, ctally + nctally, [](const cause_tally& a, const cause_tally& b) { return a.c > b.c; });
+            char ts[640]; size_t to = 0;
+            for (int c = 0; c < nctally && to < sizeof ts - 64; c++)
+                to += snprintf(ts + to, sizeof ts - to, "%s%s %u (avg %.1f ms)", c ? ", " : "", ctally[c].n, ctally[c].c,
+                               ctally[c].ms / (double)ctally[c].c);
+            port_log_async(1, "[spike] causes 5 s: %u frames >= %.0f ms, largest frame-loop part: %s (PORT_SPIKE_CAUSE=0 off)\n",
+                    ctally_frames, cause_ms, ts);
+        }
+        nctally = 0; ctally_frames = 0;
         sm_game = sm_gw = sm_cpu = sm_fifo = sm_label = sm_zcull = sm_hard = sm_rlim = sm_sub = sm_lim = 0.0;
         sm_mrsx = sm_ring = sm_av = 0.0;
         for (int i = 0; i < RC_COUNT; i++) rc_win[i] = 0;
