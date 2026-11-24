@@ -1296,17 +1296,19 @@ extern "C" uint64_t r2x_movie_seen(uint64_t seen)
  * tools/hooks/r2.json passes the string (lua_tolstring's result) here: one "[lua]" line each.
  * R2_LUA_LOG (default 1; 0 = off). Bounded: a repeat of the previous line is counted, not
  * printed; at most 20 lines a second; 5000 lines a run. */
+extern "C" int r2x_holar_prt(const char* msg);   /* r2_holar.cpp: [holar-assist] lines */
 extern "C" void r2x_lua_prt(uint64_t ea)
 {
     static int on = -1;
     if (on < 0) { const char* e = getenv("R2_LUA_LOG"); on = !(e && (*e == '0' || !_stricmp(e, "off"))); }
-    if (!on) return;
     const uint32_t a = (uint32_t)ea;
     if (!vm_base || a < 0x10000u || a >= 0xE0000000u) return;
     char msg[160]; size_t n = 0;
     const char* s = (const char*)vm_base + a;
     while (n < sizeof msg - 1 && s[n]) { const char c = s[n]; msg[n++] = (c >= 32 && c < 127) ? c : '?'; }
     msg[n] = 0;
+    if (r2x_holar_prt(msg)) return;
+    if (!on) return;
     static std::mutex mu; std::lock_guard<std::mutex> lk(mu);
     static char last[160] = ""; static unsigned rep = 0, total = 0, in_sec = 0; static ULONGLONG sec = 0;
     if (total >= 5000) return;

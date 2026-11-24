@@ -1072,6 +1072,30 @@
      "        ctx->lr = R_lr = 0x000CEACC; func_0002C648(ctx); DRAIN_TRAMPOLINE(ctx); _RCX_RL;"
     ]
    }
+  ],
+  "func_007404F8": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_007404F8(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" void r2x_lua_chunk(uint64_t buf, uint64_t size_ea);   /* R2: Holar elevator watchdog (project/r2_holar.cpp, R2_HOLAR_ASSIST) */",
+     "void func_007404F8(ppu_context* ctx) {"
+    ]
+   },
+   {
+    "at": 33,
+    "ctx": "        ctx->gpr[2] = R_2 = 0x00DED008ULL; /*TOCFIX ld r2,N(r1)*/",
+    "rm": [
+     "        ctx->gpr[8] = R_8 = (int64_t)(int32_t)(-1);"
+    ],
+    "add": [
+     "        r2x_lua_chunk(R_3, R_1 + 0x70);   /* R2: luaZ_fill got a chunk (buf, &size) from its reader */",
+     "        ctx->gpr[8] = R_8 = (int64_t)(int32_t)(-1);"
+    ]
+   }
   ]
  },
  "preamble": [],
