@@ -1681,6 +1681,23 @@ extern "C" void vm_inline_refresh(void)
     vm_inl_poll = ppu_hle_inject_base + 0x2008u;
     vm_inl_span = (vm_inline_ok && lim > 0x10000u + 8u) ? lim - 8u - 0x10000u : 0u;
 }
+/* ppu_recomp.h FP semantics (ppu_fres / ppu_frsqrte / ppu_fmadds):
+ *   PS3_PPU_HW_ESTIMATE (default 1): fres / frsqrte return the Cell's table
+ *     estimates, bit-exact with RPCS3's PPU interpreter and LLVM recompiler.
+ *     0 = the exact 1/x and 1/sqrt(x) of earlier builds.
+ *   PS3_PPU_FMADDS_INTERP (default 0): fmadds rounds a*c to double before the add,
+ *     as RPCS3's PPU interpreter does (hardware and RPCS3 LLVM fuse). */
+static int ppu_fp_env(const char* name, int def)
+{
+    const char* e = getenv(name);
+    if (!e || !*e) return def;
+    char v[8] = {0};
+    for (int i = 0; i < 7 && e[i]; i++) v[i] = (char)((e[i] >= 'A' && e[i] <= 'Z') ? e[i] + 32 : e[i]);
+    if (v[0] == '0' || !strcmp(v, "off") || !strcmp(v, "no") || !strcmp(v, "false")) return 0;
+    return 1;
+}
+extern "C" int ppu_fp_hw_estimate = ppu_fp_env("PS3_PPU_HW_ESTIMATE", 1);
+extern "C" int ppu_fp_fmadds_interp = ppu_fp_env("PS3_PPU_FMADDS_INTERP", 0);
 static struct VmInlineInit {
     VmInlineInit() {
         static const char* const vars[] = {

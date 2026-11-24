@@ -659,6 +659,9 @@ When the frame rate drops, the game's own audio mixing (on the recompiled PPU/SP
 | `AUDIO_FILL_MAX_BLOCKS` | `4` | A late block is bridged by repeating the last 5 ms of audio for at most this many blocks, with the last one fading out. `24` = the old length, which could buzz. |
 | `PORT_AUDIO_LOG` | `5000` | Period of the `[audio]` log line in ms. `1` = every second (also with `R2_RSX_PROF=1`), `0` = off. |
 | `PS3_THREAD_SLOT_FIX` | `1` | Shared with the R1 / R3 ports: a thread that ended through `sys_ppu_thread_exit` while another thread was already waiting to join it could keep its slot in the 64-entry thread table for good, until thread creates failed and the game waited for a thread that never started (R1 issue #17: black screen after a cutscene). A refused thread create is now logged (`[SYS] sys_ppu_thread_create ... FAILED: all 64 thread slots in use`). `0` = the old behaviour. |
+| `PS3_PPU_HW_ESTIMATE` | `1` | The PowerPC `fres` / `frsqrte` reciprocal estimates return the PS3's table values (bit for bit as RPCS3's interpreter and LLVM recompiler). `0` = the exact `1/x` and `1/sqrt(x)` of earlier builds. Logged at start: `[ppu-fp] ...`. |
+| `PS3_PPU_FMADDS_INTERP` | `0` | A/B test for the Holar Tower checkpoint. `1` = `fmadds` rounds `a*c` to double before the add, as RPCS3's PPU interpreter does (the PS3 and RPCS3's LLVM recompiler fuse them, the default). |
+| `R2_LUA_LOG` | `1` | The level scripts' progress messages (their `prt()`, silent in the retail game) as `[lua] ...` lines in `logs\run.log`; the last one shows which step a stuck level last reached. Repeats are counted, at most 20 lines a second and 5000 a run. `0` = off. |
 
 **Reading the log.** At start-up, `logs\run.log` shows `[audio] output: ... SoundTouch stretch (...)` with the MMCSS state and the mixer thread's affinity. Every 5 seconds there is a line like:
 
