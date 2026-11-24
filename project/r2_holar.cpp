@@ -9,9 +9,12 @@
  * checkpoint never comes (RPCS3 #11590 / #5831, "crew never move").
  *
  * The fix adds a watchdog to the loop of that script at load time:
- *   20 s after the order: give the script's own orders again;
- *   45 s, once Hale has stood on the platform for 6 s: set_position + hold_position
- *        the sentinels that are not on it onto their hold_position spots;
+ *   every 15 s from 15 s after the order: each sentinel not on the platform gets
+ *        the script's own order again (clear_home_area, innate_behavior, wait,
+ *        hold_position on its spot);
+ *   after 60 s, once Hale has stood on the platform for 6 s: set_position +
+ *        hold_position the sentinels still missing onto their spots (no more
+ *        repeats after this);
  *   once Hale has stood on the platform for another 10 s: run the gate's own body
  *        (esents5=true, idle, close the lobby door, move the elevator).
  * Each step is skipped once the original gate has fired (esents5 ~= nil).
@@ -39,26 +42,25 @@ static const char kWatchdog[] =
 "if (mstrtime4==true and esents5==nil) then\n"
 "hlra_t=(hlra_t or 0)+(step_time or 0.033)\n"
 "if is_inside(HALE, S07_TRIG_EPLATUP_ALLON2) then hlra_h=(hlra_h or 0)+(step_time or 0.033) else hlra_h=0 end\n"
-"if (hlra_s==nil and hlra_t>20) then\n"
-"hlra_s=1\n"
-"prt(\"holar-assist: crew not on the elevator 20 s after the order, giving it again\")\n"
-"clear_home_area(SENTINELS)\n"
-"wait()\n"
-"innate_behavior(SENTINELS)\n"
-"wait()\n"
-"if (esents5==nil) then\n"
-"hold_position(WARNER, S07_HOPO_EPLATUP_1)\n"
-"hold_position(CAPELLI, S07_HOPO_EPLATUP_2)\n"
-"hold_position(HAWTHORNE, S07_HOPO_EPLATUP_3)\n"
+"hlra_m=hlra_m or function(w, v, p, n, f)\n"
+"if (esents5==nil and not is_inside(w, v)) then\n"
+"if f then prt(\"holar-assist: moving \"..n..\" onto the platform\") set_position(w, p)\n"
+"else prt(\"holar-assist: \"..n..\" not on the platform, giving the order again\") clear_home_area(w) innate_behavior(w) wait() end\n"
+"if (esents5==nil) then hold_position(w, p) end\n"
 "end\n"
-"elseif (hlra_s==1 and hlra_t>45 and hlra_h>6) then\n"
-"hlra_s=2 hlra_h=0\n"
-"prt(\"holar-assist: Hale on the platform, moving the crew that is not\")\n"
-"if not is_inside(WARNER, S07_TRIG_EPLATUP_ALLON4) then prt(\"holar-assist: Warner\") set_position(WARNER, S07_HOPO_EPLATUP_1) hold_position(WARNER, S07_HOPO_EPLATUP_1) end\n"
-"if not is_inside(CAPELLI, S07_TRIG_EPLATUP_ALLON2) then prt(\"holar-assist: Capelli\") set_position(CAPELLI, S07_HOPO_EPLATUP_2) hold_position(CAPELLI, S07_HOPO_EPLATUP_2) end\n"
-"if not is_inside(HAWTHORNE, S07_TRIG_EPLATUP_ALLON2) then prt(\"holar-assist: Hawthorne\") set_position(HAWTHORNE, S07_HOPO_EPLATUP_3) hold_position(HAWTHORNE, S07_HOPO_EPLATUP_3) end\n"
-"elseif (hlra_s==2 and hlra_h>10) then\n"
-"hlra_s=3 esents5=true\n"
+"end\n"
+"if (hlra_s==nil and hlra_t>60 and hlra_h>6) then\n"
+"hlra_s=1 hlra_h=0\n"
+"hlra_m(WARNER, S07_TRIG_EPLATUP_ALLON4, S07_HOPO_EPLATUP_1, \"Warner\", true)\n"
+"hlra_m(CAPELLI, S07_TRIG_EPLATUP_ALLON2, S07_HOPO_EPLATUP_2, \"Capelli\", true)\n"
+"hlra_m(HAWTHORNE, S07_TRIG_EPLATUP_ALLON2, S07_HOPO_EPLATUP_3, \"Hawthorne\", true)\n"
+"elseif (hlra_s==nil and hlra_t>=(hlra_n or 15)) then\n"
+"hlra_n=(hlra_n or 15)+15\n"
+"hlra_m(WARNER, S07_TRIG_EPLATUP_ALLON4, S07_HOPO_EPLATUP_1, \"Warner\")\n"
+"hlra_m(CAPELLI, S07_TRIG_EPLATUP_ALLON2, S07_HOPO_EPLATUP_2, \"Capelli\")\n"
+"hlra_m(HAWTHORNE, S07_TRIG_EPLATUP_ALLON2, S07_HOPO_EPLATUP_3, \"Hawthorne\")\n"
+"elseif (hlra_s==1 and hlra_h>10) then\n"
+"hlra_s=2 esents5=true\n"
 "prt(\"holar-assist: platform check still failing, starting the elevator\")\n"
 "prt(\"ALL SENTINELS AND HALE ON ELEVATOR PLATFORM\")\n"
 "idle(SENTINELS)\n"
@@ -69,7 +71,7 @@ static const char kWatchdog[] =
 "lztimev=false lsztimev=false rztimev=false rsztimev=false lticz0=false rticz0=false\n"
 "end\n"
 "elseif (mstrtime4~=true) then\n"
-"hlra_t=nil hlra_h=nil hlra_s=nil\n"
+"hlra_t=nil hlra_h=nil hlra_s=nil hlra_n=nil\n"
 "end\n";
 
 static uint64_t fnv1a(const uint8_t* p, size_t n)
