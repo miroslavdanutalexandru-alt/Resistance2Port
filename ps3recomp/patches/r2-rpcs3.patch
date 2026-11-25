@@ -11058,17 +11058,10 @@ index b101a27..e51459f 100644
  	}
  
  	if (!m_swapchain)
-@@ -473,6 +528,68 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept
+@@ -473,6 +528,61 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept
  	vk::set_current_renderer(m_swapchain->get_device());
  	vk::init();
  
-+	{
-+		// R2PORT (issue #10): AMD GPUs create pipelines one at a time (PORT_PIPE_SERIAL), decided before any compile
-+		VkPhysicalDeviceProperties props{};
-+		vkGetPhysicalDeviceProperties(m_device->gpu(), &props);
-+		r2preload::configure(props.vendorID);
-+	}
-+
 +	// R2PORT (R3 #33): a 2 GB GPU runs out of video memory above 1.25x render scale (RSX_RES_SCALE). Cap it once, before
 +	// any surface exists. VRAM = the largest device-local heap (or RSX_VRAM_LIMIT_MB if lower). RSX_VRAM_AUTOCAP=0 = off.
 +	if (const char* e = std::getenv("RSX_VRAM_AUTOCAP"); !(e && e[0] == '0'))
