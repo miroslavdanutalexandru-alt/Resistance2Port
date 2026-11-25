@@ -20,6 +20,8 @@
 //                        in-game PC menu's Field of view).
 //   R2_PATCH_TIMING_FRAMECOUNT  30 Hz frame-count constants scaled to the
 //                        frame rate (hooks in r2.json); on by default.
+//   R2_MOVE_START_FIX    walk-start step above 60 fps (hook in r2.json,
+//                        r2_movestart.h); on by default, =0 = the game's.
 //
 // Graphics quality (all off by default, see README "Graphics enhancements"):
 //   R2_PATCH_FULLRES=1      no dynamic resolution: the scene stays at the
@@ -37,6 +39,7 @@
 #include <cstring>
 #include "ps3emu/ps3types.h"
 #include "ppu_recomp.h"
+#include "r2_movestart.h"
 
 extern "C" double r2_fps_target(void);   /* stubs.cpp: 30 = the game's own limiter */
 extern "C" double r2_lod_scale(void);
@@ -90,6 +93,8 @@ extern "C" void r2_patches_apply(void)
             const bool b = poke32("fps_floors", 0x00D69EB8u, 0x3C5A740Eu, w);
             fprintf(stderr, "[patch] Unlock FPS frame-time floors: %s\n", a && b ? "on" : "partial");
         }
+        if (r2_fps_target() != 30.0)
+            fprintf(stderr, "[patch] walk-start fix (R2_MOVE_START_FIX): %s\n", env_flag("R2_MOVE_START_FIX") != 0 ? "on" : "off");
     }
 
     /* Extended FOV (illusion), PPU-08da3b60...: bef32 0x00DE67E4 0.7.
@@ -420,4 +425,21 @@ extern "C" void r2_frustum_aspect(ppu_context* ctx, int hfov)
     if (hfov && k > 1.0)       ctx->fpr[3] = (double)(float)(atan(tan(h) * k) * (360.0 / 3.14159265358979323846));
     else if (!hfov && k < 1.0) ctx->fpr[3] = (double)(float)(atan(tan(h) / k) * (360.0 / 3.14159265358979323846));
     ctx->fpr[4] = (double)(float)(a * k);
+}
+
+/* R2_MOVE_START_FIX (default on; 0 = the game's original step). Hero ground update
+ * func_001270C8, before its func_000F0E30 steering call at 0x001278C8 (tools/hooks/r2.json):
+ * while the measured velocity is ~zero (still = f27, its largest component), the steering
+ * rates f2/f3 are scaled so the first step from a standstill is as large as at 60 fps;
+ * otherwise the 0.3 m/s test at 0x001279B0 zeroes it above ~75 fps and the hero cannot
+ * walk until a jump (GitHub R2 #21). See r2_movestart.h. */
+extern "C" void r2_move_start_hook(ppu_context* ctx, double still)
+{
+    static int on = -1;
+    if (on < 0) on = env_flag("R2_MOVE_START_FIX") != 0;
+    if (!on || !(still < R2_MOVE_STILL_EPS)) return;
+    const double k = r2_move_start_boost((double)u2f(vm_read32(0x012F73ACu)), (double)u2f(vm_read32(0x012F73A8u)));
+    if (k == 1.0) return;
+    ctx->fpr[2] = (double)(float)(ctx->fpr[2] * k);
+    ctx->fpr[3] = (double)(float)(ctx->fpr[3] * k);
 }

@@ -92,12 +92,12 @@ static std::vector<Setting> g_set = {
       "The PS3 game runs at 30 fps. 60 fps doubles how often the game updates and draws; the game measures "
       "real time each frame, so it does not play faster. Needs about twice the CPU and GPU time. "
       "40 / 45 suit 120 Hz / 90 Hz screens and handhelds. 72 to 240 / Match display / Uncapped go further (uncapped: as fast as the PC allows; "
-      "best with VSync Auto or Off and a G-Sync / FreeSync monitor). Warning: above about 75 fps "
-      "the left stick's movement breaks (the player hops instead of walking); 60 is recommended.",
+      "best with VSync Auto or Off and a G-Sync / FreeSync monitor). Above 60 fps the game's physics still "
+      "steps at 60 Hz; 60 is recommended.",
       { {"30 fps  (PS3 original)", "30"}, {"40 fps  (Steam Deck / 120 Hz screens)", "40"}, {"45 fps  (90 Hz screens)", "45"},
-        {"60 fps", "60"}, {"72 fps  (144 Hz screens)", "72"}, {"90 fps  (may break movement)", "90"},
-        {"120 fps  (may break movement)", "120"}, {"144 fps  (may break movement)", "144"}, {"165 fps  (may break movement)", "165"},
-        {"240 fps  (may break movement)", "240"}, {"Match display refresh", "refresh"}, {"Just under refresh  (G-Sync / FreeSync)", "vrr"},
+        {"60 fps", "60"}, {"72 fps  (144 Hz screens)", "72"}, {"90 fps  (experimental)", "90"},
+        {"120 fps  (experimental)", "120"}, {"144 fps  (experimental)", "144"}, {"165 fps  (experimental)", "165"},
+        {"240 fps  (experimental)", "240"}, {"Match display refresh", "refresh"}, {"Just under refresh  (G-Sync / FreeSync)", "vrr"},
         {"Uncapped", "0"} }, 3 },
     { "vsync", "VSync",
       "Off is smoothest with a G-Sync / FreeSync monitor and has the lowest input lag. On removes tearing on "

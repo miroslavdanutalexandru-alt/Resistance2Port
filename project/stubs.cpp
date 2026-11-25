@@ -1283,10 +1283,14 @@ extern "C" double r2_fps_target(void)
     { char fb[32]; snprintf(fb, sizeof fb, "%.3f", f); _putenv_s("PORT_FPS_EFFECTIVE", fb); snprintf(fb, sizeof fb, "%.3f", hz); _putenv_s("PORT_DISPLAY_HZ", fb); }   /* PORT_REFRESH_SWITCH (rsx_null_backend.c) */
     fprintf(stderr, "[fps] target %s%.3f (display %.3f Hz, RSX_VSYNC=%s)\n",
             f > 0.0 ? "" : "uncapped ", f, hz, v ? v : "(unset)");
-    if (f == 0.0 || f > 75.0)   /* the game's stick-to-movement path misbehaves at high frame rates */
-        fprintf(stderr, "[fps] WARNING: above 75 fps (%s) the left stick's movement breaks (the player jumps instead of "
-                        "walking smoothly: jump-to-move); 60 is the recommended cap (R2_FPS=60)\n",
-                f > 0.0 ? "capped" : "uncapped");
+    {
+        const char* ms = getenv("R2_MOVE_START_FIX");   /* r2_patches.cpp: the walk-start fix (GitHub R2 #21) */
+        const bool msoff = ms && (*ms == '0' || !_stricmp(ms, "off") || !_stricmp(ms, "false") || !_stricmp(ms, "no"));
+        if ((f == 0.0 || f > 75.0) && msoff)   /* without it, the hero cannot start walking at high frame rates */
+            fprintf(stderr, "[fps] WARNING: above 75 fps (%s) with R2_MOVE_START_FIX=0 the hero cannot start walking from a "
+                            "standstill (only jump-to-move works); unset it or cap at 60 (R2_FPS=60)\n",
+                    f > 0.0 ? "capped" : "uncapped");
+    }
     if (f > 0.0 && f != 30.0) {   /* a fixed-refresh display only paces evenly at a divisor of its rate */
         const double q = hz / f;
         if (fabs(q - floor(q + 0.5)) > 0.03)
