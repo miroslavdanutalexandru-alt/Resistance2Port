@@ -240,21 +240,23 @@ static int god_deathfix(void)
 }
 static void god_death(int god, int ndead)
 {
-    static int was = 0, told_long = 0;
+    static int was = 0, told_long = 0, nlog = 0;   /* nlog: with the fix off the refill can revive the hero every frame */
     static unsigned long long t0 = 0;
 #ifdef _WIN32
     const unsigned long long now = GetTickCount64();
 #else
     const unsigned long long now = 0;
 #endif
+    const int quiet = nlog > 40;
     if (god && ndead && !was) {
         t0 = now; told_long = 0;
-        fprintf(stderr, god_deathfix() ? "[cheat] god mode: hero dead (scripted kill), no health refill until the respawn\n"
+        if (!quiet && ++nlog) fprintf(stderr, god_deathfix() ? "[cheat] god mode: hero dead (scripted kill), no health refill until the respawn\n"
                                        : "[cheat] god mode: hero dead (scripted kill), health refill goes on (PORT_CHEAT_GOD_DEATHFIX=0)\n");
     } else if (god && ndead && !told_long && now - t0 > 30000) {
         told_long = 1;
         fprintf(stderr, "[cheat] god mode: hero still dead after %.0f s\n", (now - t0) / 1000.0);
-    } else if (!ndead && was) {
+    } else if (!ndead && was && !quiet) {
+        nlog++;
         fprintf(stderr, "[cheat] god mode: hero %s after %.1f s\n", god ? "alive again" : "no longer tracked (god mode off)", (now - t0) / 1000.0);
     }
     was = god && ndead;
