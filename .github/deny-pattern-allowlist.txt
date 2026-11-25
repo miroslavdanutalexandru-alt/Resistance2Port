@@ -1,0 +1,3 @@
+# Tracked paths exempt from the game-file deny patterns (exact paths, one per line, relative to the repo root).
+# Checked by .github/scripts/repo_hygiene.py. Add a line only for a source file that is not game data.
+fpval/fpval.c   # fragment program validator source; the directory name matches the (^|/)fpval/ cache pattern; build_installer.ps1 leaves fpval/ out of the installer
