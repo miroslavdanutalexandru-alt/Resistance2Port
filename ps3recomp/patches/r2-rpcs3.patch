@@ -27378,10 +27378,10 @@ index 0000000..db54a19
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..51801d6
+index 0000000..f0467bd
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12322 @@
+@@ -0,0 +1,12351 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -27886,6 +27886,11 @@ index 0000000..51801d6
 +		// are copied to the history at the flip, so it has its own velocity from the next frame (as inline classification).
 +		int om_defer = 1;
 +		bool om_defer_hist = true;
++		// RSX_AA_OBJMV_DEFER_HOLD (default 8; 0 = old): a draw that moved in any of the last n frames is not predicted
++		// static. Objects the game moves on alternate frames (30 Hz animation at 60 fps, doors, swaying foliage instances)
++		// were static last frame on every moving frame: each move was a late start with camera motion only (FB3/FB6/FB7
++		// run.log: 30-40 late starts per frame).
++		u32 om_defer_hold = 8;
 +		// RSX_AA_FAST_EXIT (default: on with RSX_AA_OBJMV_DEFER; 1 / 0 force): a draw outside the scene surfaces with the
 +		// targets, depth / stencil / colour state and frame state of the previous draw, which needed nothing (no jitter,
 +		// no capture, no run), returns right after the target tally.
@@ -28264,6 +28269,7 @@ index 0000000..51801d6
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_FAST_STATIC"); e && *e) r.om_fast_static = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_AA_OBJMV_DEFER"); e && *e) r.om_defer = std::clamp(std::atoi(e), 0, 2);
 +		if (const char* e = std::getenv("RSX_AA_OBJMV_DEFER_HIST"); e && *e) r.om_defer_hist = *e != '0';
++		if (const char* e = std::getenv("RSX_AA_OBJMV_DEFER_HOLD"); e && *e) r.om_defer_hold = static_cast<u32>(std::clamp(std::atoi(e), 0, 250));
 +		if (const char* e = std::getenv("RSX_AA_FAST_EXIT"); e && *e) r.fast_exit = std::atoi(e) != 0 ? 1 : 0;
 +		if (const char* e = std::getenv("RSX_FSR_REACTIVE")) r.fsr_reactive = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_NEW_HIST")) r.om_new_hist = static_cast<u32>(std::max(0, std::min(100, std::atoi(e))));
@@ -30426,6 +30432,7 @@ index 0000000..51801d6
 +		u64 om_dlkey = 0;              // RSX_DLSS_OBJMV_DEFORM_REBASE: vertex layout only
 +		u32 om_dcnt = 0;               // vertices copied
 +		u8 om_dage = 255;              // RSX_DLSS_OBJMV_DEFORM_CARRY: frames since its vertex data last changed (255: never seen changing)
++		u8 om_mage = 255;              // RSX_AA_OBJMV_DEFER_HOLD: frames since it last moved (255: never seen moving)
 +		const void* vkvp = nullptr; // the VKVertexProgram that drew it
 +		m4 M;
 +	};
@@ -30626,7 +30633,8 @@ index 0000000..51801d6
 +		float om_vh = 0.f;             // the scene viewport height, set by scene draws only (!aa_done): om_pick_nearest reads it
 +		                               // after the scene (RSX_AA_OBJMV_DEFER) while post passes rewrite vh
 +		std::vector<u32> om_defer_q;   // RSX_AA_OBJMV_DEFER: cur_F entries predicted static, classified after the scene
-+		u32 om_def_draws = 0, om_late_start = 0, om_def_frames = 0;
++		u32 om_def_draws = 0, om_late_start = 0, om_def_frames = 0, om_def_held = 0; // om_def_held: RSX_AA_OBJMV_DEFER_HOLD
++		u32 om_ls_age[3] = {}; // late starts by frames since the draw last moved: 2 (alternate frames), 3-8, longer / never
 +		u64 om_def_ns = 0;
 +		bool fast_ok = false;          // RSX_AA_FAST_EXIT: the previous draw needed nothing
 +		u64 fast_sig = 0;
@@ -32326,6 +32334,11 @@ index 0000000..51801d6
 +		if (p.prog != e.prog || !(p.om & om_matched) || (p.om & (om_new | om_skin | om_dyn | om_rigid)) || p.om_hslot || p.om_dsize ||
 +			p.om_dage <= r2cfg().om_deform_carry)
 +			return false;
++		if (p.om_mage < r2cfg().om_defer_hold)
++		{
++			st.om_def_held++;
++			return false;
++		}
 +		e.om = static_cast<decltype(e.om)>(e.om | om_matched);
 +		e.prev = *pp;
 +		e.loose = loose;
@@ -32716,7 +32729,12 @@ index 0000000..51801d6
 +			e.om = static_cast<decltype(e.om)>(e.om & ~(om_matched | om_new));
 +			e.loose = false;
 +			om_classify(i);
-+			if (e.om & (om_skin | om_rigid)) st.om_late_start++;
++			if (e.om & (om_skin | om_rigid))
++			{
++				st.om_late_start++;
++				const u32 pm = e.prev < st.prev_F.e.size() ? st.prev_F.e[e.prev].om_mage : 255u;
++				st.om_ls_age[pm <= 1 ? 0 : pm <= 7 ? 1 : 2]++;
++			}
 +		}
 +		st.om_def_draws += size32(st.om_defer_q);
 +		st.om_def_frames++;
@@ -34793,11 +34811,12 @@ index 0000000..51801d6
 +			st.om_fast = st.om_fast_chk = 0;
 +			if (r2cfg().om_defer || st.fast_draws)
 +			{
-+				r2log("objmv defer (RSX_AA_OBJMV_DEFER=%d): %u frames, %u draws predicted static and classified after the scene (%.0f us/frame%s); late-start %u (moving while predicted static: camera motion this frame; %u given a history copy, RSX_AA_OBJMV_DEFER_HIST); fast exit (RSX_AA_FAST_EXIT) %u of %u draws",
++				r2log("objmv defer (RSX_AA_OBJMV_DEFER=%d): %u frames, %u draws predicted static and classified after the scene (%.0f us/frame%s); late-start %u (moving while predicted static: camera motion this frame; %u given a history copy, RSX_AA_OBJMV_DEFER_HIST; moved 2 frames before %u, 3-8 frames before %u, longer ago / never %u); %u not predicted: moved in the last %u frames (RSX_AA_OBJMV_DEFER_HOLD); fast exit (RSX_AA_FAST_EXIT) %u of %u draws",
 +					r2cfg().om_defer, st.om_def_frames, st.om_def_draws, st.om_def_frames ? static_cast<double>(st.om_def_ns) / 1000.0 / st.om_def_frames : 0.0,
-+					r2cfg().om_defer == 1 ? " on the worker thread" : " on the render thread at the flip", st.om_late_start, g_om2.t_late_hist, st.fast_hits, st.fast_draws);
++					r2cfg().om_defer == 1 ? " on the worker thread" : " on the render thread at the flip", st.om_late_start, g_om2.t_late_hist, st.om_ls_age[0], st.om_ls_age[1], st.om_ls_age[2], st.om_def_held, r2cfg().om_defer_hold, st.fast_hits, st.fast_draws);
 +				g_om2.t_late_hist = 0;
-+				st.om_def_frames = st.om_def_draws = st.om_late_start = 0;
++				st.om_def_frames = st.om_def_draws = st.om_late_start = st.om_def_held = 0;
++				st.om_ls_age[0] = st.om_ls_age[1] = st.om_ls_age[2] = 0;
 +				st.om_def_ns = 0;
 +				st.fast_hits = st.fast_draws = 0;
 +			}
@@ -35117,6 +35136,16 @@ index 0000000..51801d6
 +	if (r2mvd_enabled()) [[unlikely]] r2mvd_frame_end(&m_current_command_buffer, *m_device, st.scene_valid, st.frame, st.fx_img.get(), st.fx_img && st.fx_frame == st.frame);
 +
 +	// Next frame
++	// RSX_AA_OBJMV_DEFER_HOLD: frames since each draw last moved (after om_defer_late_flush classified the deferred ones)
++	if (r2cfg().om_defer)
++	{
++		const u32 np = size32(st.prev_F.e);
++		for (auto& e : st.cur_F.e)
++		{
++			if (e.om & (om_skin | om_rigid | om_dyn)) e.om_mage = 0;
++			else if ((e.om & om_matched) && e.prev < np) e.om_mage = static_cast<u8>(std::min<u32>(st.prev_F.e[e.prev].om_mage + 1u, 255u));
++		}
++	}
 +	g_evp_swaps++; // RSX_AA_EXACT_MEMO
 +	st.prev_F.e.swap(st.cur_F.e);
 +	st.prev_F.consts.swap(st.cur_F.consts);
