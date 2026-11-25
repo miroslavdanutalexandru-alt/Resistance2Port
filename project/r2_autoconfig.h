@@ -329,9 +329,10 @@ inline Settings recommend(const Hardware& h, int tier = T_AUTO)
         s.filter = "fsr"; s.sharpen = "0.25";
     }
 
-    // frame rate: 60 doubles the CPU work. Never above 60 automatically: above ~75 fps the game's stick
-    // movement breaks (jump-to-move), so 120 / 144 / uncapped are explicit user choices only.
-    // R2_AUTOCONFIG_120=1: the old recommendation (120 on high-refresh screens with 8+ cores and a fast GPU).
+    // frame rate: 60 doubles the CPU work. Never above 60 automatically: above ~75 fps the hero could not
+    // start walking (jump-to-move, fixed by R2_MOVE_START_FIX), and 120 / 144 / uncapped stay explicit user
+    // choices (the physics step is fixed at 60 Hz). R2_AUTOCONFIG_120=1: the old recommendation (120 on
+    // high-refresh screens with 8+ cores and a fast GPU).
     char a120[4] = "";
     GetEnvironmentVariableA("R2_AUTOCONFIG_120", a120, sizeof a120);
     if (cls == 0 || very_weak_cpu || (cls == 1 && weak_cpu)) s.fps = "30";

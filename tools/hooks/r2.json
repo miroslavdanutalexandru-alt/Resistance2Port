@@ -1096,6 +1096,30 @@
      "        ctx->gpr[8] = R_8 = (int64_t)(int32_t)(-1);"
     ]
    }
+  ],
+  "func_001270C8": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_001270C8(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" void r2_move_start_hook(ppu_context* ctx, double still);   /* R2: walk-start step above 60 fps (r2_patches.cpp, R2_MOVE_START_FIX) */",
+     "void func_001270C8(ppu_context* ctx) {"
+    ]
+   },
+   {
+    "at": 582,
+    "ctx": "        ctx->fpr[3] = ctx->fpr[29];",
+    "rm": [
+     "        ctx->lr = R_lr = 0x001278CC; func_000F0E30(ctx); DRAIN_TRAMPOLINE(ctx); _RCX_RL;"
+    ],
+    "add": [
+     "        r2_move_start_hook(ctx, ctx->fpr[27]);   /* R2: f27 = largest |measured velocity| component; standing still -> first step at 60 fps size (GitHub R2 #21) */",
+     "        ctx->lr = R_lr = 0x001278CC; func_000F0E30(ctx); DRAIN_TRAMPOLINE(ctx); _RCX_RL;"
+    ]
+   }
   ]
  },
  "preamble": [],
