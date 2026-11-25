@@ -27378,10 +27378,10 @@ index 0000000..db54a19
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..497170d
+index 0000000..db1fa72
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12123 @@
+@@ -0,0 +1,12242 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -27914,6 +27914,10 @@ index 0000000..497170d
 +		u32 mv_conf_lag = 4;
 +		// RSX_DLSS_OBJMV_NONAFFINE (default 1; 0 = old): see om_classify (wind-swayed foliage got camera motion only)
 +		bool om_nonaffine = true;
++		// RSX_DLSS_OBJMV_SWAY (default 1; 0 = old): see om_sway_moves (attribute-weighted wind sway got camera motion only)
++		bool om_sway = true;
++		// RSX_DLSS_OBJMV_LOCKED (default 1; 0 = old): see om_locked (camera-locked first-person meshes got camera motion)
++		bool om_locked = true;
 +		// RSX_DLSS_OBJMV_PAIR_NEAREST (default 16; 0 = off): a matched skinned or non-affine draw whose constants changed
 +		// since its ordinal pair is re-paired with the closest previous occurrence of the same draw within +-n ordinals
 +		// (r2om_pair_nearest: R2 1120 foliage drawn as instances of one mesh paired with the neighbouring instance's bone
@@ -28227,6 +28231,8 @@ index 0000000..497170d
 +		r.conf_cut = port_native_parse_bool(std::getenv("RSX_AA_CONF_CUT"), 0) != 0;
 +		if (const char* e = std::getenv("RSX_AA_CUT_PARALLAX_GAP"); e && *e) r.cut_par_gap = static_cast<u32>(std::clamp(std::atoi(e), 0, 3600));
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_NONAFFINE")) r.om_nonaffine = std::atoi(e) != 0;
++		if (const char* e = std::getenv("RSX_DLSS_OBJMV_SWAY"); e && *e) r.om_sway = std::atoi(e) != 0;
++		if (const char* e = std::getenv("RSX_DLSS_OBJMV_LOCKED"); e && *e) r.om_locked = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_PAIR_NEAREST"); e && *e) r.om_pair_near = static_cast<u32>(std::clamp(std::atoi(e), 0, 64));
 +		if (const char* e = std::getenv("RSX_AA_OBJMV_DEFER_SPEC"); e && *e) r.om_late_spec = *e != '0';
 +		if (const char* e = std::getenv("RSX_AA_STATIC_SNAP"); e && *e) r.static_snap = std::atoi(e) != 0;
@@ -28487,6 +28493,8 @@ index 0000000..497170d
 +	// does exactly the arithmetic a separate single-point run would do. Control flow depends only on the branch
 +	// bits (condition-code tests are not interpreted), so all lanes follow the same path.
 +	constexpr int VPL = 5;
++	// RSX_DLSS_OBJMV_SWAY: value every non-position input reads during vp_run on this thread (nullptr = zero, the default)
++	thread_local const float* t_vp_attr = nullptr;
 +
 +	struct vp_code
 +	{
@@ -28595,7 +28603,7 @@ index 0000000..497170d
 +					if (d1.input_src == 0)
 +						for (int l = 0; l < VPL; ++l) put(v[l], in0[l]);
 +					else
-+						put_all(zero);
++						put_all(t_vp_attr ? t_vp_attr : zero);
 +					break;
 +				case RSX_VP_REGISTER_TYPE_CONSTANT:
 +					if (!d3.index_const)
@@ -28825,7 +28833,7 @@ index 0000000..497170d
 +					switch (s.reg_type)
 +					{
 +					case RSX_VP_REGISTER_TYPE_TEMP: p = ((rinit >> s.tmp_src) & 1) ? r[s.tmp_src][l] : zero; break;
-+					case RSX_VP_REGISTER_TYPE_INPUT: p = d1.input_src == 0 ? in0[l] : zero; break;
++					case RSX_VP_REGISTER_TYPE_INPUT: p = d1.input_src == 0 ? in0[l] : (t_vp_attr ? t_vp_attr : zero); break;
 +					case RSX_VP_REGISTER_TYPE_CONSTANT:
 +						if (!d3.index_const)
 +						{
@@ -29042,6 +29050,8 @@ index 0000000..497170d
 +		mutable u8 om_rows_sep = 0, om_rows_whole = 0;
 +		// RSX_DLSS_OBJMV_DEFORM_NEW: a paired draw of this program had rewritten vertex data (CPU / SPU deformed mesh)
 +		mutable u8 om_deforms = 0;
++		// RSX_DLSS_OBJMV_SWAY: 0 unknown, 1 position independent of the other inputs (after om_attr_n checks), 2 dependent
++		mutable u8 om_attr = 0, om_attr_n = 0;
 +		vp_code code() const { return { data.data(), static_cast<u32>(data.size() / 4), pc0 }; }
 +	};
 +
@@ -30705,6 +30715,7 @@ index 0000000..497170d
 +		u32 om_loose = 0, om_loose_bad = 0; // classifier: loose pairs, loose pairs rejected (implausible motion)
 +		u32 om_nw_n = 0;              // RSX_DLSS_OBJMV_NOWRITE: matched non-depth-writing draws given their own velocity
 +		u32 om_nonaffine = 0;          // RSX_DLSS_OBJMV_NONAFFINE: matched draws without a matrix whose constants changed (moving)
++		u32 om_sway_n = 0, om_locked_n = 0; // RSX_DLSS_OBJMV_SWAY / _LOCKED: draws given their own velocity
 +		u32 om_pn_checked = 0, om_pn_repaired = 0, om_pn_static = 0; // RSX_DLSS_OBJMV_PAIR_NEAREST
 +		u32 vote_fail_logged = 0;
 +		// RSX_AA_CAMERA_EXACT (since the last fps line, except ex_proven)
@@ -31737,6 +31748,89 @@ index 0000000..497170d
 +		return true;
 +	}
 +
++	// RSX_DLSS_OBJMV_SWAY (default 1; 0 = old): wind sway weighted by a vertex attribute (position + colour.a * sin(t) *
++	// dir) vanished from the matrix extraction (it feeds only the position, every other input reads zero), so the draw's
++	// matrix moved exactly like the camera and it got camera motion only, while the onepass redraw runs the real shader
++	// on the real attributes. Runs the program with every other input at a probe value on both frames' constants: when
++	// last frame's output is not this frame's carried by r (the draw's position-only motion), the attribute-dependent
++	// part moved on its own -> own velocity. A static attribute term (normal offset) moves with r and stays static.
++	bool om_sway_moves(const mvp_entry& e, const mvp_entry& p, const m4& r)
++	{
++		if (!r2cfg().om_sway || e.prog->indexed || p.prog != e.prog || p.branch_bits != e.branch_bits || e.state != 1) return false;
++		const vp_info& pi = *e.prog;
++		if (pi.om_attr == 1) return false;
++		static const float pts[VPL][4] = { {0, 0, 0, 1}, {1, 0, 0, 1}, {0, 1, 0, 1}, {0, 0, 1, 1}, {0.37f, -1.3f, 2.1f, 1} };
++		static const float probe[4] = { 0.73f, 0.41f, 0.59f, 1.f };
++		alignas(16) thread_local float buf[512 * 4];
++		const auto run = [&](const mvp_frame& f, const mvp_entry& x, float out[VPL][4]) -> bool
++		{
++			const float* src = f.consts.data() + x.const_off;
++			for (usz k = 0; k < pi.reads.size(); ++k) std::memcpy(buf + pi.reads[k] * 4, src + k * 4, 4 * sizeof(float));
++			t_vp_attr = probe;
++			const bool ok = vp_run(pi.code(), buf, x.branch_bits, pts, out);
++			t_vp_attr = nullptr;
++			return ok;
++		};
++		float qe[VPL][4], qp[VPL][4];
++		if (!run(g_r2.cur_F, e, qe)) return false;
++		if (pi.om_attr == 0)
++		{
++			// does the position depend on the other inputs at all? (e.M is the zero-input run)
++			double mx = 0, d = 0;
++			for (int l = 0; l < VPL; ++l)
++				for (int k = 0; k < 4; ++k)
++				{
++					double z = e.M.m[k][3];
++					for (int c = 0; c < 3; ++c) z += e.M.m[k][c] * pts[l][c];
++					mx = std::fmax(mx, std::fabs(z));
++					d = std::fmax(d, std::fabs(z - qe[l][k]));
++				}
++			if (!(d > 1e-4 * (1.0 + mx)))
++			{
++				if (++pi.om_attr_n >= 8) pi.om_attr = 1;
++				return false;
++			}
++			pi.om_attr = 2;
++		}
++		if (!run(g_r2.prev_F, p, qp)) return false;
++		const double eps = std::fmax(r2cfg().om_static_px, 0.25f) / std::fmax(g_r2.om_vh, 1.f);
++		for (int l = 0; l < VPL; ++l)
++		{
++			double a[4];
++			for (int k = 0; k < 4; ++k)
++				a[k] = r.m[k][0] * qe[l][0] + r.m[k][1] * qe[l][1] + r.m[k][2] * qe[l][2] + r.m[k][3] * qe[l][3];
++			if (!(a[3] > 1e-9) || !(qp[l][3] > 1e-9)) continue;
++			const double d = std::hypot(a[0] / a[3] - qp[l][0] / qp[l][3], a[1] / a[3] - qp[l][1] / qp[l][3]) * 0.5;
++			if (std::isfinite(d) && d > eps) return true;
++		}
++		return false;
++	}
++
++	// RSX_DLSS_OBJMV_LOCKED (default 1; 0 = old): a first-person mesh (weapon, arms) drawn with its own view-space
++	// transform keeps the same constants while the camera turns: it stands still on screen, but camera motion (from its
++	// depth) gave it the world's motion, so frame generation smeared the background around the gun. A matched draw whose
++	// constants are all identical to its pair's while the camera moved gets its own velocity (zero).
++	bool om_cam_moved()
++	{
++		auto& st = g_r2;
++		if (st.om_cam_cur && st.prev_F.cam_h) return st.om_cam_cur != st.prev_F.cam_h;
++		if (!st.om_nclus) return false;
++		u32 best = 0;
++		for (u32 c = 1; c < st.om_nclus; ++c) if (st.om_clus[c].n > st.om_clus[best].n) best = c;
++		if (st.om_clus[best].n < 3) return false;
++		const m4& R = st.om_clus[best].R;
++		return m4_maxdiff(R, m4_identity()) > 1e-5 * (1.0 + m4_maxabs(R));
++	}
++	bool om_locked(const mvp_entry& e, const mvp_entry& p)
++	{
++		auto& st = g_r2;
++		if (!r2cfg().om_locked || p.prog != e.prog || p.branch_bits != e.branch_bits) return false;
++		const usz n = e.prog->indexed ? 468 : e.prog->reads.size();
++		if (std::memcmp(st.cur_F.consts.data() + e.const_off, st.prev_F.consts.data() + p.const_off, n * 4 * sizeof(float)) != 0)
++			return false;
++		return om_cam_moved();
++	}
++
 +	// RSX_DLSS_OBJMV: classify a depth-writing scene draw right after its capture. Draws that may need their own
 +	// motion (or the bias mask) get om_want flags; r2aa_objmv_after_draw redraws them into the ID target.
 +	void om_classify(u32 i, const om_finds* hint = nullptr)
@@ -31886,6 +31980,11 @@ index 0000000..497170d
 +					e.om |= om_skin;
 +					return;
 +				}
++			if (om_locked(e, p))
++			{
++				e.om |= om_rigid;
++				st.om_locked_n++;
++			}
 +			return;
 +		}
 +		if (!resolve_entry(st.cur_F, i) || !resolve_entry(st.prev_F, *pp))
@@ -31928,6 +32027,12 @@ index 0000000..497170d
 +		if (!m4_inverse(e.M, inv)) return;
 +		const m4 r = m4_mul(p.M, inv);
 +		if (!std::isfinite(m4_maxabs(r))) return;
++		if (om_locked(e, p))
++		{
++			e.om |= om_rigid;
++			st.om_locked_n++;
++			return;
++		}
 +		if (r2cfg().om_nearest && r2cfg().om_exact_ref)
 +		{
 +			m4 Rx;
@@ -31935,6 +32040,12 @@ index 0000000..497170d
 +			{
 +				if (m4_maxdiff(Rx, r) <= 1e-3 * (1.0 + m4_maxabs(r)))
 +				{
++					if (om_sway_moves(e, p, r))
++					{
++						e.om |= om_rigid;
++						st.om_sway_n++;
++						return;
++					}
 +					st.om_nr_exact++;
 +					st.om_nr_static++;
 +					return;
@@ -32031,6 +32142,11 @@ index 0000000..497170d
 +				}
 +			}
 +			e.om |= om_rigid;
++		}
++		else if (om_sway_moves(e, p, r))
++		{
++			e.om |= om_rigid;
++			st.om_sway_n++;
 +		}
 +	}
 +
@@ -34605,6 +34721,9 @@ index 0000000..497170d
 +				o.dg_carry = o.dm_noprev = o.dm_key = o.dm_hist = o.dm_nocap = 0;
 +				o.dm_np_unp = o.dm_np_first = o.dm_np_aged = o.dm_at = o.dg_new = o.dg_new_bytes = o.dm_id = 0;
 +				st.om_loose = st.om_loose_bad = st.om_nonaffine = 0;
++				if ((r2cfg().om_sway || r2cfg().om_locked) && (st.om_sway_n || st.om_locked_n))
++					r2log("objmv own velocity: %u attribute-swayed draws (RSX_DLSS_OBJMV_SWAY), %u camera-locked draws (RSX_DLSS_OBJMV_LOCKED)", st.om_sway_n, st.om_locked_n);
++				st.om_sway_n = st.om_locked_n = 0;
 +				if (r2cfg().om_pair_near)
 +					r2log("objmv pairing by nearest constants (RSX_DLSS_OBJMV_PAIR_NEAREST=%u): %u changed skinned / non-affine pairs checked, %u re-paired with another occurrence (%u identical: static); late-start copies at command buffer ends %u, kept %u (RSX_AA_OBJMV_DEFER_SPEC=%d)",
 +						r2cfg().om_pair_near, st.om_pn_checked, st.om_pn_repaired, st.om_pn_static, o.t_late_spec, o.t_late_promo, r2cfg().om_late_spec ? 1 : 0);
