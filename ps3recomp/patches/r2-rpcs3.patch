@@ -27378,10 +27378,10 @@ index 0000000..db54a19
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..0f8ae13
+index 0000000..51801d6
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12264 @@
+@@ -0,0 +1,12322 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -27918,6 +27918,16 @@ index 0000000..0f8ae13
 +		bool om_sway = true;
 +		// RSX_DLSS_OBJMV_LOCKED (default 1; 0 = old): see om_locked (camera-locked first-person meshes got camera motion)
 +		bool om_locked = true;
++		// RSX_DLSS_OBJMV_MULTI (default 1; 0 = old): onepass also covers multi-range draws (one clause drawn as several index
++		// ranges) and trivially instanced draws: they are issued right after the velocity variant is bound, all with it, so
++		// they get their own velocity too (they were skipped: camera motion only). Instanced constants stay skipped (one
++		// constants history per draw).
++		bool om_multi = true;
++		// RSX_DLSS_OBJMV_DEFORM_REBASE (default 1; 0 = old): a CPU/SPU-rewritten mesh whose last-frame vertex copy has the same
++		// attribute layout, vertex count and size but another vertex range / base (the mesh written elsewhere in the
++		// game's buffers) uses that copy: vertex k of the copy is vertex k of this draw (vertex_id = index - vertex base).
++		// It used to fall back to camera motion ("layout" in the objmv2 detail line).
++		bool om_rebase = true;
 +		// RSX_DLSS_OBJMV_PAIR_NEAREST (default 16; 0 = off): a matched skinned or non-affine draw whose constants changed
 +		// since its ordinal pair is re-paired with the closest previous occurrence of the same draw within +-n ordinals
 +		// (r2om_pair_nearest: R2 1120 foliage drawn as instances of one mesh paired with the neighbouring instance's bone
@@ -27952,7 +27962,7 @@ index 0000000..0f8ae13
 +		// this many render pixels is written as exactly zero (float noise of the per-draw previous-frame evaluation)
 +		float om_deadzone = 0.01f;
 +		// RSX_AA_EVALS (default 2048; 1024 / 640 before, 384 originally): scene draws captured per frame (matrix vote + object motion)
-+		u32 evals_max = 2048; // RSX_AA_EVALS 16..4096; was 1024 (R3 t2: draw-cap in 239 of 278 frames: later moving draws got camera motion only, the vote saw part of the frame); 640 before: R2 jungle intro / R3 battles hit it every frame (later draws: no capture, no object motion)
++		u32 evals_max = 4096; // RSX_AA_EVALS 16..4096 (RSX_AA_EVALS=2048: the previous default; FB3 run.log iceland: draw cap hit in 193 of 1040 frames, the later draws got camera motion only); was 1024 (R3 t2: draw-cap in 239 of 278 frames: later moving draws got camera motion only, the vote saw part of the frame); 640 before: R2 jungle intro / R3 battles hit it every frame (later draws: no capture, no object motion)
 +		// RSX_AA_VOTE_HOLD=<n> (default 1; 6 before; -1 = old: forever): frames a failed camera vote keeps the last voted
 +		// motion. Beyond that the largest agreeing group is used when its motion is plausible (< RSX_AA_CUT), else no
 +		// motion. A camera held for 6 frames while turning smeared the whole screen.
@@ -28233,6 +28243,8 @@ index 0000000..0f8ae13
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_NONAFFINE")) r.om_nonaffine = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_SWAY"); e && *e) r.om_sway = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_LOCKED"); e && *e) r.om_locked = std::atoi(e) != 0;
++		if (const char* e = std::getenv("RSX_DLSS_OBJMV_MULTI"); e && *e) r.om_multi = std::atoi(e) != 0;
++		if (const char* e = std::getenv("RSX_DLSS_OBJMV_DEFORM_REBASE"); e && *e) r.om_rebase = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_PAIR_NEAREST"); e && *e) r.om_pair_near = static_cast<u32>(std::clamp(std::atoi(e), 0, 64));
 +		if (const char* e = std::getenv("RSX_AA_OBJMV_DEFER_SPEC"); e && *e) r.om_late_spec = *e != '0';
 +		if (const char* e = std::getenv("RSX_AA_STATIC_SNAP"); e && *e) r.static_snap = std::atoi(e) != 0;
@@ -30411,6 +30423,8 @@ index 0000000..0f8ae13
 +		// RSX_DLSS_OBJMV_DEFORM: its persistent vertex stream copied (with the om_hslot copy) to the deform history
 +		u32 om_doff = 0, om_dsize = 0; // offset in the history buffer, bytes (0: none)
 +		u64 om_dkey = 0;               // vertex layout + range
++		u64 om_dlkey = 0;              // RSX_DLSS_OBJMV_DEFORM_REBASE: vertex layout only
++		u32 om_dcnt = 0;               // vertices copied
 +		u8 om_dage = 255;              // RSX_DLSS_OBJMV_DEFORM_CARRY: frames since its vertex data last changed (255: never seen changing)
 +		const void* vkvp = nullptr; // the VKVertexProgram that drew it
 +		m4 M;
@@ -32228,6 +32242,8 @@ index 0000000..0f8ae13
 +		u32 dg_nohash = 0, dg_same = 0, dg_noprev = 0, dg_stream = 0, dg_budget = 0, t_new_refused = 0, n_new_hist = 0;
 +		u32 dn_new = 0, dg_new = 0, dg_new_bytes = 0, dm_id = 0, dm_np_unp = 0, dm_np_first = 0, dm_np_aged = 0, dm_at = 0; // RSX_DLSS_OBJMV_DEFORM_NEW / no-previous-copy reasons / alpha-tested fallbacks
 +		u32 dg_carry = 0, dm_noprev = 0, dm_key = 0, dm_hist = 0, dm_nocap = 0; // RSX_DLSS_OBJMV_DEFORM_CARRY / fallback reasons
++		u32 dm_key_lay = 0, dm_key_cnt = 0, dm_key_base = 0, dm_rebase = 0; // "layout" fallbacks: attribute layout / vertex count or size / range only; RSX_DLSS_OBJMV_DEFORM_REBASE uses
++		u32 sk_ds = 0, sk_multi = 0, sk_inst = 0, sk_iconst = 0, sk_cond = 0, sk_blend = 0, sk_misc = 0, op_multi = 0; // velocity redraw skipped: why; RSX_DLSS_OBJMV_MULTI draws
 +		u32 t_slot_full = 0;          // R2PORT dlss-veg: moving draws refused a history slot because all o.cap were taken
 +		bool vel_live = false;        // vel was cleared this frame (a segment replay already wrote into it)
 +		// counters: this frame / since the last fps line
@@ -34741,6 +34757,11 @@ index 0000000..0f8ae13
 +				o.dg_nohash = o.dg_same = o.dg_noprev = o.dg_stream = o.dg_budget = 0;
 +				o.dg_carry = o.dm_noprev = o.dm_key = o.dm_hist = o.dm_nocap = 0;
 +				o.dm_np_unp = o.dm_np_first = o.dm_np_aged = o.dm_at = o.dg_new = o.dg_new_bytes = o.dm_id = 0;
++				r2log("objmv2 fallbacks: velocity redraw skipped: other depth target %u, multi-range %u, instanced %u, instanced constants %u, conditional render %u, programmable blending %u, other %u; multi-range / instanced draws given velocity %u (RSX_DLSS_OBJMV_MULTI=%d); deform layout fallback: attribute layout %u, vertex count / size %u, range only %u; range-moved copies used %u (RSX_DLSS_OBJMV_DEFORM_REBASE=%d)",
++					o.sk_ds, o.sk_multi, o.sk_inst, o.sk_iconst, o.sk_cond, o.sk_blend, o.sk_misc, o.op_multi, r2cfg().om_multi ? 1 : 0,
++					o.dm_key_lay, o.dm_key_cnt, o.dm_key_base, o.dm_rebase, r2cfg().om_rebase ? 1 : 0);
++				o.sk_ds = o.sk_multi = o.sk_inst = o.sk_iconst = o.sk_cond = o.sk_blend = o.sk_misc = o.op_multi = 0;
++				o.dm_key_lay = o.dm_key_cnt = o.dm_key_base = o.dm_rebase = 0;
 +				st.om_loose = st.om_loose_bad = st.om_nonaffine = 0;
 +				if ((r2cfg().om_sway || r2cfg().om_locked) && (st.om_sway_n || st.om_locked_n || st.om_sway_chk))
 +					r2log("objmv own velocity: %u attribute-swayed draws (RSX_DLSS_OBJMV_SWAY, %u probe checks), %u camera-locked skinned draws (RSX_DLSS_OBJMV_LOCKED)",
@@ -39152,7 +39173,8 @@ index 0000000..0f8ae13
 +		const bool dfm_on = pre && g_om_vu && o.dhalf && r2cfg().om_deform && om1_on() && !m_attrib_ring_info.has_shadow();
 +		bool dfm = false, d_fresh = false;
 +		u32 d_src = 0, d_size = 0;
-+		u64 d_key = 0;
++		u64 d_key = 0, d_lkey = 0;
++		u32 d_cnt = 0;
 +		if (dfm_on)
 +		{
 +			if (!(e.om & om_hashed))
@@ -39195,17 +39217,22 @@ index 0000000..0f8ae13
 +					// Same layout, vertex range and size last frame = the same vertices at the same stream offsets
 +					u64 k = mix64(g_om_vu->first_vertex, (static_cast<u64>(g_om_vu->allocated_vertex_count) << 32) | bytes);
 +					k = mix64(k, g_om_vu->vertex_index_base);
++					u64 lk = 0x0b5; // RSX_DLSS_OBJMV_DEFORM_REBASE: the same without the vertex range
 +					for (const auto* b : m_vertex_layout.interleaved_blocks)
 +					{
 +						if (!b) continue;
 +						k = mix64(k, (static_cast<u64>(b->attribute_stride) << 40) | (static_cast<u64>(b->single_vertex) << 32) | b->memory_location);
++						lk = mix64(lk, (static_cast<u64>(b->attribute_stride) << 40) | (static_cast<u64>(b->single_vertex) << 32) | b->memory_location);
 +						k = mix64(k, (static_cast<u64>(b->vertex_range.first) << 32) | b->vertex_range.second);
 +						for (const auto& l : b->locations)
 +						{
 +							const auto& a = regs->vertex_arrays_info[l.index];
 +							k = mix64(k, static_cast<u64>((a.offset() & 0x7fffffff) - b->base_offset));
-+							k = mix64(k, (static_cast<u64>(l.index) << 48) | (static_cast<u64>(l.modulo) << 40) | (static_cast<u64>(l.frequency) << 16) |
-+								(static_cast<u64>(static_cast<u8>(a.type())) << 8) | a.size());
++							const u64 la = (static_cast<u64>(l.index) << 48) | (static_cast<u64>(l.modulo) << 40) | (static_cast<u64>(l.frequency) << 16) |
++								(static_cast<u64>(static_cast<u8>(a.type())) << 8) | a.size();
++							k = mix64(k, la);
++							lk = mix64(lk, static_cast<u64>((a.offset() & 0x7fffffff) - b->base_offset));
++							lk = mix64(lk, la);
 +						}
 +					}
 +					// RSX_DLSS_OBJMV_DEFORM_NEW: unpaired copies only in the first half of the buffer, 1 MB each at most
@@ -39214,6 +39241,8 @@ index 0000000..0f8ae13
 +					d_src = static_cast<u32>(src);
 +					d_size = bytes;
 +					d_key = k | 1;
++					d_lkey = lk | 1;
++					d_cnt = g_om_vu->allocated_vertex_count;
 +					if (carry) o.dg_carry++;
 +					d_fresh = dw.fresh;
 +				}
@@ -39267,6 +39296,8 @@ index 0000000..0f8ae13
 +					e.om_doff = static_cast<u32>(dst);
 +					e.om_dsize = d_size;
 +					e.om_dkey = d_key;
++					e.om_dlkey = d_lkey;
++					e.om_dcnt = d_cnt;
 +					o.dused += (static_cast<VkDeviceSize>(d_size) + 255) & ~VkDeviceSize{255};
 +					o.dn++;
 +					o.n_dcap++;
@@ -39308,6 +39339,15 @@ index 0000000..0f8ae13
 +				}
 +			}
 +		}
++		// RSX_DLSS_OBJMV_DEFORM_REBASE: same attribute layout, vertex count and size, only the range moved (the copy's
++		// vertex k is this draw's vertex k: positions in the window, the attribute offsets in it equal)
++		if (dfm && dp && !use_dfm && !dq && r2cfg().om_rebase && dp->om_dsize == d_size && dp->om_dcnt == d_cnt && d_cnt &&
++			dp->om_dlkey == d_lkey && dp->om_dkey != d_key && dp->om_hslot && dp->om_hslot - 1u < o.cap &&
++			o.hvalid[o.hpar ^ 1][dp->om_hslot - 1u] && dp->om_doff + static_cast<u64>(d_size) <= o.dhalf * 2)
++		{
++			use_dfm = true;
++			o.dm_rebase++;
++		}
 +		if (dfm && dp && !use_dfm)
 +		{
 +			o.n_dmiss++;
@@ -39318,7 +39358,13 @@ index 0000000..0f8ae13
 +				const int why = r2om_noprev_reason((dp->om & om_matched) != 0, dp->om_dage);
 +				(why == R2OM_NP_UNPAIRED ? o.dm_np_unp : why == R2OM_NP_FIRST ? o.dm_np_first : o.dm_np_aged)++;
 +			}
-+			else if (dp->om_dsize != d_size || dp->om_dkey != d_key) o.dm_key++;
++			else if (dp->om_dsize != d_size || dp->om_dkey != d_key)
++			{
++				o.dm_key++;
++				if (dp->om_dlkey != d_lkey) o.dm_key_lay++;
++				else if (dp->om_dcnt != d_cnt || dp->om_dsize != d_size) o.dm_key_cnt++;
++				else o.dm_key_base++;
++			}
 +			else o.dm_hist++;
 +		}
 +		if (dfm && !use_dfm && dp && (regs->alpha_test_enabled() || (m_ctx->program.fragment_program.ctrl & RSX_SHADER_CONTROL_META_USES_DISCARD)))
@@ -39345,16 +39391,27 @@ index 0000000..0f8ae13
 +		const auto& ps = m_pipeline_properties.state;
 +		const VkDescriptorSet set0 = cmd->r2_bound_set(0);
 +		const VkDescriptorSetLayout set0_layout = m_program->r2_set_layout(0);
-+		if (!ds || ds != st.ds_ptr || ds->samples() != 1 || !draw_count || !m_vertex_prog->handle || !set0 || !set0_layout ||
-+			!m_device->get_shader_draw_parameters_support() || clause.is_trivial_instanced_draw || !clause.is_single_draw() ||
-+			(cmd->flags & vk::command_buffer::cb_has_conditional_render) ||
-+			(m_ctx->program.vertex_program.ctrl & RSX_SHADER_CONTROL_INSTANCED_CONSTANTS) ||
-+			(m_ctx->program.fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING) ||
++		// RSX_DLSS_OBJMV_MULTI: multi-range / trivially instanced draws in onepass (all ranges / instances are issued
++		// with the bound variant; instanced constants stay out: one constants history per draw)
++		const bool multi_ok = r2cfg().om_multi && om1_on();
++		int skip_why = 0;
++		if (!ds || ds != st.ds_ptr || ds->samples() != 1) skip_why = 1;
++		else if (m_ctx->program.vertex_program.ctrl & RSX_SHADER_CONTROL_INSTANCED_CONSTANTS) skip_why = 4;
++		else if (clause.is_trivial_instanced_draw && !multi_ok) skip_why = 3;
++		else if (!clause.is_trivial_instanced_draw && !clause.is_single_draw() && !multi_ok) skip_why = 2;
++		else if (cmd->flags & vk::command_buffer::cb_has_conditional_render) skip_why = 5;
++		else if (m_ctx->program.fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING) skip_why = 6;
++		else if (!draw_count || !m_vertex_prog->handle || !set0 || !set0_layout || !m_device->get_shader_draw_parameters_support() ||
 +			(ps.ds.depthTestEnable && ps.ds.depthCompareOp == VK_COMPARE_OP_NEVER))
++			skip_why = 7;
++		if (skip_why)
 +		{
 +			o.n_skip++;
++			(skip_why == 1 ? o.sk_ds : skip_why == 2 ? o.sk_multi : skip_why == 3 ? o.sk_inst : skip_why == 4 ? o.sk_iconst :
++				skip_why == 5 ? o.sk_cond : skip_why == 6 ? o.sk_blend : o.sk_misc)++;
 +			return;
 +		}
++		const bool is_multi = clause.is_trivial_instanced_draw || !clause.is_single_draw();
 +		if (om1_on())
 +		{
 +			// onepass: the variant of this very pipeline, bound for the draw that follows
@@ -39450,6 +39507,7 @@ index 0000000..0f8ae13
 +			}
 +			o.vb_written = true;
 +			o.n_op++;
++			if (is_multi) o.op_multi++;
 +			e.om |= om_replayed;
 +			return;
 +		}
