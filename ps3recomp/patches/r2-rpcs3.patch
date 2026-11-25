@@ -21495,10 +21495,10 @@ index 0000000..bf28e96
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGenLogic.h b/rpcs3/Emu/RSX/VK/VKR2FrameGenLogic.h
 new file mode 100644
-index 0000000..30c8c7d
+index 0000000..96aee50
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGenLogic.h
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,204 @@
 +/* R2PORT: Resistance 1/2/3 port addition (not upstream RPCS3).
 + * Frame generation decisions without any graphics API: the PORT_FG / PORT_FG_HUDLESS / PORT_FG_PACE selectors,
 + * the FSR 3 present pacer, the Reflex frame cap, the FSR 3 enable hold and the per-frame on/off gate.
@@ -21626,7 +21626,9 @@ index 0000000..30c8c7d
 +   otherwise interpolate the whole scene with a wrong or zero camera motion (a double image of everything while
 +   turning; R2 Chicago Leviathan). src: PFG_CAM_HELD (failed vote, last frame's motion reused), PFG_CAM_GUESSED
 +   (failed vote, the largest agreeing group of draws or no motion), PFG_CAM_ZEROED (depth check reject).
-+   moving_px: largest camera motion of the frame in render pixels (applied, discarded or last trusted).
++   moving_px: render pixels of the stand-in motion frame generation would warp by, or of the camera's own movement
++   (the game's view-projection when known, else the last measured motion, latched through the unmeasured run; never
++   the rejected motion, usually an object's).
 +   mode: 0 off, 1 guessed / zeroed (default), 2 held ones too. */
 +enum { PFG_CAM_TRUSTED = 0, PFG_CAM_HELD = 1, PFG_CAM_GUESSED = 2, PFG_CAM_ZEROED = 3 };
 +#define PFG_CAM_MOVING_PX 1.0
@@ -27250,10 +27252,10 @@ index 0000000..db54a19
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..81a2513
+index 0000000..7f5c867
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12106 @@
+@@ -0,0 +1,12119 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -30399,6 +30401,7 @@ index 0000000..81a2513
 +		pdq_s_tally s_tal{}; // RSX_AA_FRAME_S_VOTE: this frame's scene-draw screen transforms
 +		u32 stat_s_mixed = 0, stat_s_voted = 0, stat_s_logged = 0, stat_snap_vp_same = 0, stat_s_wide = 0, stat_s_wide_logged = 0, stat_weak_cut = 0;
 +		u32 stat_fg_cam[3] = {}; // R2_DLSS_FG_CAM_RESET: frame generation resets by pfg_cam_reset src (held, guessed, zeroed)
++		double fg_mov_px = 0.0; // R2_DLSS_FG_CAM_RESET: camera motion (render px) of the last measured frame or game VP
 +		// still-camera jolts: a kept camera motion after >= 30 still runs (and the run after it); the game VP of the
 +		// previous run's previous frame, to tell a VP that returns bit-exactly (A-B-A) from a real move
 +		m4 jolt_vpp{};
@@ -37380,11 +37383,10 @@ index 0000000..81a2513
 +				st.stat_vote_ident++;
 +				fb = "none";
 +			}
-+			// R2_DLSS_FG_CAM_RESET: the frame's motion is a stand-in; the camera moves if the stand-in or the last trusted
-+			// motion (a few frames old at most) does
++			// R2_DLSS_FG_CAM_RESET: the frame's motion is a stand-in. A moving stand-in is what frame generation would warp
++			// by (wrong either way if it is not the camera's); the camera's own movement is added below.
 +			fg_cam = fb[0] == 'h' ? PFG_CAM_HELD : PFG_CAM_GUESSED;
 +			fg_cam_px = snap_px(T);
-+			if (st.frame - st.last_T_frame <= 4) fg_cam_px = std::fmax(fg_cam_px, snap_px(st.last_T));
 +			if (st.vote_fail_logged < 16 || (r2cfg().debug && (st.frame % 120) == 0))
 +			{
 +				st.vote_fail_logged++;
@@ -37505,10 +37507,23 @@ index 0000000..81a2513
 +	}
 +	if (r2cfg().mv_conf && st.conf_reject && !reset && !(r2cfg().conf_trust_exact && st.conf_exact[st.frame % 8] == st.frame + 1))
 +	{
-+		fg_cam = PFG_CAM_ZEROED; // R2_DLSS_FG_CAM_RESET: the discarded motion tells whether the camera moves
-+		fg_cam_px = std::fmax(fg_cam_px, snap_px(T));
++		// R2_DLSS_FG_CAM_RESET: the rejected motion is no evidence that the camera moves (it is usually an object's)
++		fg_cam = PFG_CAM_ZEROED;
++		fg_cam_px = 0.0;
 +		T = m4_identity();
 +		st.stat_conf_zero++;
++	}
++	{
++		// R2_DLSS_FG_CAM_RESET: is the camera moving? The game's VP motion when it is known (confirmed or shared by most
++		// draws; unchanged and confirmed: still), else the last measured motion, latched across the whole run of
++		// unmeasured frames. A still verified VP (ex_static) replaces the stand-in with the identity below: nothing to reset.
++		double vp_px = -1.0;
++		if (ex_static) vp_px = 0.0;
++		else if (ps_vp == 2 || (ps_vp == 1 && ex_vp_same)) vp_px = snap_px(ps_vp_T);
++		if (!fg_cam && !fg_cut && !reset) st.fg_mov_px = snap_px(T);
++		else if (vp_px >= 0.0) st.fg_mov_px = vp_px;
++		if (r2cfg().static_snap && ex_static) fg_cam = 0;
++		if (fg_cam) fg_cam_px = std::fmax(fg_cam_px, vp_px >= 0.0 ? vp_px : st.fg_mov_px);
 +	}
 +	if (reset)
 +	{
