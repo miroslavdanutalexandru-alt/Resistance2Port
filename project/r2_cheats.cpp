@@ -7,7 +7,9 @@
  *                      every local player's health is topped back up to full,
  *                      and the hero's moby is kept non-damageable (what
  *                      set_damageable(moby, false) does: bit 0x8 at moby+0x64),
- *                      so instant-kill attacks don't land either.
+ *                      so instant-kill attacks don't land either. A hero that is
+ *                      dead anyway (scripted kills) is left alone until the
+ *                      respawn (PORT_CHEAT_GOD_DEATHFIX, on by default).
  *   Infinite ammo      every frame, for each local player's weapons (the
  *                      weapon lookup func_000F35BC, types 0..46 except the
  *                      grenades) the four ammo counters (primary +0x314/+0x316,
@@ -221,6 +223,45 @@ static void god_moby(uint32_t moby, uint32_t player, int on)
     }
 }
 
+/* God mode, part 3: a hero that is already dead is left alone. Scripted instant
+ * kills (Lua kill(HALE): the Leviathan smash and the kill zones in Chicago
+ * seg16b_enemy_segment.lua, falls...) go through func_0002CE94 and don't care
+ * about the damageable bit, so the hero dies anyway; topping the dead hero's
+ * health back up every frame then left the death half done: camera on the body,
+ * no fade, no checkpoint reload. While a local hero is dead there is no health
+ * refill (and the damageable bit isn't touched) so the game's own death ->
+ * respawn sequence runs; God mode carries on once the hero is alive again.
+ * PORT_CHEAT_GOD_DEATHFIX=0 gives the old behaviour (refill even when dead). */
+static int god_deathfix(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("PORT_CHEAT_GOD_DEATHFIX"); v = !(e && *e && strcmp(e, "0") == 0); }
+    return v;
+}
+static void god_death(int god, int ndead)
+{
+    static int was = 0, told_long = 0, nlog = 0;   /* nlog: with the fix off the refill can revive the hero every frame */
+    static unsigned long long t0 = 0;
+#ifdef _WIN32
+    const unsigned long long now = GetTickCount64();
+#else
+    const unsigned long long now = 0;
+#endif
+    const int quiet = nlog > 40;
+    if (god && ndead && !was) {
+        t0 = now; told_long = 0;
+        if (!quiet && ++nlog) fprintf(stderr, god_deathfix() ? "[cheat] god mode: hero dead (scripted kill), no health refill until the respawn\n"
+                                       : "[cheat] god mode: hero dead (scripted kill), health refill goes on (PORT_CHEAT_GOD_DEATHFIX=0)\n");
+    } else if (god && ndead && !told_long && now - t0 > 30000) {
+        told_long = 1;
+        fprintf(stderr, "[cheat] god mode: hero still dead after %.0f s\n", (now - t0) / 1000.0);
+    } else if (!ndead && was && !quiet) {
+        nlog++;
+        fprintf(stderr, "[cheat] god mode: hero %s after %.1f s\n", god ? "alive again" : "no longer tracked (god mode off)", (now - t0) / 1000.0);
+    }
+    was = god && ndead;
+}
+
 extern "C" void r2_cheats_frame(ppu_context* ctx)
 {
     static int init = 0;
@@ -254,15 +295,17 @@ extern "C" void r2_cheats_frame(ppu_context* ctx)
     c->gpr[1] = ((save.gpr[1] & 0xFFFFFFFFull) - 0x400) & ~0xFull;
     const uint32_t iter = (uint32_t)c->gpr[1] + 0x100;   /* above the callees' frames, below the limiter's */
 
-    if (god) gcall(c, func_00034854, 4);
-
     gcall(c, func_0071DE90, iter);                        /* local player iterator: begin */
-    int np = 0;
+    int np = 0, ndead = 0;
     for (int guard = 0; guard < 8 && (gcall(c, func_0071DCD0, iter) & 0xFF); guard++) {
         const uint32_t player = (uint32_t)gcall(c, func_0011C93C, iter);
         if (player) {
             np++;
-            if (god || restore) {
+            /* the game's own dead test (Lua is_dead: func_0002D01C -> func_0002CFB0
+             * -> func_00A776BC([moby+0x40]), [moby+0x40] being this player) */
+            const int dead = god && (gcall(c, func_00A776BC, player) & 0xFF);
+            if (dead) ndead++;
+            if ((god && !(dead && god_deathfix())) || restore) {
                 const uint32_t ent = vm_read32(iter);
                 if (ent) god_moby((uint32_t)gcall(c, func_0071DC64, ent), player, god);
             }
@@ -272,6 +315,8 @@ extern "C" void r2_cheats_frame(ppu_context* ctx)
         gcall(c, func_0071DD34, iter);                    /* next */
     }
     if (restore && np) { restore = 0; s_ninv = 0; s_inv_next = 0; }
+    god_death(god, ndead);
+    if (god && !(ndead && god_deathfix())) gcall(c, func_00034854, 4);
     static int np_was = -1;
     if (np != np_was) { fprintf(stderr, "[cheat] %d local player(s)\n", np); np_was = np; }
 
