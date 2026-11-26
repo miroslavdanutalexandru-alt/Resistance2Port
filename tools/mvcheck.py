@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Frame-generation / upscaler motion-vector quality check on RSX_MV_DUMP bursts.
 
 For every pair of consecutive dumped frames (N-1, N) it follows each pixel of frame N along its motion vector into
@@ -11,9 +11,11 @@ the predicted position, with sub-pixel refinement. Per pixel:
   flat     not measurable (no texture: sky, flat walls, dark)   off   the vector points off-screen
 Percentages are of the measurable pixels (ok + err1 + err3 + lost); 'within 1 px' = ok / measurable.
 
-Pixel classes (from the dump): sky (cleared depth), hud (fg_ui alpha), fx (effect coverage / fxid), objmv (ID-redrawn
-draw that wrote its own velocity, draws.jsonl "op"), deform (vertex data changed since last frame, "vh" != "vh_prev"),
-cam (everything else: camera-only motion).
+Pixel classes (from the dump, later ones win): cam (camera-only motion), deform (vertex data changed since last frame,
+"vh" != "vh_prev"), objmv (ID-redrawn draw that wrote its own velocity, draws.jsonl "op"), edge (within ~2 px of a 5 %
+depth step: one vector cannot describe both layers), fx (effect coverage / fxid), hud (fg_ui alpha), disocc (where the
+vector points, last frame's depth was all nearer: the surface was hidden), vm (first-person view model, depth < 0.5),
+sky (cleared depth).
 
 Vector conventions (r2aa_prep_pass): mv is in view UV units, previous position = current + mv, both unjittered
 (ndc = pixel ndc - jndc). --mv fg_mv checks what frame generation was handed (same units: Streamline mvecScale =
@@ -29,8 +31,13 @@ import sys
 
 import numpy as np
 
+try:
+    import cv2  # optional: ~50x faster box filter / bilinear lookup
+except ImportError:
+    cv2 = None
+
 VK = {97: ('<f2', 4), 100: ('<f4', 1), 83: ('<f2', 2), 9: ('u1', 1), 70: ('<u2', 1), 37: ('u1', 4), 44: ('u1', 4), 64: ('<u4', 1)}
-CLASSES = ('cam', 'objmv', 'deform', 'fx', 'hud', 'sky')
+CLASSES = ('cam', 'objmv', 'deform', 'fx', 'hud', 'sky', 'vm', 'edge', 'disocc')
 BINS = ('ok', 'err1', 'err3', 'lost', 'flat', 'off')
 
 
@@ -95,6 +102,8 @@ def luma(c):
 
 def box(a, r):
     """sum over a (2r+1)^2 window, edges clamped"""
+    if cv2 is not None:
+        return cv2.boxFilter(a.astype(np.float32), -1, (2 * r + 1, 2 * r + 1), normalize=False, borderType=cv2.BORDER_REPLICATE)
     p = np.pad(a, ((r + 1, r), (r + 1, r)), mode='edge').astype(np.float64)
     s = p.cumsum(0).cumsum(1)
     k = 2 * r + 1
@@ -103,6 +112,9 @@ def box(a, r):
 
 def bilinear(img, x, y):
     h, w = img.shape
+    if cv2 is not None:
+        return cv2.remap(img.astype(np.float32), np.asarray(x, np.float32), np.asarray(y, np.float32), cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_REPLICATE)
     x = x.clip(0, w - 1.001)
     y = y.clip(0, h - 1.001)
     x0 = np.floor(x).astype(np.int32)
@@ -114,9 +126,25 @@ def bilinear(img, x, y):
     return a * (1 - fy) + b * fy
 
 
+def cam_prev_lin(m, depth, h, w):
+    """camera-predicted previous linear depth (lin = 1 - z, or z when inverted) of every pixel"""
+    T = np.array(m['T_d'] if 'T_d' in m else m['T'], dtype=np.float64).reshape(4, 4).T
+    vw, vh = m.get('vw', w), m.get('vh', h)
+    jx, jy = m.get('jndc', [0.0, 0.0])
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float64)
+    nx = (xs + 0.5) / vw * 2 - 1 - jx
+    ny = (ys + 0.5) / vh * 2 - 1 - jy
+    z = depth.astype(np.float64) * m['zA'] + m['zB']
+    with np.errstate(all='ignore'):
+        zp = (T[0, 2] * nx + T[1, 2] * ny + T[2, 2] * z + T[3, 2]) / (T[0, 3] * nx + T[1, 3] * ny + T[2, 3] * z + T[3, 3])
+        zp = (zp - m['zB']) / (m['zA'] or 1.0)
+    lp = zp if m.get('inverted', 0) else 1.0 - zp
+    return np.where(np.isfinite(lp), lp, 0.0)
+
+
 def cam_mv(m, depth, h, w):
     """camera-only vectors as r2aa_prep_pass computes them: q = T (ndc, d zA + zB, 1), mv = (q.xy / q.w - ndc) / 2"""
-    T = np.array(m['T_d'] if 'T_d' in m else m['T'], dtype=np.float64).reshape(4, 4)  # T[c][r]: column c
+    T = np.array(m['T_d'] if 'T_d' in m else m['T'], dtype=np.float64).reshape(4, 4).T  # dumped row by row: T[c][r] after .T
     vw, vh = m.get('vw', w), m.get('vh', h)
     jx, jy = m.get('jndc', [0.0, 0.0])
     ys, xs = np.mgrid[0:h, 0:w].astype(np.float64)
@@ -133,7 +161,8 @@ def cam_mv(m, depth, h, w):
     return np.stack([mx, my], -1).astype(np.float32)
 
 
-def classify(b, f, m, h, w, depth):
+def classify(b, f, m, h, w, depth, mv=None, cam=None):
+    """cam: the camera-predicted previous linear depth (disocclusion test), else the current one"""
     cls = np.zeros((h, w), np.uint8)  # 0 cam
     dr = b.draws(f)
     idm = fit(b.img(f, 'id'), h, w)
@@ -158,12 +187,60 @@ def classify(b, f, m, h, w, depth):
     ui = b.img(f, 'fg_ui')
     if ui is not None and ui.ndim == 3:
         cls[fit(ui[..., 3], h, w) > 0.02] = 4
-    clear = 0.0 if m.get('inverted', 0) else 1.0
+    inv = bool(m.get('inverted', 0))
+    lin = depth.astype(np.float64) if inv else 1.0 - depth.astype(np.float64)  # ~ 1 / view distance
+    # depth edge: a 3x3 neighbour more than 5 % nearer or farther (one vector per pixel cannot describe both layers)
+    pad = np.pad(lin, 1, mode='edge')
+    lo = hi = lin
+    for oy in range(3):
+        for ox in range(3):
+            n_ = pad[oy:oy + h, ox:ox + w]
+            lo = np.minimum(lo, n_)
+            hi = np.maximum(hi, n_)
+    edge = (hi > lin * 1.05 + 1e-6) | (lo < lin * 0.95 - 1e-6)
+    edge = np.pad(edge, 1, mode='edge')
+    edge = edge[:-2, 1:-1] | edge[2:, 1:-1] | edge[1:-1, :-2] | edge[1:-1, 2:] | edge[1:-1, 1:-1]
+    cls[edge] = 7
+    # disocclusion: where the vector points, last frame's 3x3 depth was all nearer than this surface (it was hidden)
+    dp = b.img(f, 'depth_prev')
+    if mv is not None and dp is not None:
+        dp = fit(dp, h, w).astype(np.float64)
+        lp = dp if inv else 1.0 - dp
+        if cam is not None:
+            want = cam
+        else:
+            want = lin
+        ys, xs = np.mgrid[0:h, 0:w]
+        ix = np.floor(xs + 0.5 + mv[..., 0] * m.get('vw', w)).astype(np.int64)
+        iy = np.floor(ys + 0.5 + mv[..., 1] * m.get('vh', h)).astype(np.int64)
+        near = np.full((h, w), True)
+        for oy in (-1, 0, 1):
+            for ox in (-1, 0, 1):
+                near &= lp[np.clip(iy + oy, 0, h - 1), np.clip(ix + ox, 0, w - 1)] > want * 1.05 + 1e-6
+        cls[near] = 8
+    cls[lin > 0.5] = 6  # first-person view model: depth range 0.15 .. 0.18 (world >= 0.89)
+    clear = 0.0 if inv else 1.0
     cls[np.abs(depth - clear) < 1e-7] = 5
     return cls
 
 
-def measure(cur, prev, mv, m_cur, m_prev, radius, patch=3):
+def dilate(mv, depth, inverted=False):
+    """closest-depth 3x3 dilation, as DLSS / FSR apply internally to render-resolution (undilated) vectors"""
+    h, w = depth.shape
+    d = -depth if inverted else depth
+    pd = np.pad(d, 1, mode='edge')
+    pm = np.pad(mv, ((1, 1), (1, 1), (0, 0)), mode='edge')
+    best, out = d.copy(), mv.copy()
+    for oy in range(3):
+        for ox in range(3):
+            n_ = pd[oy:oy + h, ox:ox + w]
+            u = n_ < best
+            best = np.where(u, n_, best)
+            out = np.where(u[..., None], pm[oy:oy + h, ox:ox + w], out)
+    return out
+
+
+def measure(cur, prev, mv, m_cur, m_prev, radius, patch=3, margin=0.02):
     """per-pixel error (px), bin index, best ZNCC"""
     h, w = cur.shape
     vw, vh = m_cur.get('vw', w), m_cur.get('vh', h)
@@ -207,7 +284,7 @@ def measure(cur, prev, mv, m_cur, m_prev, radius, patch=3):
             bx = np.where(upd, ox, bx).astype(np.int8)
             by = np.where(upd, oy, by).astype(np.int8)
     # ties / near-ties with the predicted position count as on target (repeating texture, aperture)
-    on = (best - zero) < 0.02
+    on = (best - zero) < margin
 
     def zn(ox, oy):
         wp = bilinear(prev, px + ox, py + oy)
@@ -225,13 +302,10 @@ def measure(cur, prev, mv, m_cur, m_prev, radius, patch=3):
     ex = np.where(on, 0, fbx + vertex(zn(fbx - 1, fby), best, zn(fbx + 1, fby)))
     ey = np.where(on, 0, fby + vertex(zn(fbx, fby - 1), best, zn(fbx, fby + 1)))
     err = np.hypot(ex, ey)
-    # sub-pixel at the predicted position: the 3x3 parabola vertex (catches 0.5..1.5 px offsets)
+    measure.last = (ex, ey, on)
+    # on target: sub-pixel residual at the predicted position (parabola vertex, at most half a pixel per axis)
     zl, zr, zu, zd = scores[(-1, 0)], scores[(1, 0)], scores[(0, -1)], scores[(0, 1)]
-    dx, dy = zl - 2 * zero + zr, zu - 2 * zero + zd
-    with np.errstate(all='ignore'):
-        sx = np.where(dx < -1e-6, np.clip(0.5 * (zl - zr) / dx, -1, 1), 0)
-        sy = np.where(dy < -1e-6, np.clip(0.5 * (zu - zd) / dy, -1, 1), 0)
-    err = np.where(on, np.hypot(sx, sy), err)
+    err = np.where(on, np.hypot(vertex(zl, zero, zr), vertex(zu, zero, zd)), err)
     bins = np.where(err <= 1.0, 0, np.where(err <= 3.0, 1, 2)).astype(np.uint8)
     bins[best < 0.7] = 3
     bins[~meas] = 4
@@ -260,7 +334,8 @@ def heatmap(path, cur, bins, cls):
     rgb[bins == 3] = (40, 90, 255)
     rgb[bins == 5] = (120, 0, 120)
     Image.fromarray(rgb).save(path)
-    pal = np.array([[90, 90, 90], [0, 220, 0], [220, 220, 0], [255, 0, 255], [255, 255, 255], [0, 160, 255]], np.uint8)
+    pal = np.array([[90, 90, 90], [0, 220, 0], [220, 220, 0], [255, 0, 255], [255, 255, 255], [0, 160, 255], [140, 70, 20],
+                    [255, 120, 0], [255, 0, 0]], np.uint8)
     Image.fromarray(pal[cls]).save(path.replace('.png', '_cls.png'))
 
 
@@ -282,14 +357,31 @@ def run_burst(d, args, report):
         h, w = rh or col_c.shape[0], rw or col_c.shape[1]
         cur, prev = luma(col_c[:h, :w]), luma(col_p[:h, :w])
         dep = fit(dep, h, w).astype(np.float32)
-        cls = classify(b, c, mc, h, w, dep)
+        mv0 = fit(mv, h, w).astype(np.float32) if mv is not None else cam_mv(mc, dep, h, w)
+        cls = classify(b, c, mc, h, w, dep, mv0, cam_prev_lin(mc, dep, h, w))
         sets = []
         if mv is not None:
             sets.append((args.mv, fit(mv, h, w).astype(np.float32)))
         if args.cam:
             sets.append(('cam', cam_mv(mc, dep, h, w)))
+        if args.dilate:
+            sets = [(n_, dilate(v_, dep, bool(mc.get('inverted', 0)))) for n_, v_ in sets]
+        mcm, mam, clsm = mc, ma, cls
+        if args.domain == 'out':
+            # the upscaler's output (what frame generation interpolates): unjittered and anti-aliased, so the aliasing of the
+            # jittered render-resolution input does not count as motion error; vectors / classes scaled up (nearest)
+            oc, op = b.img(c, 'out'), b.img(a, 'out')
+            if oc is None or op is None:
+                continue
+            oh, ow = mc.get('oh') or oc.shape[0], mc.get('ow') or oc.shape[1]
+            cur, prev = luma(oc[:oh, :ow]), luma(op[:oh, :ow])
+            sets = [(n_, fit(v_, oh, ow)) for n_, v_ in sets]
+            clsm = fit(cls, oh, ow)
+            mcm = dict(mc, jndc=[0.0, 0.0], vw=float(ow), vh=float(oh))
+            mam = dict(ma, jndc=[0.0, 0.0])
         for name, v in sets:
-            err, bins, _ = measure(cur, prev, v, mc, ma, args.radius)
+            err, bins, _ = measure(cur, prev, v, mcm, mam, args.radius, margin=args.margin)
+            cls = clsm
             s = summarise(bins, cls)
             key = (os.path.basename(d), name)
             t = tot.setdefault(name, np.zeros((len(CLASSES) + 1, 6)))
@@ -341,12 +433,12 @@ def selftest():
                 a.tofile(os.path.join(d, 'f%02u_%s.bin' % (f, name)))
                 man.append({'f': f, 'frame': 100 + f, 'name': name, 'w': w, 'h': h, 'bpp': bpp, 'vk_format': fmt})
             meta.append({'frame': 100 + f, 'rw': w, 'rh': h, 'vw': w, 'vh': h, 'jndc': [0, 0], 'reset': 0, 'fg_reset': 0,
-                         'zA': 1, 'zB': 0, 'inverted': 0, 'T': [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -4.0 / w, 0, 0, 1]})
+                         'zA': 1, 'zB': 0, 'inverted': 0, 'T': [1, 0, 0, -4.0 / w, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]})
         with open(os.path.join(d, 'images.jsonl'), 'w') as o:
             o.write('\n'.join(json.dumps(e) for e in man) + '\n')
         with open(os.path.join(d, 'frames.jsonl'), 'w') as o:
             o.write('\n'.join(json.dumps(e) for e in meta) + '\n')
-        a = argparse.Namespace(mv='mv', cam=True, radius=6, png=None)
+        a = argparse.Namespace(mv='mv', cam=True, radius=6, png=None, margin=0.02, domain='render', dilate=False)
         rep = []
         tot = run_burst(d, a, rep)
         t = tot['mv'][-1]
@@ -372,8 +464,11 @@ def main():
     ap.add_argument('--mv', default='mv', help='vector image to check: mv (upscaler) or fg_mv (frame generation)')
     ap.add_argument('--cam', action='store_true', help='also check camera-only vectors recomputed from T')
     ap.add_argument('--radius', type=int, default=6)
+    ap.add_argument('--domain', default='out', choices=('out', 'render'), help='images compared: the upscaler output (default) or its jittered input')
+    ap.add_argument('--margin', type=float, default=0.05, help='ZNCC gain a shifted match needs over the predicted position')
     ap.add_argument('--png', help='write heatmaps here (green ok, yellow >1, red >3, blue lost, purple off-screen)')
     ap.add_argument('--json', help='write the per-pair report here')
+    ap.add_argument('--dilate', action='store_true', help='score the vectors after the closest-depth 3x3 dilation DLSS / FSR apply')
     ap.add_argument('--selftest', action='store_true')
     args = ap.parse_args()
     if args.selftest:
