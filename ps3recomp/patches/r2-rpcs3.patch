@@ -27386,10 +27386,10 @@ index 0000000..db54a19
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..2e43652
+index 0000000..0d5da40
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12487 @@
+@@ -0,0 +1,12503 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -36464,8 +36464,8 @@ index 0000000..2e43652
 +
 +// RSX_MV_DUMP=<K> (2..64; unset / 0 = off: one cached branch per upscaler run / flip / draw, images created as before):
 +// offline motion-vector, frame-generation and frame-pacing dumps for one test run.
-+// Triggers: Pause (RSX_MV_DUMP_KEY=<Windows VK code> to change) or F11 (keys are polled every flip, so a press in a menu is
-+// logged and kept until gameplay); RSX_MV_DUMP_AFTER=<s> (once, s seconds after the first scene); RSX_MV_DUMP_AUTO=<s>
++// Triggers: Pause (RSX_MV_DUMP_KEY=<Windows VK code> to change; polled every flip, so a press in a menu is logged and kept
++// until gameplay), creating <RSX_MV_DUMP_DIR>\mvdump.now (any content; deleted when seen, polled twice a second); RSX_MV_DUMP_AFTER=<s> (once, s seconds after the first scene); RSX_MV_DUMP_AUTO=<s>
 +// (a period every s seconds of scene time, RSX_MV_DUMP_AUTO_N periods, default 6; each period's burst is armed half way in).
 +// RSX_MV_DUMP_VARIANTS=<letters> (default "a"): each AUTO period switches to the next runtime A/B variant (shown as an
 +// on-screen hint, logged, in every dumped line): a baseline, b FG motion vectors dilated (3x3 nearest depth), c FG camera
@@ -36513,6 +36513,7 @@ index 0000000..2e43652
 +		bool arm_at_set = false;
 +		int cycle_key = 0x91; // VK_SCROLL: RSX_MV_DUMP_CYCLE_KEY
 +		bool cycle_was = false;
++		std::chrono::steady_clock::time_point file_poll{}; // <dir>\mvdump.now trigger, checked twice a second
 +		std::string variants = "a";
 +		std::atomic<char> var{ 'a' };
 +		u32 burst = 0;
@@ -36594,8 +36595,8 @@ index 0000000..2e43652
 +				if (s.variants.empty()) s.variants = "a";
 +			}
 +			s.tbase = std::chrono::steady_clock::now();
-+			if (s.k) r2log("RSX_MV_DUMP: bursts of %d runs to %s (keys 0x%X and F11%s; RSX_MV_DUMP_AUTO every %.1f s of scene time, %d periods, variants \"%s\"; live switch key 0x%X)",
-+				s.k, s.dir.c_str(), s.key, s.after_s >= 0.0 ? ", once after RSX_MV_DUMP_AFTER s" : "", s.auto_s, s.auto_max, s.variants.c_str(), s.cycle_key);
++			if (s.k) r2log("RSX_MV_DUMP: bursts of %d runs to %s (key 0x%X, trigger file %s\\mvdump.now%s; RSX_MV_DUMP_AUTO every %.1f s of scene time, %d periods, variants \"%s\"; live switch key 0x%X)",
++				s.k, s.dir.c_str(), s.key, s.dir.c_str(), s.after_s >= 0.0 ? ", once after RSX_MV_DUMP_AFTER s" : "", s.auto_s, s.auto_max, s.variants.c_str(), s.cycle_key);
 +		}
 +		return s.k > 0;
 +	}
@@ -36850,8 +36851,9 @@ index 0000000..2e43652
 +			s.last_flip = now;
 +		}
 +
-+		// keys (edge-triggered; GetAsyncKeyState is global, it does not need the window focused) and timers
-+		const bool k1 = s.key && (GetAsyncKeyState(s.key) & 0x8000) != 0;
++		// keys (edge-triggered; GetAsyncKeyState is global, it does not need the window focused) and timers. Bit 0 = pressed
++		// since the last poll: Pause sends its make and break codes together, so it is never down at a flip (FB19: no burst).
++		const bool k1 = s.key && (GetAsyncKeyState(s.key) & 0x8001) != 0;
 +		const bool k2 = false; // F11 is taken by benchmark capture + debug profiler
 +		const bool edge = (k1 && !s.key_was) || (k2 && !s.f11_was);
 +		s.key_was = k1;
@@ -36867,6 +36869,20 @@ index 0000000..2e43652
 +		{
 +			r2log("RSX_MV_DUMP: key seen (%s)%s", scene ? "scene" : "no scene yet: burst waits for gameplay", s.armed || s.left || s.cap ? ", a burst is already pending" : "");
 +			s.armed = true;
++		}
++		// trigger file: creating <dir>\mvdump.now (any content, e.g. from a tool or a second window) arms one burst; deleted when seen
++		if (now - s.file_poll >= std::chrono::milliseconds(500))
++		{
++			s.file_poll = now;
++			const std::string fp = s.dir + "\\mvdump.now";
++			if (GetFileAttributesA(fp.c_str()) != INVALID_FILE_ATTRIBUTES)
++			{
++				const bool del = DeleteFileA(fp.c_str()) != 0;
++				r2log("RSX_MV_DUMP: trigger file seen (%s)%s%s", scene ? "scene" : "no scene yet: burst waits for gameplay",
++					s.armed || s.left || s.cap ? ", a burst is already pending" : "", del ? "" : ", could not delete it: ignored from now on");
++				if (!del) s.file_poll = now + std::chrono::hours(24 * 365);
++				s.armed = true;
++			}
 +		}
 +		if (scene)
 +		{
