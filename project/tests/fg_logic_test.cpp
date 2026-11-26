@@ -304,6 +304,20 @@ static void test_deform()
 	CHECK(!r2om_deform_want(false, false, 255, 12, 4, 0, 8, 128, true).want); // reserve = max / 2
 	CHECK(r2om_deform_want(false, false, 255, 12, 3, 0, 8, 128, true).want);
 	CHECK(!r2om_deform_want(false, false, 255, 12, 0, 0, 0, 128, true).want);
+	// RSX_DLSS_OBJMV_DEFORM_WARM: paired unchanged draws past the carry / never changed, deforming program only, not from
+	// the last quarter of the budget; carry and changing draws unaffected
+	for (uint8_t age : { uint8_t{13}, uint8_t{255} })
+	{
+		r2om_dwant w = r2om_deform_want(true, false, age, 12, 0, 0, 768, 128, true, true);
+		CHECK(w.want && w.warm && !w.carry && !w.fresh);
+		CHECK(!r2om_deform_want(true, false, age, 12, 0, 0, 768, 128, false, true).want);
+		CHECK(!r2om_deform_want(true, false, age, 12, 0, 0, 768, 128, true, false).want);
+		CHECK(r2om_deform_want(true, false, age, 12, 575, 0, 768, 128, true, true).want);
+		CHECK(!r2om_deform_want(true, false, age, 12, 576, 0, 768, 128, true, true).want);
+	}
+	CHECK(!r2om_deform_want(true, false, 5, 12, 0, 0, 768, 128, true, true).warm);
+	CHECK(!r2om_deform_want(true, true, 255, 12, 0, 0, 768, 128, true, true).warm);
+	CHECK(!r2om_deform_want(false, false, 255, 12, 0, 0, 768, 0, true, true).want);
 	// bytes: first half of the buffer only, 1 MB per copy, rounded to the 256-byte copy alignment
 	const uint64_t half = 32u << 20;
 	CHECK(r2om_fresh_fits(0, 4096, half));

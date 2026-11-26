@@ -15511,10 +15511,10 @@ index 0000000..dd8284d
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2DeformLogic.h b/rpcs3/Emu/RSX/VK/VKR2DeformLogic.h
 new file mode 100644
-index 0000000..17d403a
+index 0000000..03f4fc1
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2DeformLogic.h
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,125 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// RSX_DLSS_OBJMV_DEFORM capture policy, without any graphics API (VKR2Upscaler.cpp om2 record path).
 +// A draw whose vertex data the CPU / SPU rewrote since its paired previous-frame draw gets real per-vertex motion
@@ -15542,20 +15542,26 @@ index 0000000..17d403a
 +	bool want;  // copy this draw's vertex stream this frame
 +	bool carry; // unchanged, but changed within the carry window
 +	bool fresh; // unpaired this frame (RSX_DLSS_OBJMV_DEFORM_NEW)
++	bool warm;  // unchanged past the carry window or never changed, its program deforms (RSX_DLSS_OBJMV_DEFORM_WARM)
 +};
 +
 +// dn: copies taken so far this frame, dn_new: of those for unpaired draws. Unpaired draws (no previous-frame pair:
 +// their pairing came and went, R2 1120 'no previous copy' fallbacks) get a copy too, but only when their vertex program
 +// has been seen deforming (prog_deforms: a paired draw of it had rewritten vertex data; not static / streamed chunks),
 +// at most new_cap per frame and never from the last min(new_cap, max / 2) of the frame's draw budget.
++// warm (RSX_DLSS_OBJMV_DEFORM_WARM): a paired unchanged draw outside the carry window (never changed, or unchanged for
++// more than carry_n frames) is copied too when its vertex program has been seen deforming, so its first change has a
++// previous copy (FB14 Iceland: 'first change' 9 + 'unchanged past the carry' 11 per frame fell back to camera motion).
++// Never from the last quarter of the frame's draw budget (changing draws later in the frame keep it).
 +inline r2om_dwant r2om_deform_want(bool matched, bool dyn, uint8_t dage, uint32_t carry_n, uint32_t dn, uint32_t dn_new,
-+	uint32_t max, uint32_t new_cap, bool prog_deforms)
++	uint32_t max, uint32_t new_cap, bool prog_deforms, bool warm = false)
 +{
 +	r2om_dwant w{};
 +	w.carry = carry_n && matched && !dyn && dage >= 1 && dage <= carry_n;
 +	const uint32_t reserve = new_cap < max / 2 ? new_cap : max / 2;
 +	w.fresh = !matched && prog_deforms && new_cap && dn_new < new_cap && dn + reserve < max;
-+	w.want = (matched && dyn) || w.carry || w.fresh;
++	w.warm = warm && matched && !dyn && !w.carry && prog_deforms && dn + max / 4 < max;
++	w.want = (matched && dyn) || w.carry || w.fresh || w.warm;
 +	return w;
 +}
 +
@@ -27380,10 +27386,10 @@ index 0000000..db54a19
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..fbbdf43
+index 0000000..2e43652
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12478 @@
+@@ -0,0 +1,12487 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -27765,7 +27771,7 @@ index 0000000..fbbdf43
 +		// moving draws late in heavy frames get no slot and fall back to camera motion the next frame, varying per frame
 +		// (branch flicker suspect). Costs 2 x N x 7.3 KB of device memory (15 MB at 1024). See scratch\dlss_veg.md.
 +		// r8b: 2048 (30 MB; R3 parity: its grass field took all 1024 slots 331-3262 times per 5 s).
-+		u32 om_slots = 2048;
++		u32 om_slots = 2048; // RSX_DLSS_OBJMV_SLOTS up to 4096 (61 MB)
 +		float om_max_motion = 0.1f; // RSX_DLSS_OBJMV_LIMIT: larger per-object motion (screen fraction) = a wrong match
 +		// RSX_DLSS_OBJMV_REPAIR=0: off. A draw paired with last frame's same-key draw by occurrence ordinal whose motion
 +		// disagrees with the camera is first re-paired with another occurrence of that key that agrees with it (rows of
@@ -27831,6 +27837,11 @@ index 0000000..fbbdf43
 +		// changed within the last n frames keeps its vertex stream copied while unchanged, so its next change finds a
 +		// previous copy (R3 diner 1117: animated meshes paused 2+ frames between updates: "no previous copy" > used).
 +		u32 om_deform_carry = 12;
++		// RSX_DLSS_OBJMV_DEFORM_WARM=1 (default 0): also copy the vertex stream of paired draws that are unchanged past the
++		// carry window / never changed when their vertex program deforms (foliage swaying on and off), while a quarter of
++		// the history slots and of the deform draw budget is free. Their next change gets real per-vertex motion instead
++		// of camera motion (VKR2DeformLogic.h r2om_deform_want).
++		bool om_deform_warm = false;
 +		// RSX_DLSS_OBJMV_DEFORM_NEW=<draws per frame> (default 128, 0 = off): unpaired draws (no previous-frame pair) copy their
 +		// vertex stream too, so when they pair next frame and their vertices changed they get real per-vertex motion. R2 1120
 +		// logs: "no previous copy" was the largest deform fallback (6-7.5k per 5 s) with the budget and buffer never full,
@@ -28220,7 +28231,7 @@ index 0000000..fbbdf43
 +			r.reset_hitch_ms = std::fmax(pdq_env_float("PORT_DLSS_RESET_HITCH_MS", 250.f), 0.f);
 +			r.reset_cuts = pdq_env_int("PORT_DLSS_RESET_CUTS", 0) != 0;
 +			if (const char* e = std::getenv("RSX_DLSS_OBJMV_MAX")) r.om_max_replays = static_cast<u32>(std::max(0, std::min(384, std::atoi(e))));
-+			if (const char* e = std::getenv("RSX_DLSS_OBJMV_SLOTS"); e && *e) r.om_slots = std::atoi(e) > 0 ? static_cast<u32>(std::max(16, std::min(2048, std::atoi(e)))) : 0u;
++			if (const char* e = std::getenv("RSX_DLSS_OBJMV_SLOTS"); e && *e) r.om_slots = std::atoi(e) > 0 ? static_cast<u32>(std::max(16, std::min(4096, std::atoi(e)))) : 0u;
 +			if (const char* e = std::getenv("RSX_DLSS_OBJMV_LIMIT")) r.om_max_motion = std::fmax(static_cast<float>(std::atof(e)), 0.001f);
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_REPAIR")) r.om_repair = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_NEAREST")) r.om_nearest = std::atoi(e) != 0;
@@ -28241,6 +28252,7 @@ index 0000000..fbbdf43
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_DEFORM_MB")) r.om_deform_mb = static_cast<u32>(std::max(1, std::min(128, std::atoi(e))));
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_DEFORM_MAX")) r.om_deform_max = static_cast<u32>(std::max(0, std::min(1024, std::atoi(e))));
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_DEFORM_CARRY"); e && *e) r.om_deform_carry = static_cast<u32>(std::max(0, std::min(250, std::atoi(e))));
++		if (const char* e = std::getenv("RSX_DLSS_OBJMV_DEFORM_WARM"); e && *e) r.om_deform_warm = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_DEFORM_ID"); e && *e) r.om_deform_id = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_DEFORM_NEW"); e && *e) r.om_deform_new = static_cast<u32>(std::max(0, std::min(512, std::atoi(e))));
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_NOWRITE"); e && *e) r.om_nowrite = std::clamp(std::atoi(e), 0, 2);
@@ -32265,6 +32277,7 @@ index 0000000..fbbdf43
 +		u32 dm_key_lay = 0, dm_key_cnt = 0, dm_key_base = 0, dm_rebase = 0; // "layout" fallbacks: attribute layout / vertex count or size / range only; RSX_DLSS_OBJMV_DEFORM_REBASE uses
 +		u32 sk_ds = 0, sk_multi = 0, sk_inst = 0, sk_iconst = 0, sk_cond = 0, sk_blend = 0, sk_misc = 0, op_multi = 0; // velocity redraw skipped: why; RSX_DLSS_OBJMV_MULTI draws
 +		u32 op_cond = 0; // RSX_DLSS_OBJMV_COND: onepass draws under a conditional render
++		u32 dg_warm = 0; // RSX_DLSS_OBJMV_DEFORM_WARM copies
 +		u32 t_slot_full = 0;          // R2PORT dlss-veg: moving draws refused a history slot because all o.cap were taken
 +		u32 t_hold_hist = 0, t_hold_full = 0; // RSX_AA_OBJMV_DEFER_HOLD_HIST: held static draws given a history copy / refused (slots past 3/4)
 +		u32 nh_noslot = 0, nh_inval = 0, nh_prog = 0; // no-history: the previous draw had no slot / its copy is not valid / other program or constants source
@@ -34792,11 +34805,11 @@ index 0000000..fbbdf43
 +				o.dg_nohash = o.dg_same = o.dg_noprev = o.dg_stream = o.dg_budget = 0;
 +				o.dg_carry = o.dm_noprev = o.dm_key = o.dm_hist = o.dm_nocap = 0;
 +				o.dm_np_unp = o.dm_np_first = o.dm_np_aged = o.dm_at = o.dg_new = o.dg_new_bytes = o.dm_id = 0;
-+				r2log("objmv2 fallbacks: velocity redraw skipped: other depth target %u, multi-range %u, instanced %u, instanced constants %u, conditional render %u, programmable blending %u, other %u; multi-range / instanced draws given velocity %u (RSX_DLSS_OBJMV_MULTI=%d); conditional-render draws given velocity %u (RSX_DLSS_OBJMV_COND=%d); deform layout fallback: attribute layout %u, vertex count / size %u, range only %u; range-moved copies used %u (RSX_DLSS_OBJMV_DEFORM_REBASE=%d)",
++				r2log("objmv2 fallbacks: velocity redraw skipped: other depth target %u, multi-range %u, instanced %u, instanced constants %u, conditional render %u, programmable blending %u, other %u; multi-range / instanced draws given velocity %u (RSX_DLSS_OBJMV_MULTI=%d); conditional-render draws given velocity %u (RSX_DLSS_OBJMV_COND=%d); warm deform copies %u (RSX_DLSS_OBJMV_DEFORM_WARM=%d); deform layout fallback: attribute layout %u, vertex count / size %u, range only %u; range-moved copies used %u (RSX_DLSS_OBJMV_DEFORM_REBASE=%d)",
 +					o.sk_ds, o.sk_multi, o.sk_inst, o.sk_iconst, o.sk_cond, o.sk_blend, o.sk_misc, o.op_multi, r2cfg().om_multi ? 1 : 0,
-+					o.op_cond, r2cfg().om_cond && om1_on() ? 1 : 0,
++					o.op_cond, r2cfg().om_cond && om1_on() ? 1 : 0, o.dg_warm, r2cfg().om_deform_warm ? 1 : 0,
 +					o.dm_key_lay, o.dm_key_cnt, o.dm_key_base, o.dm_rebase, r2cfg().om_rebase ? 1 : 0);
-+				o.sk_ds = o.sk_multi = o.sk_inst = o.sk_iconst = o.sk_cond = o.sk_blend = o.sk_misc = o.op_multi = o.op_cond = 0;
++				o.sk_ds = o.sk_multi = o.sk_inst = o.sk_iconst = o.sk_cond = o.sk_blend = o.sk_misc = o.op_multi = o.op_cond = o.dg_warm = 0;
 +				o.dm_key_lay = o.dm_key_cnt = o.dm_key_base = o.dm_rebase = 0;
 +				st.om_loose = st.om_loose_bad = st.om_nonaffine = 0;
 +				if ((r2cfg().om_sway || r2cfg().om_locked) && (st.om_sway_n || st.om_locked_n || st.om_sway_chk))
@@ -39344,7 +39357,8 @@ index 0000000..fbbdf43
 +			// the next change finds a previous copy (R2 run.log 11-14: captured 11937, fallback 11152 per 5 s in the jungle)
 +			// RSX_DLSS_OBJMV_DEFORM_NEW: unpaired draws too (VKR2DeformLogic.h)
 +			const r2om_dwant dw = r2om_deform_want((e.om & om_matched) != 0, (e.om & om_dyn) != 0, e.om_dage, r2cfg().om_deform_carry,
-+				o.dn, o.dn_new, r2cfg().om_deform_max, r2cfg().om_deform_new, e.prog && e.prog->om_deforms);
++				o.dn, o.dn_new, r2cfg().om_deform_max, r2cfg().om_deform_new, e.prog && e.prog->om_deforms,
++				r2cfg().om_deform_warm && o.cap && o.hn < o.cap - o.cap / 4);
 +			const bool carry = dw.carry;
 +			const bool want_d = dw.want;
 +			if (want_d && o.dn >= r2cfg().om_deform_max) o.dg_budget++;
@@ -39386,6 +39400,7 @@ index 0000000..fbbdf43
 +					d_lkey = lk | 1;
 +					d_cnt = g_om_vu->allocated_vertex_count;
 +					if (carry) o.dg_carry++;
++					if (dw.warm) o.dg_warm++;
 +					d_fresh = dw.fresh;
 +				}
 +			}
