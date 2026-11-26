@@ -18105,10 +18105,10 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..04b8025
+index 0000000..757b18e
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
-@@ -0,0 +1,3409 @@
+@@ -0,0 +1,3418 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation, two backends:
 +//  * NVIDIA DLSS Frame Generation through Streamline (manual hooking): sl.interposer.dll is loaded at run time
@@ -18247,6 +18247,11 @@ index 0000000..04b8025
 +		// (or one not started yet): Reflex then slept the game thread for the GPU time on top of the frame, base fps ~30-45.
 +		int reflex_ids = 1;
 +		bool reflex_sleep = true; // R2_DLSS_FG_REFLEX_SLEEP=0: Reflex markers only, no slReflexSleep (A/B)
++		// RSX_DLSS_MV_DILATE=1: DLSS-G gets 3x3 nearest-depth dilated motion vectors (flagged motionVectorsDilated), so
++		// thin alpha-tested grass blades and silhouettes carry their own motion instead of the ground's. Offline
++		// (tools/mvdilate.py on RSX_MV_DUMP bursts) walking through grass gained ~7 points of pixels within 1 px.
++		// FSR 3 keeps the vectors as rendered (its frame interpolation dilates them itself).
++		bool mv_dilate = false;
 +	};
 +
 +	const fg_config& fgcfg()
@@ -18291,6 +18296,7 @@ index 0000000..04b8025
 +			if (r.want) std::fprintf(stderr, "[fg-vk] DLSS_FG_STATS=%d DLSS_FG_FX_MV=%d DLSS_FG_HUD_HOLD=%d DLSS_FG_MV_DEBUG=%d\n", r.stats, r.fx_mv, r.hud_hold ? 1 : 0, r.mv_debug ? 1 : 0);
 +			r.reflex_ids = penv_int("DLSS_FG_REFLEX_IDS", 1) != 0 ? 1 : 0;
 +			r.reflex_sleep = penv_int("DLSS_FG_REFLEX_SLEEP", 1) != 0;
++			if (const char* e = std::getenv("RSX_DLSS_MV_DILATE")) r.mv_dilate = std::atoi(e) != 0;
 +			if (r.want && (!r.reflex_ids || !r.reflex_sleep))
 +				std::fprintf(stderr, "[fg-vk] DLSS_FG_REFLEX_IDS=%d DLSS_FG_REFLEX_SLEEP=%d\n", r.reflex_ids, r.reflex_sleep ? 1 : 0);
 +			return r;
@@ -19672,6 +19678,7 @@ index 0000000..04b8025
 +		float jx = 0.f, jy = 0.f, mvsx = 1.f, mvsy = 1.f, zA = 1.f, zB = 0.f;
 +		float dbg_jx = 0.f, dbg_jy = 0.f, mv_w = 0.f, mv_h = 0.f; // R2_DLSS_FG_MV_DEBUG: jitter (ndc) and view size of the tagged vectors
 +		bool inverted = false, reset = false;
++		bool mv_dilated = false; // the tagged vectors are 3x3 nearest-depth dilated (RSX_DLSS_MV_DILATE, RSX_MV_DUMP b)
 +		double T[16] = {};
 +		image_ptr depth, mv;
 +		u32 streak = 0;            // consecutive frames with a tagged scene
@@ -19977,7 +19984,8 @@ index 0000000..04b8025
 +		vk::image* fx = var == 'd' ? r2mvd_fx_image() : fgcfg().fx_mv ? fx_now : nullptr;
 +		const u32 fx_fl = !fx ? 0u : (var == 'd' || fgcfg().fx_mv == 2) ? 4u : 8u;
 +		// RSX_MV_DUMP variant l: camera motion only everywhere (flag 16: every pixel's vector from its depth, object motion dropped)
-+		const u32 fl = (var == 'b' ? 1u : 0u) | (var == 'g' && r2mvd_sky(zinf, jndc_x, jndc_y) ? 2u : 0u) | fx_fl | (var == 'l' ? 16u : 0u);
++		const bool dilate = var == 'b' || (fgcfg().mv_dilate && !var && !fx_usable());
++		const u32 fl = (dilate ? 1u : 0u) | (var == 'g' && r2mvd_sky(zinf, jndc_x, jndc_y) ? 2u : 0u) | fx_fl | (var == 'l' ? 16u : 0u);
 +		if (fx_fl == 8u || var == 'l') r2fg_jitter_ndc(jndc_x, jndc_y);
 +		if (fl) [[unlikely]]
 +		{
@@ -20011,6 +20019,7 @@ index 0000000..04b8025
 +			if (fx_now) fx_now->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 +			fg_stats_tag(cmd, fx_now, inverted, T, zA, zB, sx, sy, mv_w, mv_h);
 +		}
++		f.mv_dilated = dilate;
 +		f.jx = jx; f.jy = jy;
 +		f.mvsx = mv_w / static_cast<float>(rw);
 +		f.mvsy = mv_h / static_cast<float>(rh);
@@ -20556,7 +20565,7 @@ index 0000000..04b8025
 +		c.motionVectors3D = sl::Boolean::eFalse;
 +		c.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 +		c.orthographicProjection = sl::Boolean::eFalse;
-+		c.motionVectorsDilated = var == 'b' ? sl::Boolean::eTrue : sl::Boolean::eFalse; // RSX_MV_DUMP variant b dilates them
++		c.motionVectorsDilated = f.mv_dilated ? sl::Boolean::eTrue : sl::Boolean::eFalse; // RSX_DLSS_MV_DILATE / RSX_MV_DUMP b
 +		c.motionVectorsJittered = sl::Boolean::eFalse;
 +		c.minRelativeLinearDepthObjectSeparation = fgcfg().depth_sep;
 +	}
