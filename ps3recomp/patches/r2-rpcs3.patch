@@ -27380,10 +27380,10 @@ index 0000000..db54a19
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..dfd7a42
+index 0000000..fbbdf43
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12468 @@
+@@ -0,0 +1,12478 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -27819,6 +27819,12 @@ index 0000000..dfd7a42
 +		// 1118: 48 MB / 384 draws (the carry window below copies unchanged frames too)
 +		// r8b: 768 draws (R3 parity: its grass run hit the 384 budget 3158-8848 times per 5 s with 'not copied' 0; a draw
 +		// over the budget gets no copy, so next frame it falls back to camera motion)
++		// RSX_DLSS_OBJMV_COND (default 1; 0 = old, onepass only): moving draws issued under the game's conditional render
++		// (occlusion-tested objects, SET_RENDER_ENABLE) bind their velocity variant too. The variant is the draw itself
++		// (pipeline / set / push constant binds, no extra draw or render pass), so the guest's condition drops both or
++		// neither. Old: skipped -> camera motion only. FB14 Iceland door run: 51 such moving draws per frame (FB15 up to
++		// 81), the largest camera-only class left (deform fallbacks ~37, no-history 18): doors / foliage ghosting in FG.
++		bool om_cond = true;
 +		u32 om_deform_mb = 48;
 +		u32 om_deform_max = 768;
 +		// RSX_DLSS_OBJMV_DEFORM_CARRY=<frames> (default 12; 1 = the old one-frame carry, 0 = off): a draw whose vertex data
@@ -28231,6 +28237,7 @@ index 0000000..dfd7a42
 +			r.om_mode = (v == "replay" || v == "0") ? 0 : 1;
 +		}
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_DEFORM")) r.om_deform = std::atoi(e) != 0;
++		if (const char* e = std::getenv("RSX_DLSS_OBJMV_COND"); e && *e) r.om_cond = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_DEFORM_MB")) r.om_deform_mb = static_cast<u32>(std::max(1, std::min(128, std::atoi(e))));
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_DEFORM_MAX")) r.om_deform_max = static_cast<u32>(std::max(0, std::min(1024, std::atoi(e))));
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_DEFORM_CARRY"); e && *e) r.om_deform_carry = static_cast<u32>(std::max(0, std::min(250, std::atoi(e))));
@@ -32257,6 +32264,7 @@ index 0000000..dfd7a42
 +		u32 dg_carry = 0, dm_noprev = 0, dm_key = 0, dm_hist = 0, dm_nocap = 0; // RSX_DLSS_OBJMV_DEFORM_CARRY / fallback reasons
 +		u32 dm_key_lay = 0, dm_key_cnt = 0, dm_key_base = 0, dm_rebase = 0; // "layout" fallbacks: attribute layout / vertex count or size / range only; RSX_DLSS_OBJMV_DEFORM_REBASE uses
 +		u32 sk_ds = 0, sk_multi = 0, sk_inst = 0, sk_iconst = 0, sk_cond = 0, sk_blend = 0, sk_misc = 0, op_multi = 0; // velocity redraw skipped: why; RSX_DLSS_OBJMV_MULTI draws
++		u32 op_cond = 0; // RSX_DLSS_OBJMV_COND: onepass draws under a conditional render
 +		u32 t_slot_full = 0;          // R2PORT dlss-veg: moving draws refused a history slot because all o.cap were taken
 +		u32 t_hold_hist = 0, t_hold_full = 0; // RSX_AA_OBJMV_DEFER_HOLD_HIST: held static draws given a history copy / refused (slots past 3/4)
 +		u32 nh_noslot = 0, nh_inval = 0, nh_prog = 0; // no-history: the previous draw had no slot / its copy is not valid / other program or constants source
@@ -34784,10 +34792,11 @@ index 0000000..dfd7a42
 +				o.dg_nohash = o.dg_same = o.dg_noprev = o.dg_stream = o.dg_budget = 0;
 +				o.dg_carry = o.dm_noprev = o.dm_key = o.dm_hist = o.dm_nocap = 0;
 +				o.dm_np_unp = o.dm_np_first = o.dm_np_aged = o.dm_at = o.dg_new = o.dg_new_bytes = o.dm_id = 0;
-+				r2log("objmv2 fallbacks: velocity redraw skipped: other depth target %u, multi-range %u, instanced %u, instanced constants %u, conditional render %u, programmable blending %u, other %u; multi-range / instanced draws given velocity %u (RSX_DLSS_OBJMV_MULTI=%d); deform layout fallback: attribute layout %u, vertex count / size %u, range only %u; range-moved copies used %u (RSX_DLSS_OBJMV_DEFORM_REBASE=%d)",
++				r2log("objmv2 fallbacks: velocity redraw skipped: other depth target %u, multi-range %u, instanced %u, instanced constants %u, conditional render %u, programmable blending %u, other %u; multi-range / instanced draws given velocity %u (RSX_DLSS_OBJMV_MULTI=%d); conditional-render draws given velocity %u (RSX_DLSS_OBJMV_COND=%d); deform layout fallback: attribute layout %u, vertex count / size %u, range only %u; range-moved copies used %u (RSX_DLSS_OBJMV_DEFORM_REBASE=%d)",
 +					o.sk_ds, o.sk_multi, o.sk_inst, o.sk_iconst, o.sk_cond, o.sk_blend, o.sk_misc, o.op_multi, r2cfg().om_multi ? 1 : 0,
++					o.op_cond, r2cfg().om_cond && om1_on() ? 1 : 0,
 +					o.dm_key_lay, o.dm_key_cnt, o.dm_key_base, o.dm_rebase, r2cfg().om_rebase ? 1 : 0);
-+				o.sk_ds = o.sk_multi = o.sk_inst = o.sk_iconst = o.sk_cond = o.sk_blend = o.sk_misc = o.op_multi = 0;
++				o.sk_ds = o.sk_multi = o.sk_inst = o.sk_iconst = o.sk_cond = o.sk_blend = o.sk_misc = o.op_multi = o.op_cond = 0;
 +				o.dm_key_lay = o.dm_key_cnt = o.dm_key_base = o.dm_rebase = 0;
 +				st.om_loose = st.om_loose_bad = st.om_nonaffine = 0;
 +				if ((r2cfg().om_sway || r2cfg().om_locked) && (st.om_sway_n || st.om_locked_n || st.om_sway_chk))
@@ -39547,7 +39556,7 @@ index 0000000..dfd7a42
 +		else if (m_ctx->program.vertex_program.ctrl & RSX_SHADER_CONTROL_INSTANCED_CONSTANTS) skip_why = 4;
 +		else if (clause.is_trivial_instanced_draw && !multi_ok) skip_why = 3;
 +		else if (!clause.is_trivial_instanced_draw && !clause.is_single_draw() && !multi_ok) skip_why = 2;
-+		else if (cmd->flags & vk::command_buffer::cb_has_conditional_render) skip_why = 5;
++		else if ((cmd->flags & vk::command_buffer::cb_has_conditional_render) && !(r2cfg().om_cond && om1_on())) skip_why = 5;
 +		else if (m_ctx->program.fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING) skip_why = 6;
 +		else if (!draw_count || !m_vertex_prog->handle || !set0 || !set0_layout || !m_device->get_shader_draw_parameters_support() ||
 +			(ps.ds.depthTestEnable && ps.ds.depthCompareOp == VK_COMPARE_OP_NEVER))
@@ -39656,6 +39665,7 @@ index 0000000..dfd7a42
 +			o.vb_written = true;
 +			o.n_op++;
 +			if (is_multi) o.op_multi++;
++			if (cmd->flags & vk::command_buffer::cb_has_conditional_render) o.op_cond++;
 +			e.om |= om_replayed;
 +			return;
 +		}
