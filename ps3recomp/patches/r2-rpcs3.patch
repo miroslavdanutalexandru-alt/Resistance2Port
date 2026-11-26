@@ -18099,10 +18099,10 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..f9b7aab
+index 0000000..04b8025
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
-@@ -0,0 +1,3407 @@
+@@ -0,0 +1,3409 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation, two backends:
 +//  * NVIDIA DLSS Frame Generation through Streamline (manual hooking): sl.interposer.dll is loaded at run time
@@ -19169,7 +19169,7 @@ index 0000000..f9b7aab
 +				"		if (abs(q.w) > 1e-7) { vec2 m = (q.xy / q.w - ndc) * 0.5; if (!any(isnan(m)) && all(lessThan(abs(m), vec2(2.0)))) mv = m; }\n"
 +				"	}\n"
 +				"	if ((fl & 4) != 0 && texelFetch(FxIn, p, 0).r > 0.0) mv = vec2(0.0);\n"
-+				"	if ((fl & 8) != 0 && texelFetch(FxIn, p, 0).r > 0.0 && !(inv ? d <= 1e-7 : d >= 0.9999999))\n"
++				"	if (((fl & 16) != 0 || ((fl & 8) != 0 && texelFetch(FxIn, p, 0).r > 0.0)) && !(inv ? d <= 1e-7 : d >= 0.9999999))\n"
 +				"	{\n"
 +				"		vec2 ndc = (vec2(p) + 0.5) / c.zw * 2.0 - 1.0 - c.xy;\n"
 +				"		vec4 q = T * vec4(ndc, d * b.x + b.y, 1.0);\n"
@@ -19970,8 +19970,9 @@ index 0000000..f9b7aab
 +		if (fx_now && (fx_now->width() < rw || fx_now->height() < rh)) fx_now = nullptr;
 +		vk::image* fx = var == 'd' ? r2mvd_fx_image() : fgcfg().fx_mv ? fx_now : nullptr;
 +		const u32 fx_fl = !fx ? 0u : (var == 'd' || fgcfg().fx_mv == 2) ? 4u : 8u;
-+		const u32 fl = (var == 'b' ? 1u : 0u) | (var == 'g' && r2mvd_sky(zinf, jndc_x, jndc_y) ? 2u : 0u) | fx_fl;
-+		if (fx_fl == 8u) r2fg_jitter_ndc(jndc_x, jndc_y);
++		// RSX_MV_DUMP variant l: camera motion only everywhere (flag 16: every pixel's vector from its depth, object motion dropped)
++		const u32 fl = (var == 'b' ? 1u : 0u) | (var == 'g' && r2mvd_sky(zinf, jndc_x, jndc_y) ? 2u : 0u) | fx_fl | (var == 'l' ? 16u : 0u);
++		if (fx_fl == 8u || var == 'l') r2fg_jitter_ndc(jndc_x, jndc_y);
 +		if (fl) [[unlikely]]
 +		{
 +			auto pass = vk::get_compute_task<vk::r2fg_mvd_pass>();
@@ -20729,7 +20730,8 @@ index 0000000..f9b7aab
 +		int mvd_r = 0;
 +		if (fg_usable())
 +		{
-+			on = tok && f.ready && f.want_on && f.depth && f.mv && (f.debug_view || (f.have_ui && f.hudless && f.ui));
++			on = tok && f.ready && f.want_on && f.depth && f.mv && (f.debug_view || (f.have_ui && f.hudless && f.ui)) &&
++				vk::r2mvd_variant() != 'k'; // RSX_MV_DUMP variant k: generated frames off (live A/B)
 +			fg_set_options(on, n);
 +			fg_set_reflex_cap(on);
 +			if (on)
@@ -27378,10 +27380,10 @@ index 0000000..db54a19
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..6eaa9be
+index 0000000..dfd7a42
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12374 @@
+@@ -0,0 +1,12468 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -34011,6 +34013,8 @@ index 0000000..6eaa9be
 +
 +// RSX_MV_DUMP (defined before r2aa_objmv_pre_draw)
 +static bool r2mvd_enabled();
++static bool r2live_on();
++static void r2live_flip();
 +static void r2mvd_frame_end(vk::command_buffer_chunk** cb_pp, const vk::render_device& dev, bool scene, u32 frame, vk::image* fx, bool fx_valid);
 +static unsigned r2mvd_preset(unsigned preset);
 +static int r2mvd_phases(int phases);
@@ -35142,6 +35146,7 @@ index 0000000..6eaa9be
 +
 +	// RSX_MV_DUMP: this frame's record is complete (all draws in); keys, timers, variants
 +	if (r2mvd_enabled()) [[unlikely]] r2mvd_frame_end(&m_current_command_buffer, *m_device, st.scene_valid, st.frame, st.fx_img.get(), st.fx_img && st.fx_frame == st.frame);
++	if (r2live_on()) [[unlikely]] r2live_flip(); // R2_LIVE: counters for an attached tool, live variant requests
 +
 +	// Next frame
 +	// RSX_AA_OBJMV_DEFER_HOLD: frames since each draw last moved (after om_defer_late_flush classified the deferred ones)
@@ -36444,7 +36449,10 @@ index 0000000..6eaa9be
 +// on-screen hint, logged, in every dumped line): a baseline, b FG motion vectors dilated (3x3 nearest depth), c FG camera
 +// (projection, axes, position) from the game's view-projection, d FG motion vectors zeroed under effect (smoke) coverage,
 +// e DLSS-SR jitter sign flipped, f FG camera motion identity, g FG sky (cleared depth) reprojected as a direction,
-+// h 8 jitter phases, i NVIDIA mip bias log2(render / output) - 1, j DLSS preset M (the feature is re-created).
++// h 8 jitter phases, i NVIDIA mip bias log2(render / output) - 1, j DLSS preset M (the feature is re-created),
++// k frame generation off (generated frames only), l FG camera motion only (object motion dropped), m DLSS-SR jitter
++// off (one phase). RSX_MV_DUMP_CYCLE_KEY=<VK code> (default 0x91 Scroll Lock, 0 = off): each press switches live to the
++// next letter of RSX_MV_DUMP_VARIANTS (on-screen hint + log line); R2_LIVE requests do the same from a tool.
 +// A burst = one priming frame (draw log only) + K consecutive frames with an upscaler run. Per frame
 +// (<RSX_MV_DUMP_DIR, default logs\mvdump>\burstNN\): what the upscaler was handed (colour rgba16f, depth r32f, previous depth,
 +// motion vectors rg16f, mask r8, output rgba16f), per-draw ID maps (r16: id = depth-writing scene draws, fxid = the rest
@@ -36481,6 +36489,8 @@ index 0000000..6eaa9be
 +		int auto_n = 0, auto_max = 6;
 +		std::chrono::steady_clock::time_point auto_last{}, arm_at{};
 +		bool arm_at_set = false;
++		int cycle_key = 0x91; // VK_SCROLL: RSX_MV_DUMP_CYCLE_KEY
++		bool cycle_was = false;
 +		std::string variants = "a";
 +		std::atomic<char> var{ 'a' };
 +		u32 burst = 0;
@@ -36531,6 +36541,9 @@ index 0000000..6eaa9be
 +		case 'h': return "DLSS-SR 8 jitter phases";
 +		case 'i': return "DLSS-SR mip bias log2(render/output) - 1";
 +		case 'j': return "DLSS-SR preset M";
++		case 'k': return "frame generation OFF";
++		case 'l': return "FG camera motion only (object motion off)";
++		case 'm': return "DLSS-SR jitter off";
 +		default: return "baseline";
 +		}
 +	}
@@ -36547,24 +36560,38 @@ index 0000000..6eaa9be
 +			if (const char* e = std::getenv("RSX_MV_DUMP_AUTO"); e && *e) s.auto_s = std::max(0.0, std::atof(e));
 +			if (const char* e = std::getenv("RSX_MV_DUMP_AUTO_N"); e && *e) s.auto_max = std::clamp(std::atoi(e), 1, 64);
 +			if (const char* e = std::getenv("RSX_MV_DUMP_DIR"); e && *e) s.dir = e;
++			if (const char* e = std::getenv("RSX_MV_DUMP_CYCLE_KEY"); e && *e) s.cycle_key = static_cast<int>(std::strtol(e, nullptr, 0));
 +			if (const char* e = std::getenv("RSX_MV_DUMP_VARIANTS"); e && *e)
 +			{
 +				s.variants.clear();
 +				for (const char* p = e; *p; ++p)
 +				{
 +					const char c = static_cast<char>(std::tolower(static_cast<unsigned char>(*p)));
-+					if (c >= 'a' && c <= 'j') s.variants += c;
++					if (c >= 'a' && c <= 'm') s.variants += c;
 +				}
 +				if (s.variants.empty()) s.variants = "a";
 +			}
 +			s.tbase = std::chrono::steady_clock::now();
-+			if (s.k) r2log("RSX_MV_DUMP: bursts of %d runs to %s (keys 0x%X and F11%s; RSX_MV_DUMP_AUTO every %.1f s of scene time, %d periods, variants \"%s\")",
-+				s.k, s.dir.c_str(), s.key, s.after_s >= 0.0 ? ", once after RSX_MV_DUMP_AFTER s" : "", s.auto_s, s.auto_max, s.variants.c_str());
++			if (s.k) r2log("RSX_MV_DUMP: bursts of %d runs to %s (keys 0x%X and F11%s; RSX_MV_DUMP_AUTO every %.1f s of scene time, %d periods, variants \"%s\"; live switch key 0x%X)",
++				s.k, s.dir.c_str(), s.key, s.after_s >= 0.0 ? ", once after RSX_MV_DUMP_AFTER s" : "", s.auto_s, s.auto_max, s.variants.c_str(), s.cycle_key);
 +		}
 +		return s.k > 0;
 +	}
 +
 +	char mvd_var() { return mvd_on() ? g_mvd.var.load() : 'a'; }
++
++	// live A/B switch (RSX_MV_DUMP_CYCLE_KEY / R2_LIVE): the variant applies from the next frame
++	void mvd_set_var(char v, const char* why)
++	{
++		auto& s = g_mvd;
++		const char old = s.var.exchange(v);
++		if (old == v) return;
++		if ((old == 'j') != (v == 'j')) g_r2.res_w = 0; // preset M: re-create the feature (and back)
++		char title[48];
++		std::snprintf(title, sizeof(title), "A/B %c", static_cast<char>(std::toupper(static_cast<unsigned char>(v))));
++		r2pf_hint(title, mvd_var_name(v), 4000);
++		r2log("RSX_MV_DUMP: live variant %c (%s) by %s at frame %u", v, mvd_var_name(v), why, g_r2.frame);
++	}
 +
 +	// one timing.jsonl line; body = the remaining JSON members (no braces). Any thread.
 +	void mvd_tline(const char* body, u32 frame)
@@ -36807,6 +36834,13 @@ index 0000000..6eaa9be
 +		const bool edge = (k1 && !s.key_was) || (k2 && !s.f11_was);
 +		s.key_was = k1;
 +		s.f11_was = k2;
++		const bool kc = s.cycle_key && (GetAsyncKeyState(s.cycle_key) & 0x8000) != 0;
++		if (kc && !s.cycle_was)
++		{
++			const size_t i = s.variants.find(s.var.load());
++			mvd_set_var(s.variants[i == std::string::npos ? 0 : (i + 1) % s.variants.size()], "key");
++		}
++		s.cycle_was = kc;
 +		if (edge)
 +		{
 +			r2log("RSX_MV_DUMP: key seen (%s)%s", scene ? "scene" : "no scene yet: burst waits for gameplay", s.armed || s.left || s.cap ? ", a burst is already pending" : "");
@@ -36867,8 +36901,70 @@ index 0000000..6eaa9be
 +	mvd_frame_end(cb_pp, dev, scene, frame, fx, fx_valid);
 +}
 +static unsigned r2mvd_preset(unsigned preset) { return mvd_var() == 'j' ? 13u : preset; }
-+static int r2mvd_phases(int phases) { return mvd_var() == 'h' ? 8 : phases; }
++static int r2mvd_phases(int phases) { return mvd_var() == 'h' ? 8 : mvd_var() == 'm' ? 1 : phases; }
 +static bool r2mvd_nv_bias() { return mvd_var() == 'i'; }
++
++// R2_LIVE=1 (unset / 0 = off): live counters and control for an attached tool (tools\r2live.py). A 4 KB named shared
++// memory block "Local\R2Live_<pid>" written at every flip: frame, the RSX_MV_DUMP variant, raw object-motion counters
++// (most reset when the periodic stats lines are logged: readers take deltas and treat a drop as a reset). A reader may
++// write req_var (a letter a..m) to switch the RSX_MV_DUMP variant live (needs RSX_MV_DUMP); the game clears it.
++namespace
++{
++	struct r2live_blk
++	{
++		u32 magic, version, pid, frame;
++		u32 flips, scene, var, req_var;
++		u32 ctr[32];
++	};
++	r2live_blk* g_live = nullptr;
++	int g_live_on = -1;
++}
++
++static bool r2live_on()
++{
++	if (g_live_on >= 0) [[likely]] return g_live_on > 0;
++	g_live_on = 0;
++	const char* e = std::getenv("R2_LIVE");
++	if (!e || !*e || *e == '0') return false;
++	char name[64];
++	std::snprintf(name, sizeof(name), "Local\\R2Live_%lu", static_cast<unsigned long>(GetCurrentProcessId()));
++	if (HANDLE m = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 4096, name))
++		g_live = static_cast<r2live_blk*>(MapViewOfFile(m, FILE_MAP_ALL_ACCESS, 0, 0, 4096));
++	if (!g_live)
++	{
++		r2log("R2_LIVE: shared memory %s failed (error %lu)", name, static_cast<unsigned long>(GetLastError()));
++		return false;
++	}
++	std::memset(g_live, 0, 4096);
++	g_live->magic = 0x564C3252; // "R2LV"
++	g_live->version = 1;
++	g_live->pid = GetCurrentProcessId();
++	g_live_on = 1;
++	r2log("R2_LIVE: live counters in shared memory %s%s", name, mvd_on() ? "" : " (RSX_MV_DUMP off: variant requests ignored)");
++	return true;
++}
++
++static void r2live_flip()
++{
++	auto& L = *g_live;
++	const auto& st = g_r2;
++	const auto& o = g_om2;
++	L.frame = st.frame;
++	L.flips++;
++	L.scene = st.scene_valid ? 1u : 0u;
++	L.var = mvd_on() ? static_cast<u32>(g_mvd.var.load()) : 0u;
++	const u32 rq = L.req_var;
++	if (rq)
++	{
++		const char v = static_cast<char>(std::tolower(static_cast<int>(rq & 0xff)));
++		if (mvd_on() && v >= 'a' && v <= 'm') mvd_set_var(v, "R2_LIVE");
++		L.req_var = 0;
++	}
++	const u32 c[] = { st.om_late_start, st.om_def_held, o.t_hold_hist, o.t_hold_full, o.t_nohist, o.nh_noslot, o.t_slot_full,
++		o.t_dfm, o.t_dmiss, o.dm_noprev, o.t_frames, o.sk_cond, st.om_def_frames, o.n_nohist, st.om_ls_age[2], o.t_hist };
++	static_assert(sizeof(c) / sizeof(c[0]) <= 32);
++	std::memcpy(L.ctr, c, sizeof(c));
++}
 +
 +namespace vk
 +{
