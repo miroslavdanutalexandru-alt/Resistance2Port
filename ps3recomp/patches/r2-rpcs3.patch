@@ -27378,10 +27378,10 @@ index 0000000..db54a19
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..f0467bd
+index 0000000..6eaa9be
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12351 @@
+@@ -0,0 +1,12374 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -27891,6 +27891,8 @@ index 0000000..f0467bd
 +		// were static last frame on every moving frame: each move was a late start with camera motion only (FB3/FB6/FB7
 +		// run.log: 30-40 late starts per frame).
 +		u32 om_defer_hold = 8;
++		// RSX_AA_OBJMV_DEFER_HOLD_HIST (default 1; 0 = FB12 behaviour): those held draws keep a GPU history copy while static
++		bool om_defer_hold_hist = true;
 +		// RSX_AA_FAST_EXIT (default: on with RSX_AA_OBJMV_DEFER; 1 / 0 force): a draw outside the scene surfaces with the
 +		// targets, depth / stencil / colour state and frame state of the previous draw, which needed nothing (no jitter,
 +		// no capture, no run), returns right after the target tally.
@@ -28270,6 +28272,7 @@ index 0000000..f0467bd
 +		if (const char* e = std::getenv("RSX_AA_OBJMV_DEFER"); e && *e) r.om_defer = std::clamp(std::atoi(e), 0, 2);
 +		if (const char* e = std::getenv("RSX_AA_OBJMV_DEFER_HIST"); e && *e) r.om_defer_hist = *e != '0';
 +		if (const char* e = std::getenv("RSX_AA_OBJMV_DEFER_HOLD"); e && *e) r.om_defer_hold = static_cast<u32>(std::clamp(std::atoi(e), 0, 250));
++		if (const char* e = std::getenv("RSX_AA_OBJMV_DEFER_HOLD_HIST"); e && *e) r.om_defer_hold_hist = *e != '0';
 +		if (const char* e = std::getenv("RSX_AA_FAST_EXIT"); e && *e) r.fast_exit = std::atoi(e) != 0 ? 1 : 0;
 +		if (const char* e = std::getenv("RSX_FSR_REACTIVE")) r.fsr_reactive = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_NEW_HIST")) r.om_new_hist = static_cast<u32>(std::max(0, std::min(100, std::atoi(e))));
@@ -32253,6 +32256,8 @@ index 0000000..f0467bd
 +		u32 dm_key_lay = 0, dm_key_cnt = 0, dm_key_base = 0, dm_rebase = 0; // "layout" fallbacks: attribute layout / vertex count or size / range only; RSX_DLSS_OBJMV_DEFORM_REBASE uses
 +		u32 sk_ds = 0, sk_multi = 0, sk_inst = 0, sk_iconst = 0, sk_cond = 0, sk_blend = 0, sk_misc = 0, op_multi = 0; // velocity redraw skipped: why; RSX_DLSS_OBJMV_MULTI draws
 +		u32 t_slot_full = 0;          // R2PORT dlss-veg: moving draws refused a history slot because all o.cap were taken
++		u32 t_hold_hist = 0, t_hold_full = 0; // RSX_AA_OBJMV_DEFER_HOLD_HIST: held static draws given a history copy / refused (slots past 3/4)
++		u32 nh_noslot = 0, nh_inval = 0, nh_prog = 0; // no-history: the previous draw had no slot / its copy is not valid / other program or constants source
 +		bool vel_live = false;        // vel was cleared this frame (a segment replay already wrote into it)
 +		// counters: this frame / since the last fps line
 +		u32 n_rec = 0, n_replay = 0, n_pending = 0, n_skip = 0, n_nohist = 0, n_static = 0, n_hist = 0, n_seg = 0;
@@ -34811,10 +34816,13 @@ index 0000000..f0467bd
 +			st.om_fast = st.om_fast_chk = 0;
 +			if (r2cfg().om_defer || st.fast_draws)
 +			{
-+				r2log("objmv defer (RSX_AA_OBJMV_DEFER=%d): %u frames, %u draws predicted static and classified after the scene (%.0f us/frame%s); late-start %u (moving while predicted static: camera motion this frame; %u given a history copy, RSX_AA_OBJMV_DEFER_HIST; moved 2 frames before %u, 3-8 frames before %u, longer ago / never %u); %u not predicted: moved in the last %u frames (RSX_AA_OBJMV_DEFER_HOLD); fast exit (RSX_AA_FAST_EXIT) %u of %u draws",
++				r2log("objmv defer (RSX_AA_OBJMV_DEFER=%d): %u frames, %u draws predicted static and classified after the scene (%.0f us/frame%s); late-start %u (moving while predicted static: camera motion this frame; %u given a history copy, RSX_AA_OBJMV_DEFER_HIST; moved 2 frames before %u, 3-8 frames before %u, longer ago / never %u); %u not predicted: moved in the last %u frames (RSX_AA_OBJMV_DEFER_HOLD); held static draws given a history copy %u, refused (slots) %u (RSX_AA_OBJMV_DEFER_HOLD_HIST=%d); no-history (moving, camera motion only) %u: previous draw had no copy %u, copy not valid %u, other program %u; fast exit (RSX_AA_FAST_EXIT) %u of %u draws",
 +					r2cfg().om_defer, st.om_def_frames, st.om_def_draws, st.om_def_frames ? static_cast<double>(st.om_def_ns) / 1000.0 / st.om_def_frames : 0.0,
-+					r2cfg().om_defer == 1 ? " on the worker thread" : " on the render thread at the flip", st.om_late_start, g_om2.t_late_hist, st.om_ls_age[0], st.om_ls_age[1], st.om_ls_age[2], st.om_def_held, r2cfg().om_defer_hold, st.fast_hits, st.fast_draws);
++					r2cfg().om_defer == 1 ? " on the worker thread" : " on the render thread at the flip", st.om_late_start, g_om2.t_late_hist, st.om_ls_age[0], st.om_ls_age[1], st.om_ls_age[2], st.om_def_held, r2cfg().om_defer_hold,
++					g_om2.t_hold_hist, g_om2.t_hold_full, r2cfg().om_defer_hold_hist ? 1 : 0, g_om2.nh_noslot + g_om2.nh_inval + g_om2.nh_prog, g_om2.nh_noslot, g_om2.nh_inval, g_om2.nh_prog,
++					st.fast_hits, st.fast_draws);
 +				g_om2.t_late_hist = 0;
++				g_om2.t_hold_hist = g_om2.t_hold_full = g_om2.nh_noslot = g_om2.nh_inval = g_om2.nh_prog = 0;
 +				st.om_def_frames = st.om_def_draws = st.om_late_start = st.om_def_held = 0;
 +				st.om_ls_age[0] = st.om_ls_age[1] = st.om_ls_age[2] = 0;
 +				st.om_def_ns = 0;
@@ -39283,7 +39291,20 @@ index 0000000..f0467bd
 +		// straight from the transform constants ring. Static matched geometry needs none (camera motion).
 +		// om2_init sets o.cap: it used to be called only after 'o.hn < o.cap' (cap 0 -> never), so no history copy was
 +		// ever made, every moving draw was "no-history" and v2 never ran (found in R3, same bug here).
-+		const bool moving = (e.om & (om_skin | om_rigid)) || !(e.om & om_matched) || e.prog->indexed || dfm;
++		// RSX_AA_OBJMV_DEFER_HOLD_HIST: a static draw that moved in the last RSX_AA_OBJMV_DEFER_HOLD frames keeps a history
++		// copy (like RSX_DLSS_OBJMV_DEFORM_CARRY for vertex data), so its next move has its own velocity. Without it a held
++		// draw (not predicted static) moving on alternate frames found no copy from its static frame: "no-history", camera
++		// motion only, the same ghost as the late start it replaced (FB12 run.log: late starts 47 -> 6 per frame,
++		// no-history 35 -> 62 per frame). Lowest priority: only while a quarter of the slots is still free.
++		const bool static_now = !(e.om & (om_skin | om_rigid)) && (e.om & om_matched) && !e.prog->indexed && !dfm;
++		bool held = static_now && r2cfg().om_defer && r2cfg().om_defer_hold && r2cfg().om_defer_hold_hist &&
++			e.prev < st.prev_F.e.size() && st.prev_F.e[e.prev].om_mage < r2cfg().om_defer_hold;
++		if (held && o.cap && o.hn >= o.cap - o.cap / 4)
++		{
++			o.t_hold_full++;
++			held = false;
++		}
++		const bool moving = (e.om & (om_skin | om_rigid)) || !(e.om & om_matched) || e.prog->indexed || dfm || held;
 +		const bool om_ok = moving && om2_init(*m_device);
 +		if (om_ok && m_transform_constants_ring_info.has_shadow())
 +		{
@@ -39315,6 +39336,7 @@ index 0000000..f0467bd
 +				bc.size = static_cast<VkDeviceSize>(e.om_src == 1 ? 468 : e.om_cnt) * 16;
 +				o.hcopy.push_back(bc);
 +				e.om_hslot = static_cast<u16>(slot + 1);
++				if (held) o.t_hold_hist++;
 +				// RSX_DLSS_OBJMV_DEFORM: the vertex stream too, issued with the constants (hvalid covers both)
 +				const VkBuffer vring = m_attrib_ring_info.heap->value;
 +				if (dfm && !o.dsrc) o.dsrc = vring;
@@ -39411,6 +39433,7 @@ index 0000000..f0467bd
 +			!o.hvalid[o.hpar ^ 1][pslot])
 +		{
 +			o.n_nohist++;
++			(p.vkvp != e.vkvp || p.om_src != e.om_src || (e.om_src == 2 && p.om_cnt != e.om_cnt) ? o.nh_prog : pslot >= o.cap ? o.nh_noslot : o.nh_inval)++;
 +			return;
 +		}
 +		const u32 prev_base = o.cap + ((o.hpar ^ 1) * o.cap + pslot) * 468;
