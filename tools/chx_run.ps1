@@ -1,15 +1,16 @@
 # Chicxulub freeze repro run (RL 138705: hard freeze a few metres after Daedalus tears the roof off the last dome).
-#   tools\chx_run.ps1 [-Exe <path>] [-Checkpoint cp_boss_catwalks1] [-Level last-1] [-Pack R2_100pct_newgameplus]
+#   tools\chx_run.ps1 [-Exe <path>] [-Checkpoint cp_boss_catwalks1] [-Level chicxulub] [-Pack R2_100pct_newgameplus]
 #                     [-Env @{NAME='value'}]
-# Boots straight into Chicxulub (fast boot: Campaign > Load Level, one row above the bottom = "decks" checkpoint,
-# which is still before the domes if the checkpoint switch below fails) and switches the start to the catwalks
-# checkpoint, with god mode + infinite ammo and the CHX1 diagnostics (hang report after 20 s without progress,
+# Boots straight into Chicxulub (fast boot: Campaign > Load Level, whose start the port redirects to the level and
+# checkpoint found by the name cp_boss_catwalks1 in the game's level/checkpoint table; the log shows "[fastboot]
+# start redirected: ..."; if the name is not found the first level starts unchanged), with god mode + infinite ammo
+# and the CHX1 diagnostics (hang report after 20 s without progress,
 # level-script [lua] lines, stutter log, RSX stall report). -Env adds/overrides game env vars (A/B switches).
 # Game-run rules: refuses to start while any Resistance*.exe runs or D:\Games\tmp\gamerun.lock exists; takes the
 # lock, copies the user's saves, installs the save pack. A separate hidden watcher (it survives closing this
 # console) waits for every Resistance2.exe started from -Exe to exit, then puts the saves back and removes the lock.
 # This script itself waits until the game has exited.
-param([string]$Exe = '', [string]$Checkpoint = 'cp_boss_catwalks1', [string]$Level = 'last-1',
+param([string]$Exe = '', [string]$Checkpoint = 'cp_boss_catwalks1', [string]$Level = 'chicxulub',
       [string]$Pack = 'R2_100pct_newgameplus', [string]$Log = '', [string]$Owner = 'chx_run', [hashtable]$Env = @{})
 
 $ErrorActionPreference = 'Stop'
@@ -48,7 +49,7 @@ try {
 
     # CHX1 diagnostics; FREEZE_RELAUNCH off: a frozen game must stay frozen (the hang report is the point)
     $envs = @{ PORT_HANG_DUMP = '1'; PORT_HITCH_LOG = '1'; R2_LUA_LOG = '1'; RSX_STALL_DIAG_MS = '3000'
-               PORT_CHEAT_GODMODE = '1'; PORT_CHEAT_AMMO = '1'; FREEZE_RELAUNCH = '' }
+               PORT_CHEAT_GODMODE = '1'; PORT_CHEAT_AMMO = '1'; FREEZE_RELAUNCH = ''; PORT_FAST_BOOT_TRACE = '1' }
     foreach ($k in $Env.Keys) { $envs[$k] = [string]$Env[$k] }
     $out = & (Join-Path $PSScriptRoot 'fastboot.ps1') -Level $Level -Checkpoint $Checkpoint -Exe $Exe -GameDir $GameDir `
         -Log $Log -KeepSaves -Cutscenes -Env $envs 6>&1 | ForEach-Object { "$_" }
@@ -75,7 +76,7 @@ Write-Host " (If you start somewhere else, e.g. the ship decks, just play on to 
 Write-Host '=================================================================================================='
 Write-Host "game PID $gpid, log $Log"
 $t0 = Get-Date; $seen = @{}
-$marks = '^\[fastboot\] (start checkpoint|PORT_BOOT_CHECKPOINT|gameplay)|closing Boss door|REGION H IS LOADING|set_Boss_Arena_cp|\[hang|\[freeze|watchdog'
+$marks = '^\[fastboot\] (start checkpoint|start redirected|level/checkpoint table|  level |PORT_BOOT_|gameplay|fscommand (SetScreen|LoadCheckpoint|LoadLevel))|fast boot: |closing Boss door|REGION H IS LOADING|set_Boss_Arena_cp|\[hang|\[freeze|watchdog'
 while (Get-Process -Id $gpid -ErrorAction SilentlyContinue) {
     Start-Sleep 1
     foreach ($h in Select-String -Path $Log -Pattern $marks -ErrorAction SilentlyContinue) {

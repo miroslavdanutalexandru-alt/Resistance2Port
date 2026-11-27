@@ -1,8 +1,9 @@
 # Developer fast boot (automated tests): starts the game straight into a level, intro movies skipped.
 #   tools\fastboot.ps1 -Level <name|row> [-Exe <path>] [-Seconds N] [-GameDir <dir>] [-Log <file>] [-Cutscenes]
 #                      [-KeepSaves] [-List] [-Checkpoint <name|index>]
-# -Level    a name from the list printed below (iceland), or the row number in the game's Campaign > Load Level
-#           list (1 = first), or last (the bottom row). The port presses through the menus for you.
+# -Level    a name from the list printed below (iceland, chicxulub), or a checkpoint row of the first level in the
+#           game's Campaign > Load Level screen (1 = first). The port presses through the menus for you; other
+#           levels are reached by redirecting that start to the level of a checkpoint name (port_fastboot.h).
 # -Checkpoint  start the picked level at that checkpoint (PORT_BOOT_CHECKPOINT): a define_checkpoint name from the
 #           level's levelconfig.lua, e.g. cp_boss_catwalks1, or its 0-based index.
 # -Exe      the Resistance2.exe to run (default: build\Resistance2.exe next to this tools folder).
@@ -21,8 +22,8 @@ $ExeName = 'Resistance2.exe'
 # run.bat's fixed settings (the user's settings.bat comes after them)
 $RunEnv = [ordered]@{ SPURS_PM_YIELD = '0'; SPURS_IDLE_POLL = '0'; FREEZE_RELAUNCH = '900' }
 $CfgUser = Join-Path $env:USERPROFILE 'Saved Games\Resistance 2\config'   # run.bat's CFG_USER
-# same table as project\port_fastboot.h: name -> Campaign > Load Level row
-$Named = [ordered]@{ 'iceland' = '1  (Holar, Iceland: the opening)'; 'chicxulub' = 'last  (Chicxulub: the final level, not checked on screen)'; 'last' = 'last  (the bottom row)' }
+# same table as project\port_fastboot.h: name -> how it is reached
+$Named = [ordered]@{ 'iceland' = '1  (Holar, Iceland: the opening)'; 'chicxulub' = '1, redirected to the level of cp_boss_catwalks1  (Chicxulub: the final level)' }
 $repo = Split-Path -Parent $PSScriptRoot
 if (-not $GameDir) {
     $GameDir = $repo
@@ -52,7 +53,7 @@ if ($levels) { Write-Host ('Level folders (the log shows the one loaded): ' + ($
 if ($List -or -not $Level) { if (-not $Level -and -not $List) { Write-Host 'Give -Level <name|row>.' }; exit 0 }
 
 $name = ($Level -split '[/\\]')[-1].ToLower()
-if (-not $Named.Contains($name) -and $name -notmatch '^([1-9]\d*|last-\d+)$') { throw "unknown level '$Level': a name above or a Load Level row number" }
+if (-not $Named.Contains($name) -and $name -notmatch '^[1-9]\d*$') { throw "unknown level '$Level': a name above or a Load Level row number" }
 if (-not (Test-Path $Exe)) { throw "no game executable at $Exe (build first, or give -Exe)" }
 $Exe = (Resolve-Path $Exe).Path
 
