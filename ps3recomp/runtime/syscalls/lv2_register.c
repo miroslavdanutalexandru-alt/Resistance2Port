@@ -1974,6 +1974,29 @@ void spu_thread_publish_ctx(uint32_t tid, void* c)
     if (t) t->live_ctx = c;
 }
 
+/* Hang reports: one line per SPU thread -- where each lifted worker is (image,
+ * pc, lr) and its mailbox fill, so a freeze shows whether a SPURS lane is stuck
+ * in a job or idle. Racy reads, written only when a hang report is. */
+void spu_hang_lanes(void (*emit)(const char* line))
+{
+    for (int i = 0; i < MAX_SPU_THREADS; i++) {
+        const spu_thread_t* t = &s_spu_threads[i];
+        if (!t->in_use) continue;
+        char ln[256];
+        int p = snprintf(ln, sizeof ln, "spu %08X grp %08X idx %u run %d", t->tid, t->group_id, t->index,
+                         t->running);
+        const spu_context* c = (const spu_context*)(t->live_ctx ? t->live_ctx : t->sctx);
+        if (c && p > 0 && p < (int)sizeof ln)
+            snprintf(ln + p, sizeof ln - (size_t)p,
+                     " %s img %d pc %05X lr %05X status %X stop %X depth %u pm %d ovl %d"
+                     " | in %u out %u intr %u",
+                     t->live_ctx ? "live" : "sctx", c->image_id, c->pc & 0x3FFFFu, c->gpr[0]._u32[0] & 0x3FFFFu,
+                     c->status, c->stop_code, c->host_depth, c->policy_mode, c->resident_ovl,
+                     c->ch_in_mbox.count, c->ch_out_mbox.count, c->ch_out_intr_mbox.count);
+        emit(ln);
+    }
+}
+
 /* Public: consume the pending inbound-mailbox command for a SPU thread, if any.
  * Read-and-clear: one PPU write is delivered to exactly one SPU run. */
 uint32_t spu_thread_take_pending_inmbox(uint32_t tid)

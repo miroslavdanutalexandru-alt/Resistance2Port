@@ -42,6 +42,13 @@ static void r2c_guest(PortGuestState* g)
 }
 
 extern "C" void ppu_hang_guest_threads(void (*emit)(const char*));   /* sys_ppu_thread.c */
+extern "C" void spu_hang_lanes(void (*emit)(const char*));           /* lv2_register.c */
+static void r2c_guest_threads(void (*emit)(const char*))
+{
+    ppu_hang_guest_threads(emit);
+    emit("-- spu threads --");
+    spu_hang_lanes(emit);
+}
 
 /* R3 #33 (same renderer here): an RPCS3 renderer thread (rsx::thread, ...) that dies of a fatal error -- e.g. out
  * of video memory -- used to leave the game frozen on its last frame, with no report (focus pauses kept resetting
@@ -104,7 +111,7 @@ static void r2_crash_init(void)
     c.guest_resolve = ppu_prof_resolve_host;
     c.before_report = rsx_null_refresh_restore_on_crash;
     c.guest_state = r2c_guest;
-    c.guest_threads = ppu_hang_guest_threads;
+    c.guest_threads = r2c_guest_threads;
     c.after_report = port_ft_on_report;
     port_crash::init(c);
     g_port_thread_fatal_hook = r2_thread_fatal;
