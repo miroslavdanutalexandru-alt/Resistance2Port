@@ -445,7 +445,8 @@ extern "C" void r2_move_start_hook(ppu_context* ctx, double still)
     ctx->fpr[3] = (double)(float)(ctx->fpr[3] * k);
 }
 
-/* R2_PHYS_STEP_FILL (opt-in test, 1 = on). Entry of the physics frame func_006F3C64
+/* R2_PHYS_STEP_FILL: on by default when the frame limit is above 30 fps or unlocked
+ * (0 = off, 1 = also at 30 fps). Entry of the physics frame func_006F3C64
  * (tools/hooks/r2.json): f1 = physics dt. See r2_physstep.h. */
 extern "C" void r2_phys_dt_hook(ppu_context* ctx)
 {
@@ -453,8 +454,12 @@ extern "C" void r2_phys_dt_hook(ppu_context* ctx)
     static double debt = 0.0;
     if (on < 0) {
         const char* e = getenv("R2_PHYS_STEP_FILL");
-        on = (e && *e == '1') ? 1 : 0;
-        if (on) fprintf(stderr, "[patch] R2_PHYS_STEP_FILL: physics frames always run at least one step\n");
+        const double t = r2_fps_target();
+        if (e && *e == '0') on = 0;
+        else if (e && *e == '1') on = 1;
+        else on = (t == 0.0 || t > 30.0) ? 1 : 0;
+        fprintf(stderr, "[patch] R2_PHYS_STEP_FILL: %s\n",
+                on ? "on (physics frames always run at least one step)" : "off");
     }
     if (!on) return;
     const double scale = (double)u2f(vm_read32(0x012F7308u + 0xA0u));
