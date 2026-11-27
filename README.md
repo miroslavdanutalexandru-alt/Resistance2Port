@@ -778,6 +778,10 @@ What's planned after this beta, and how it relates to the issues above: [docs/RO
 - `tools/art/make_r2_art.py` draws the installer's wizard artwork (original, Python + Pillow); `tools/installer/make_wizard_images.py` sizes it for Setup.
 - `tools/r2_regen.py` runs the lifters on your decrypted `EBOOT.elf`, then re-applies this port's own edits to the generated code (`tools/hooks/`).
 
+### Developer fast boot (automated test runs)
+
+Opt-in environment variables, all off by default: `PORT_FAST_BOOT=1` skips the start-up logo and intro movies; `PORT_BOOT_LEVEL=<level>` starts straight in a level (a name such as `iceland`, or a chapter number from `tools\fastboot.ps1 -List`) through the game's own `-level` command-line option, which bypasses the front end; `PORT_FAST_BOOT_CUTSCENES=1` also skips cutscenes (off by default, because some tests need them). The log prints `[fastboot] gameplay: ...` when the player gets control. `tools\fastboot.ps1 -Level <name|chapter> [-Exe <path>] [-Seconds N] [-Cutscenes]` starts a build with these and your `settings.bat`, prints the game's PID, and with `-Seconds` waits for gameplay and prints the boot time.
+
 ## Credits and licences
 
 - [Resistance: Fall of Man PC port](https://github.com/Psyykosis/Resistance-Fall-of-Man-Recomp): this port builds on its runtime, tools and research (SPURS/SPU job handling, frame pacing, input, audio and video fixes).

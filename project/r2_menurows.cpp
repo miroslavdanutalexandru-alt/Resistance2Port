@@ -431,8 +431,17 @@ extern "C" int r2_menu_rows_cmd(ppu_context* ctx)
  * PlaySound, ... ; cmd r4, args r5), the only code that knows "SetScreen". The main menu's
  * Options > PC SETTINGS entry sends SetScreen "PcSettings": opened as AVOptions, and its "PcStart"
  * then answers "from the entry" (the PC category list). Never skips the game's code. */
+extern "C" void r2_fb_fscommand(const char* cmd, const char* args);   /* r2_pcextra.cpp: fast boot menu driver */
 extern "C" void r2_menu_rows_screen(ppu_context* ctx)
 {
+    if (vm_base) {
+        char c[48] = "", a[64] = "";
+        const uint32_t ce = (uint32_t)ctx->gpr[4], ae = (uint32_t)ctx->gpr[5];
+        if (ce && ce < 0xF0000000u - 64 && guest_cstr(ce, c, sizeof c)) {
+            if (ae && ae < 0xF0000000u - 64) guest_cstr(ae, a, sizeof a);
+            r2_fb_fscommand(c, a);
+        }
+    }
     if (!vm_base || mode() != 1) return;
     if (!s_hook_live.load(std::memory_order_relaxed)) s_hook_live = true;
     const uint32_t cmd = (uint32_t)ctx->gpr[4];
