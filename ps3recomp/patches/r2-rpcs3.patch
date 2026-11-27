@@ -22311,10 +22311,10 @@ index 0000000..9adb01b
 +#endif
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Gfx.cpp b/rpcs3/Emu/RSX/VK/VKR2Gfx.cpp
 new file mode 100644
-index 0000000..fe23352
+index 0000000..47ddca1
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Gfx.cpp
-@@ -0,0 +1,2755 @@
+@@ -0,0 +1,2763 @@
 +// R2PORT: optional graphics-quality upgrades for the Resistance ports (see VKR2Gfx.h for the switches).
 +//
 +// Per-surface resolution: RPCS3 already supports surfaces of different resolution scales side by side (the
@@ -22875,6 +22875,14 @@ index 0000000..fe23352
 +			p.n = 0.08f;
 +			p.f = 4000.f;
 +			p.fov_y = 44.6f * 3.14159265f / 180.f;
++			// R2's CACAO multiplies the final lit scene (not an ambient term): FFX's defaults (radius 1.2 m, full strength,
++			// clamp 0.98, horizon 0.06, fade 50-300 m) shade whole walls and rocks grey there. Same tuning as Fall of Man.
++			p.radius = 0.6f;
++			p.shadow_multiplier = 0.5f;
++			p.shadow_clamp = 0.6f;
++			p.horizon = 0.1f;
++			p.fade_from = 20.f;
++			p.fade_to = 90.f;
 +			p.radius = env_f("RSX_CACAO_RADIUS", p.radius, 0.05f, 20.f);
 +			p.shadow_multiplier = env_f("RSX_CACAO_STRENGTH", p.shadow_multiplier, 0.f, 5.f);
 +			return p;
