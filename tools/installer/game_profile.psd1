@@ -6,7 +6,8 @@
     RegionLabel = 'EU'
     AppVer      = '01.00'
     TitleMatch  = 'Resistance.?2'                 # other regions of the same game (for a clearer message)
-    Required    = @('PS3_GAME/PARAM.SFO', 'PS3_GAME/USRDIR/EBOOT.BIN', 'PS3_GAME/USRDIR/packed/game/game.psarc')
+    Required    = @('PS3_GAME/PARAM.SFO', 'PS3_GAME/USRDIR/EBOOT.BIN', 'PS3_GAME/USRDIR/packed/game/game.psarc',
+                    'PS3_GAME/USRDIR/packed/levels/lobby/level_cached.psarc', 'PS3_GAME/USRDIR/packed/levels/lobby/level_uncached.psarc')   # lobby: loaded at boot (black screen without it)
     Program     = @('PS3_GAME/USRDIR/EBOOT.BIN')   # the PS3 program file Setup decrypts
     Sha1        = @{
         'PS3_GAME/USRDIR/EBOOT.BIN' = 'cad595100af29baca3fe125642a5eaac647d51ec'

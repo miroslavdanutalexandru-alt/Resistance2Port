@@ -715,7 +715,9 @@ static std::string path_of(const char* name) { return std::string(g_dir) + "\\" 
 // Empty = <port>\gamefiles. Required files: tools\installer\game_profile.psd1 Required.
 static std::string g_gamefiles;
 static const char* const k_gf_required[] = { "PS3_GAME/PARAM.SFO", "PS3_GAME/USRDIR/EBOOT.BIN",
-                                             "PS3_GAME/USRDIR/packed/game/game.psarc", nullptr };
+                                             "PS3_GAME/USRDIR/packed/game/game.psarc",
+                                             "PS3_GAME/USRDIR/packed/levels/lobby/level_cached.psarc",
+                                             "PS3_GAME/USRDIR/packed/levels/lobby/level_uncached.psarc", nullptr };
 static const char* const k_gf_title_ids[] = { "BCES00226", nullptr };
 static std::string gf_dir(int* source = nullptr) { return port_gamefiles_effective(g_dir, g_gamefiles, source); }
 static std::string gf_path(const char* rel) { return gf_dir() + "\\" + rel; }

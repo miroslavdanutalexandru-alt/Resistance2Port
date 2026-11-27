@@ -24,6 +24,8 @@ if exist settings.bat call settings.bat
 if not defined PS3_VFS_ROOT if defined PORT_GAMEFILES set "PS3_VFS_ROOT=%PORT_GAMEFILES%"
 if not defined PS3_VFS_ROOT set "PS3_VFS_ROOT=%~dp0gamefiles"
 if not exist "%PS3_VFS_ROOT%\PS3_GAME\USRDIR\" (set "RUNERR=Your game files were not found - run Setup.bat, or check the game files folder in the launcher, Saves and tools page." & goto missing)
+rem the game opens the multiplayer lobby archive at boot: a copy without it stays on a black screen
+if not exist "%PS3_VFS_ROOT%\PS3_GAME\USRDIR\packed\levels\lobby\level_cached.psarc" (set "RUNERR=Your copy of the game is incomplete: PS3_GAME\USRDIR\packed\levels\lobby\level_cached.psarc is missing. Copy or dump the whole game again." & goto missing)
 rem crash dumps are opt-in: set R2_DUMPS=1 to have Windows write minidumps to logs\dumps (newest 3 kept)
 set "R2_WER=HKCU\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\Resistance2.exe"
 if "%R2_DUMPS%"=="1" (
