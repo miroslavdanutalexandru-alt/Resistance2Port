@@ -1111,6 +1111,20 @@
     ]
    }
   ],
+  "func_006F3C64": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_006F3C64(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" void r2_phys_dt_hook(ppu_context* ctx);   /* R2: physics frames always run a step (r2_patches.cpp, R2_PHYS_STEP_FILL) */",
+     "void func_006F3C64(ppu_context* ctx) {",
+     "        r2_phys_dt_hook(ctx);   /* R2: f1 = physics dt; topped up so the 1/60 s accumulators step this frame (GitHub R2 #27) */"
+    ]
+   }
+  ],
   "func_001270C8": [
    {
     "at": 0,

@@ -40,6 +40,7 @@
 #include "ps3emu/ps3types.h"
 #include "ppu_recomp.h"
 #include "r2_movestart.h"
+#include "r2_physstep.h"
 
 extern "C" double r2_fps_target(void);   /* stubs.cpp: 30 = the game's own limiter */
 extern "C" double r2_lod_scale(void);
@@ -442,4 +443,28 @@ extern "C" void r2_move_start_hook(ppu_context* ctx, double still)
     if (k == 1.0) return;
     ctx->fpr[2] = (double)(float)(ctx->fpr[2] * k);
     ctx->fpr[3] = (double)(float)(ctx->fpr[3] * k);
+}
+
+/* R2_PHYS_STEP_FILL (opt-in test, 1 = on). Entry of the physics frame func_006F3C64
+ * (tools/hooks/r2.json): f1 = physics dt. See r2_physstep.h. */
+extern "C" void r2_phys_dt_hook(ppu_context* ctx)
+{
+    static int on = -1;
+    static double debt = 0.0;
+    if (on < 0) {
+        const char* e = getenv("R2_PHYS_STEP_FILL");
+        on = (e && *e == '1') ? 1 : 0;
+        if (on) fprintf(stderr, "[patch] R2_PHYS_STEP_FILL: physics frames always run at least one step\n");
+    }
+    if (!on) return;
+    const double scale = (double)u2f(vm_read32(0x012F7308u + 0xA0u));
+    double acc = -1.0;
+    for (uint32_t g = 0x0134E100u; g <= 0x0134E108u; g += 4) {
+        const uint32_t w = vm_read32(g);
+        if (w < 0x00010000u || w >= 0xC0000000u) continue;
+        const double a = (double)u2f(vm_read32(w + 0x54u));
+        if (a >= 0.0 && (acc < 0.0 || a < acc)) acc = a;
+    }
+    if (acc < 0.0) return;
+    ctx->fpr[1] = (double)(float)r2_phys_fill_dt(ctx->fpr[1], acc, R2_PHYS_STEP_S * scale, &debt);
 }
