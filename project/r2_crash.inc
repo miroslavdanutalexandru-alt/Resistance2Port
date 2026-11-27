@@ -8,6 +8,10 @@
  * that was installed before it). A hang -- the game loop, r2_game_frames,
  * counted in the stubs.cpp frame limiter, stops -- writes R2_<time>_hang.dmp/.txt
  * once per stall and keeps running.
+ * The game quitting on its own (libc exit() / sys_process_exit: an internal error,
+ * back to the XMB on PS3) writes R2_<time>_exit.dmp/.txt, shows a message box and
+ * ends the process instead of freezing on the last frame.
+ *   PORT_GUEST_EXIT_QUIT=0   no report / box: the old freeze
  *   R2_CRASH_DUMPS=0 / PORT_CRASH_DUMPS=0          both off
  *   R2_CRASH_DUMPS=full (or CRASH_DUMP_FULL=1)      full-memory dumps (several GB)
  *   PORT_HANG_DUMP=1   strict watchdog: 20 s (PORT_HANG_S) without a game frame,
@@ -96,6 +100,43 @@ static void r2_thread_fatal(const char* thread_name, const char* reason)
     MessageBoxA(NULL, msg, "Resistance 2", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
     TerminateProcess(GetCurrentProcess(), code);
 }
+/* R3 RL160363 (same runtime here): the game quit on its own -- libc exit() after an internal error
+ * -> sys_prx_exitspawn_with_level, which used to be a no-op, so it froze on the last frame until the
+ * player closed it. sysPrxForUser.c calls this once (not for a player quit): write the report, tell the
+ * player, and the caller exits. PORT_GUEST_EXIT_QUIT=0: the old behaviour. */
+extern "C" int (*volatile g_port_guest_exit_hook)(const char* via, int32_t* code, int code_known);
+extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
+static int r2_guest_exit(const char* via, int32_t* code, int code_known)
+{
+    const char* q = getenv("PORT_GUEST_EXIT_QUIT");
+    if (q && *q == '0') return 0;
+    uint64_t tid = 0; uint32_t lr = 0, sp = 0, sc_in = 0, sc_last = 0, site = 0;
+    const int g = ppu_crash_guest_state(&tid, &lr, &sp, &sc_in, &sc_last, &site);
+    char cs[32] = "unknown";
+    if (code_known) snprintf(cs, sizeof cs, "%d", (int)*code);
+    fprintf(stderr, "[exit] the game quit on its own: %s (guest exit code %s)\n", via, cs);
+    if (g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "exit");
+    fflush(stdout); fflush(stderr);
+    char d[400];
+    if (g)
+        snprintf(d, sizeof d, "the game called %s (guest exit code %s) on guest thread %llu, lr=0x%08X sp=0x%08X, "
+                 "last syscall %u, callsite 0x%08X", via, cs, (unsigned long long)tid, lr, sp, sc_last, site);
+    else
+        snprintf(d, sizeof d, "the game called %s (guest exit code %s) off a guest thread", via, cs);
+    const int saved = port_crash::guest_exit(d);
+    rsx_null_refresh_restore_on_crash();
+    ClipCursor(NULL);
+    if (HWND w = (HWND)rsx_null_backend_get_hwnd()) ShowWindowAsync(w, SW_MINIMIZE);
+    fprintf(stderr, "[exit] closing the game\n");
+    fflush(stderr);
+    MessageBoxA(NULL, saved ? "The game hit an internal error and closed. A report was saved in logs\\crash."
+                            : "The game hit an internal error and closed.",
+                "Resistance 2", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+    if (!code_known) *code = 1;
+    return 1;
+}
+
 static void r2_crash_init(void)
 {
     PortCrashConfig c = {};
@@ -115,6 +156,7 @@ static void r2_crash_init(void)
     c.after_report = port_ft_on_report;
     port_crash::init(c);
     g_port_thread_fatal_hook = r2_thread_fatal;
+    g_port_guest_exit_hook = r2_guest_exit;
     PortFtConfig f = {};
     f.title = c.title;
     f.paused = r2c_paused;
