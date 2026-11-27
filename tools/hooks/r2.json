@@ -1081,7 +1081,7 @@
      "void func_007404F8(ppu_context* ctx) {"
     ],
     "add": [
-     "extern \"C\" void r2x_lua_chunk(uint64_t buf, uint64_t size_ea);   /* R2: Holar elevator watchdog (project/r2_holar.cpp, R2_HOLAR_ASSIST) */",
+     "extern \"C\" uint64_t r2x_lua_chunk(uint64_t zio, uint64_t buf, uint64_t size_ea);   /* R2: Holar elevator watchdogs (project/r2_holar.cpp, R2_HOLAR_ASSIST) */",
      "void func_007404F8(ppu_context* ctx) {"
     ]
    },
@@ -1092,7 +1092,7 @@
      "        ctx->gpr[8] = R_8 = (int64_t)(int32_t)(-1);"
     ],
     "add": [
-     "        r2x_lua_chunk(R_3, R_1 + 0x70);   /* R2: luaZ_fill got a chunk (buf, &size) from its reader */",
+     "        ctx->gpr[3] = R_3 = r2x_lua_chunk(R_31, R_3, R_1 + 0x70);   /* R2: luaZ_fill got a chunk (buf, &size) from its reader; may hand back a patched one */",
      "        ctx->gpr[8] = R_8 = (int64_t)(int32_t)(-1);"
     ]
    }
