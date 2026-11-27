@@ -171,8 +171,9 @@ static void register_extra_options()
     // Graphics page "EFFECTS AND ACCESSIBILITY", the crosshair on Controls (all also in game: F10 > More PC Options, or F9)
 #if LX_HAS_FX
     add_option(SEC_X_FX, "fx_blur", "Screen blur",
-               "The game's full-screen blur effects (damage, sprint, explosions). Off keeps the picture sharp.",
-               LX_ENV("FX_SCREEN_BLUR"), { {"On  (PS3 original)", ""}, {"Off", "0"} }, 0);
+               "The game's full-screen blur effects (damage, sprint, explosions). Off keeps the picture sharp. "
+               "Auto turns it off while Frame Generation runs (generated frames smear it), else on.",
+               LX_ENV("FX_SCREEN_BLUR"), { {"Auto  (off with Frame Generation)", ""}, {"On  (PS3 original)", "1"}, {"Off", "0"} }, 0);
     add_option(SEC_X_FX, "fx_shake", "Camera shake",
                "Explosion and impact camera shake.", LX_ENV("FX_CAMERA_SHAKE"), { {"On  (PS3 original)", ""}, {"Off", "0"} }, 0);
     add_option(SEC_X_FX, "fx_letterbox", "Cinematic black bars",

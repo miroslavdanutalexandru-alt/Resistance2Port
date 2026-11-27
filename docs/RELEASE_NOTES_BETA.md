@@ -12,6 +12,20 @@ This is a **beta**. The campaign has been played through the opening Iceland lev
 
 ### New
 - **Ambient occlusion: CACAO, and the choice of AO (issue #45). Not yet tested in game.** *Graphics › Quality › Ambient occlusion* (and F9) is now Game / Port SSAO (extra) / CACAO / Off (`R2_AO_MODE`), with *Ambient occlusion quality* Low / Medium / High (`R2_AO_QUALITY`). Resistance 2 has no AO of its own; CACAO (AMD FidelityFX CACAO) is a higher-quality alternative to the port SSAO, applied at the same point. Game is the default and unchanged; a saved "On" is Port SSAO.
+- **Surround sound: 5.1 / 7.1 speaker layouts** now reach the speakers channel for channel (*Audio > Speaker layout*, `PORT_AUDIO_CHANNELS`; Auto follows Windows). *Not yet tested on 7.1.*
+- **Game files on another drive:** launcher > Saves and tools > *Game files folder* (`PORT_GAMEFILES`).
+- **Online (RPCN), opt-in and off by default** (`PORT_ONLINE`). Nothing changes unless you turn it on.
+
+### Fixes
+- **Quarter-frame water / surface flicker (#27):** the picture is shown at the display surface's own resolution scale (`R2_PRESENT_SURFACE_SCALE`, default `1`).
+- **Frame Generation ghosting on foliage, grass and moving objects:** the FB21 test settings are now the defaults (`RSX_DLSS_OBJMV_GUARD_FAR=16`, `RSX_DLSS_OBJMV_DEFORM_WARM=1`, `RSX_DLSS_OBJMV_SLOTS=3072`, `RSX_DLSS_MV_DILATE=1`; each `0` / old value restores the old behaviour), Frame Generation uses the real camera (`R2_DLSS_FG_REAL_CAMERA`, default on) and holds a scene through short gaps.
+- **Screen blur under Frame Generation:** *Graphics > Screen blur* has a new default, **Auto**: the scripted full-screen blur (hits, explosions) is off while Frame Generation runs, since generated frames smear it, and on otherwise. *On* keeps it always (`R2_FX_SCREEN_BLUR=1`), *Off* never (`0`).
+- **Jungle intro brightness flash:** late occlusion answers count as glare (`R2_OCC_NOWAIT_LATE=glare`, the default).
+- **HDR:** the picture is no longer cropped and invalid (NaN) pixels are cleared before output.
+- **Elevators that never arrive (Holar tower and the node shafts):** a watchdog moves a stuck elevator on (`R2_HOLAR_ASSIST`, default on; `0` = off).
+- **Frame pacing on fixed-refresh screens (#38):** steps down to a frame rate the screen can hold when frames are missed (`PORT_PACING_ADAPT`, default on).
+- **CACAO ambient occlusion** tuned (strength and radius closer to the game's look).
+- **Hang reports** (`logs\run.log` after a freeze) now also list what each SPU thread was doing. No extra logging during play.
 
 ## 0.3.1-beta
 

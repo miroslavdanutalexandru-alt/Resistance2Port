@@ -18669,7 +18669,7 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..a402e60
+index 0000000..4a2b009
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 @@ -0,0 +1,3481 @@
@@ -18820,8 +18820,8 @@ index 0000000..a402e60
 +		// alpha-tested grass blades and silhouettes carry their own motion instead of the ground's. 1: only at depth edges
 +		// (nearest neighbour > 5% nearer), 2: every pixel. Offline (tools/mvdilate.py on RSX_MV_DUMP bursts) walking
 +		// through grass went 65.8% -> 72.9% of pixels within 1 px (both modes); 1 changes fewer pixels and regresses less.
-+		// FSR 3 keeps the vectors as rendered (its frame interpolation dilates them itself).
-+		int mv_dilate = 0;
++		// FSR 3 keeps the vectors as rendered (its frame interpolation dilates them itself). Default 1 (0.3.1.1; 0 = off).
++		int mv_dilate = 1;
 +	};
 +
 +	const fg_config& fgcfg()
@@ -28302,10 +28302,10 @@ index 0000000..db54a19
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..94a0651
+index 0000000..e6aa556
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12524 @@
+@@ -0,0 +1,12525 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -28687,7 +28687,8 @@ index 0000000..94a0651
 +		// moving draws late in heavy frames get no slot and fall back to camera motion the next frame, varying per frame
 +		// (branch flicker suspect). Costs 2 x N x 7.3 KB of device memory (15 MB at 1024). See scratch\dlss_veg.md.
 +		// r8b: 2048 (30 MB; R3 parity: its grass field took all 1024 slots 331-3262 times per 5 s).
-+		u32 om_slots = 2048; // RSX_DLSS_OBJMV_SLOTS up to 4096 (61 MB)
++		// 0.3.1.1: 3072 (45 MB; the FB16-FB21 frame generation test settings, with RSX_DLSS_OBJMV_DEFORM_WARM).
++		u32 om_slots = 3072; // RSX_DLSS_OBJMV_SLOTS up to 4096 (61 MB)
 +		float om_max_motion = 0.1f; // RSX_DLSS_OBJMV_LIMIT: larger per-object motion (screen fraction) = a wrong match
 +		// RSX_DLSS_OBJMV_REPAIR=0: off. A draw paired with last frame's same-key draw by occurrence ordinal whose motion
 +		// disagrees with the camera is first re-paired with another occurrence of that key that agrees with it (rows of
@@ -28712,11 +28713,11 @@ index 0000000..94a0651
 +		// instance, stale constants) gave a static floor/rug polygon a foreign velocity: hard-edged dark smears in DLSS
 +		// while the camera moved (R3 11-19). Genuinely moving surfaces fail the camera check and keep their velocity.
 +		bool om_guard = true;
-+		// RSX_DLSS_OBJMV_GUARD_FAR=N (render px, default 0 = off; needs the depth guard): an object velocity more than N px
++		// RSX_DLSS_OBJMV_GUARD_FAR=N (render px, default 16, 0 = off; needs the depth guard): an object velocity more than N px
 +		// from the camera motion is dropped wherever the camera motion is confirmed by the previous depth, even when its own
 +		// previous position is confirmed too. Mispaired skinned grass patches (another clump's bone palette, 30-1000 px off)
 +		// land on grass at a similar depth and passed the guard (FB19 dumps: 1-20% of grass pixels per moving frame).
-+		float om_guard_far = 0.f;
++		float om_guard_far = 16.f;
 +		// RSX_DLSS_OBJMV_EXACT_REF=0: the reference camera is the frame's most common draw motion only. Default: a draw whose
 +		// program carries the game's verified view-projection rows (RSX_AA_CAMERA_EXACT) is checked against its own
 +		// VP_prev * VP_cur^-1, the game's camera, not the provisional vote (R3: 5-15% of the matched draws agree with it)
@@ -28758,11 +28759,11 @@ index 0000000..94a0651
 +		// changed within the last n frames keeps its vertex stream copied while unchanged, so its next change finds a
 +		// previous copy (R3 diner 1117: animated meshes paused 2+ frames between updates: "no previous copy" > used).
 +		u32 om_deform_carry = 12;
-+		// RSX_DLSS_OBJMV_DEFORM_WARM=1 (default 0): also copy the vertex stream of paired draws that are unchanged past the
++		// RSX_DLSS_OBJMV_DEFORM_WARM (default 1; 0 = off): also copy the vertex stream of paired draws that are unchanged past the
 +		// carry window / never changed when their vertex program deforms (foliage swaying on and off), while a quarter of
 +		// the history slots and of the deform draw budget is free. Their next change gets real per-vertex motion instead
 +		// of camera motion (VKR2DeformLogic.h r2om_deform_want).
-+		bool om_deform_warm = false;
++		bool om_deform_warm = true;
 +		// RSX_DLSS_OBJMV_DEFORM_NEW=<draws per frame> (default 128, 0 = off): unpaired draws (no previous-frame pair) copy their
 +		// vertex stream too, so when they pair next frame and their vertices changed they get real per-vertex motion. R2 1120
 +		// logs: "no previous copy" was the largest deform fallback (6-7.5k per 5 s) with the budget and buffer never full,
@@ -29158,7 +29159,7 @@ index 0000000..94a0651
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_NEAREST")) r.om_nearest = std::atoi(e) != 0;
 +		r.om_behind = pdq_env_int("RSX_DLSS_OBJMV_BEHIND", 0) != 0;
 +		r.om_guard = pdq_env_int("RSX_DLSS_OBJMV_DEPTH_GUARD", 1) != 0;
-+		r.om_guard_far = std::clamp(pdq_env_float("RSX_DLSS_OBJMV_GUARD_FAR", 0.f), 0.f, 4096.f);
++		r.om_guard_far = std::clamp(pdq_env_float("RSX_DLSS_OBJMV_GUARD_FAR", 16.f), 0.f, 4096.f);
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_EXACT_REF")) r.om_exact_ref = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_STATIC_PX")) r.om_static_px = std::clamp(static_cast<float>(std::atof(e)), 0.f, 16.f);
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_HSUBMIT")) r.om_hsubmit = std::atoi(e) != 0;

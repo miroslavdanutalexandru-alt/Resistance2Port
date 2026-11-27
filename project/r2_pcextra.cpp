@@ -12,6 +12,8 @@
  *   Post effects     R2_FX_SCREEN_BLUR / R2_FX_CAMERA_SHAKE / R2_FX_LETTERBOX (1 = as
  *                    the game, 0 = off): the game's Lua script functions are pointed
  *                    at a no-op function (their OPD words in the Lua binding table).
+ *                    R2_FX_SCREEN_BLUR unset = auto: off while frame generation runs
+ *                    (generated frames smear the scripted full-screen blur), else on.
  *   Cutscene skip    R2_CUTSCENE_SKIP=1: hold Space / Enter / A / Start for 1 s
  *                    while a pre-rendered movie (.bik) plays. R2_CUTSCENE_SKIP_ALL
  *                    (default 1; 0 = off): unwatched movies too (r2x_movie_seen).
@@ -205,6 +207,20 @@ static void fx_apply(void)
     }
 }
 static void fx_set(const char* env, int on) { for (auto& p : s_fx) if (!strcmp(p.env, env)) p.on = on; fx_apply(); }
+/* R2_FX_SCREEN_BLUR: "" = auto (off while frame generation shows generated frames, NVIDIA's DLSS-G guidance for
+ * motion blur; R2's blur is a scripted full-screen pulse with no strength to scale), "1" = always on, "0" = off.
+ * Frame generation counts as running until ~10 s (600 game frames) after it last presented, so menus, cuts and loads
+ * do not flip the blur back and forth. */
+extern "C" volatile int g_r2fg_active;           /* VKR2FrameGen.cpp: frames shown per present, 0 = FG off */
+extern "C" volatile int g_r2fg_active_default = 0;
+#pragma comment(linker, "/alternatename:g_r2fg_active=g_r2fg_active_default")
+static int s_blur_mode = 0;                       /* 0 auto, 1 on, 2 off */
+static int s_fg_idle = 1 << 30;                   /* game frames since frame generation last ran */
+static void fx_blur_update(void)
+{
+    const int on = s_blur_mode == 1 || (s_blur_mode == 0 && s_fg_idle >= 600);
+    for (auto& p : s_fx) if (!strcmp(p.env, "FX_SCREEN_BLUR")) p.on = on;
+}
 
 /* ======================================================================
  * Controller layout (XInput hook in cellPad.c pad_poll_xinput) */
@@ -559,8 +575,9 @@ extern "C" void r2x_frame_tick(void)
     r2pc_reflex_sleep();                         /* NVIDIA Reflex: no-op unless R2_REFLEX is on and the driver has it */
     if (rsx_d3d12_engine_latency_frame() && g_pad_input_hook != rsx_d3d12_engine_latency_input)
         g_pad_input_hook = rsx_d3d12_engine_latency_input;   /* Direct3D 12: Reflex / Anti-Lag 2 */
+    if (g_r2fg_active > 0) s_fg_idle = 0; else if (s_fg_idle < (1 << 30)) s_fg_idle++;
     static int n = 0;
-    if ((++n & 15) == 0) fx_apply();
+    if ((++n & 15) == 0) { fx_blur_update(); fx_apply(); }
 }
 
 /* ======================================================================
@@ -575,7 +592,7 @@ static std::vector<XOpt> s_opts;
 static int s_photo_on = 0;
 static int s_crosshair = 0;             /* 0 off, 1 dot, 2 cross */
 static int s_disc_pause_on = 1, s_cut_skip = 1, s_cut_skip_all = 1, s_photo_allowed = 1;
-static void live_fx_blur(const std::string& v) { fx_set("FX_SCREEN_BLUR", v != "0"); }
+static void live_fx_blur(const std::string& v) { s_blur_mode = v.empty() ? 0 : v == "0" ? 2 : 1; fx_blur_update(); fx_apply(); }
 static void live_fx_shake(const std::string& v) { fx_set("FX_CAMERA_SHAKE", v != "0"); }
 static void live_fx_lbox(const std::string& v) { fx_set("FX_LETTERBOX", v != "0"); }
 static void live_cvd(const std::string& v) { g_pc_cvd_mode = atoi(v.c_str()); }
@@ -641,8 +658,8 @@ static void opts_init(void)
     if (!s_opts.empty()) return;
     /* values match launcher_extra.inc exactly ("" = default: no settings.bat line), or the launcher drops them */
     const std::vector<XChoice> onoff = { {L"On", ""}, {L"Off", "0"} };
-    opt_add(L"Screen blur", L"The game's motion / damage blur effects (Lua screen_blur, node_blur).", "fx_blur", ENVN("FX_SCREEN_BLUR"), 0,
-            onoff, "", live_fx_blur);
+    opt_add(L"Screen blur", L"The game's motion / damage blur effects (Lua screen_blur, node_blur). Auto: off while frame generation runs.",
+            "fx_blur", ENVN("FX_SCREEN_BLUR"), 0, { {L"Auto", ""}, {L"On", "1"}, {L"Off", "0"} }, "", live_fx_blur);
     opt_add(L"Camera shake", L"Explosion and impact camera shake.", "fx_shake", ENVN("FX_CAMERA_SHAKE"), 0, onoff, "", live_fx_shake);
     opt_add(L"Cinematic black bars", L"Letterbox bars in in-engine cutscenes.", "fx_letterbox", ENVN("FX_LETTERBOX"), 0, onoff, "", live_fx_lbox);
     opt_add(L"Colour-blind filter", L"Daltonization filter on the final image.", "colorblind", ENVN("COLORBLIND"), 0,
