@@ -14221,7 +14221,7 @@ index c9bed75..be01c7f 100644
  }
  
 diff --git a/rpcs3/Emu/RSX/VK/VKPresent.cpp b/rpcs3/Emu/RSX/VK/VKPresent.cpp
-index 4afff84..a2c9a79 100644
+index 4afff84..a34973e 100644
 --- a/rpcs3/Emu/RSX/VK/VKPresent.cpp
 +++ b/rpcs3/Emu/RSX/VK/VKPresent.cpp
 @@ -1,10 +1,12 @@
@@ -14469,15 +14469,38 @@ index 4afff84..a2c9a79 100644
  
  			if (section.base_address == info->address)
  			{
-@@ -356,6 +485,7 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
+@@ -356,9 +485,29 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
  			if (viable)
  			{
  				image_to_flip = section.surface->get_surface(rsx::surface_access::transfer_read);
 +				r2d_kind = 0;
++
++				// R2PORT (#27): r2gx/r2aa temporarily raise the global scale while an effect/shadow target is bound
++				// (restored at the next bind). A flip in that window scaled the present rect by 2-4x the display
++				// surface, showing the frame in the top-left quarter. Use the display surface's own scale instead.
++				// R2_PRESENT_SURFACE_SCALE=0 restores the old behaviour.
++				static const bool r2_surf_scale = [] { const char* e = std::getenv("R2_PRESENT_SURFACE_SCALE"); return !(e && e[0] == '0'); }();
++				const auto& active_cfg = RSX(m_ctx)->resolution_scaling_config;
++				const auto& scale_cfg = r2_surf_scale ? surface->resolution_scaling_config : active_cfg;
++				static const bool r2_surf_scale_log = [] { const char* e = std::getenv("R2_PRESENT_DIAG"); return e && e[0] && e[0] != '0'; }();
++				if (r2_surf_scale_log && r2_surf_scale && active_cfg.scale_percent != scale_cfg.scale_percent)
++				{
++					static u32 r2_mismatch_logs = 0;
++					if (r2_mismatch_logs < 8)
++					{
++						r2_mismatch_logs++;
++						rsx_log.warning("[r2aa] present: active scale %u%% at flip, using display surface's %u%% (R2_PRESENT_SURFACE_SCALE)",
++							active_cfg.scale_percent, scale_cfg.scale_percent);
++					}
++				}
  
  				std::tie(info->width, info->height) = rsx::apply_resolution_scale<true>(
- 					RSX(m_ctx)->resolution_scaling_config,
-@@ -370,6 +500,11 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
+-					RSX(m_ctx)->resolution_scaling_config,
++					scale_cfg,
+ 					std::min(surface_width, info->width),
+ 					std::min(surface_height, info->height));
+ 			}
+@@ -370,6 +519,11 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
  		// Hack - this should be the first location to check for output
  		// The render might have been done offscreen or in software and a blit used to display
  		image_to_flip = dynamic_cast<vk::viewable_image*>(surface->get_raw_texture());
@@ -14489,7 +14512,7 @@ index 4afff84..a2c9a79 100644
  	}
  
  	// The correct output format is determined by the AV configuration set in CellVideoOutConfigure by the game.
-@@ -398,8 +533,10 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
+@@ -398,8 +552,10 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
  			flush_command_queue();
  		}
  
@@ -14500,7 +14523,7 @@ index 4afff84..a2c9a79 100644
  	}
  	else if (image_to_flip->format() != expected_format)
  	{
-@@ -429,17 +566,31 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
+@@ -429,17 +585,31 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
  		}
  	}
  
@@ -14532,7 +14555,7 @@ index 4afff84..a2c9a79 100644
  	if (!info.emu_flip)
  	{
  		// Native UI flips are requested from the local task. Submit outstanding work first.
-@@ -456,6 +607,8 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -456,6 +626,8 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  		}
  	}
  
@@ -14541,7 +14564,7 @@ index 4afff84..a2c9a79 100644
  	if (m_vsync_mode != g_cfg.video.vsync)
  	{
  		swapchain_unavailable = true;
-@@ -484,9 +637,15 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -484,9 +656,15 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  		}
  	}
  
@@ -14559,7 +14582,7 @@ index 4afff84..a2c9a79 100644
  
  	if (m_current_frame == &m_aux_frame_context)
  	{
-@@ -605,14 +764,17 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -605,14 +783,17 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  
  	if (info.emu_flip)
  	{
@@ -14577,7 +14600,7 @@ index 4afff84..a2c9a79 100644
  	while (VkResult status = m_swapchain->acquire_next_swapchain_image(m_current_frame->acquire_signal_semaphore, timeout, &m_current_frame->present_image))
  	{
  		switch (status)
-@@ -655,6 +817,7 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -655,6 +836,7 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  
  	// Confirm that the driver did not silently fail
  	ensure(m_current_frame->present_image != umax);
@@ -14585,7 +14608,7 @@ index 4afff84..a2c9a79 100644
  
  	// Calculate output dimensions. Done after swapchain acquisition in case it was recreated.
  	areai aspect_ratio;
-@@ -847,9 +1010,14 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -847,9 +1029,14 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  	{
  		const bool use_full_rgb_range_output = g_cfg.video.full_rgb_range_output.get();
  
@@ -14602,7 +14625,7 @@ index 4afff84..a2c9a79 100644
  			if (image_to_flip2) calibration_src.push_back(image_to_flip2);
  
  			if (m_output_scaling == output_scaling_mode::fsr && !avconfig.stereo_enabled) // 3D will be implemented later
-@@ -890,11 +1058,15 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -890,11 +1077,15 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  		else
  		{
  			// Do raw transfer here as there is no image object associated with textures owned by the driver (TODO)
@@ -14619,7 +14642,7 @@ index 4afff84..a2c9a79 100644
  			rgn.dstOffsets[0] = { aspect_ratio.x1, aspect_ratio.y1, 0 };
  			rgn.dstOffsets[1] = { aspect_ratio.x2, aspect_ratio.y2, 1 };
  
-@@ -904,10 +1076,12 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -904,10 +1095,12 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  				target_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
  			}
  
@@ -14633,7 +14656,7 @@ index 4afff84..a2c9a79 100644
  	if (g_cfg.video.debug_overlay || has_overlay)
  	{
  		if (target_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-@@ -997,6 +1171,8 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -997,6 +1190,8 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  		direct_fbo->release();
  	}
  
