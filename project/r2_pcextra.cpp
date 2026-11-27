@@ -1274,6 +1274,10 @@ static volatile int s_fb_seen_notice = 0, s_fb_seen_past_notice = 0, s_fb_seen_m
  * SetScreen (CampaignLoad = the Load Level screen, Cinematics, CampaignDifficulty = New Game) */
 static volatile int s_fb_ll_idx = -1, s_fb_camp_n = 0, s_fb_camp_run = 0, s_fb_screen_n = 0;
 static char s_fb_screen[48] = "";
+/* the visible Campaign sublist: its items slide in as tweens of _level0.mainMenu.mc.subList.genericItem<N>._x
+ * (N = 0..count-1; hidden options are not built) and the selector moves as a tween of subList.selector._y
+ * (y = 5 + 36 * row). -1 = not seen. */
+static volatile int s_fb_vis_n = -1, s_fb_sel = -1;
 /* every FSCommand the menus send (r2_menu_rows_screen, func_00769378 entry): the screens the driver waits for */
 extern "C" void r2_fb_fscommand(const char* cmd, const char* args)
 {
@@ -1281,6 +1285,23 @@ extern "C" void r2_fb_fscommand(const char* cmd, const char* args)
     if (!strcmp(cmd, "SetScreen")) {
         snprintf(s_fb_screen, sizeof s_fb_screen, "%s", args);
         s_fb_screen_n = s_fb_screen_n + 1;
+        LOG("fast boot: screen '%s'", s_fb_screen);
+    }
+    if (!strcmp(cmd, "CreateTween")) {
+        const char* t = strrchr(args, ':');
+        if (t && (t = strstr(t, "subList.")) != nullptr) {
+            if (!strncmp(t + 8, "genericItem", 11)) {
+                const int k = atoi(t + 19);
+                if (k == 0) s_fb_vis_n = 1;
+                else if (s_fb_vis_n >= 0 && k + 1 > s_fb_vis_n) s_fb_vis_n = k + 1;
+            } else if (!strncmp(t + 8, "selector._y", 11)) {
+                double from = 0, to = 0; int a = 0, b = 0;
+                if (sscanf(args, "%d:%d:%lf:%lf:", &a, &b, &from, &to) == 4) {
+                    const int r = (int)((to - 5.0) / 36.0 + 0.5);
+                    if (r >= 0 && r < 8) s_fb_sel = r;
+                }
+            }
+        }
     }
     if (!strcmp(cmd, "Localize2")) {
         static const char* const camp[] = { "LOBBY_OPTION_CONTINUEGAME:", "LOBBY_OPTION_NEWGAME:", "LOBBY_OPTION_LOADLEVEL:",
@@ -1316,6 +1337,7 @@ extern "C" void r2_fb_fscommand(const char* cmd, const char* args)
 /* PORT_BOOT_LEVEL: presses the pad through the front end (port_fastboot.h). Each step waits for its screen
  * (FSCommands above); inside the Load Level pages, fixed settle times. Never Continue Game or New Game. */
 static int s_fb_row = 0, s_fb_step = 0;
+static int s_fb_target = 0, s_fb_cur = 0, s_fb_retry = 0, s_fb_retry_dir = 0;   /* Campaign row driver (case 3-5) */
 static ULONGLONG s_fb_next = 0;
 static void fb_press(uint32_t b, ULONGLONG now)
 {
@@ -1324,7 +1346,7 @@ static void fb_press(uint32_t b, ULONGLONG now)
 static void fb_drive_tick(ULONGLONG now)
 {
     if (!s_fb_row || s_fb_step < 0 || now < s_fb_next) return;
-    enum { CROSS = 0x4000, START = 0x8, DOWN = 0x40, UP = 0x10 };
+    enum { CROSS = 0x4000, CIRCLE = 0x2000, START = 0x8, DOWN = 0x40, UP = 0x10 };
     static int sub = 0;
     auto go = [&](int step, ULONGLONG wait) { s_fb_step = step; sub = 0; s_fb_next = now + wait; };
     switch (s_fb_step) {
@@ -1338,24 +1360,52 @@ static void fb_drive_tick(ULONGLONG now)
     case 2:     /* main menu: Campaign is the first row */
         if (s_fb_seen_campaign) { LOG("fast boot: campaign menu at %.1f s", proc_uptime_s()); go(3, 1200); break; }
         fb_press(CROSS, now); s_fb_next = now + 2500; break;
-    case 3:     /* [Continue Game,] New Game, Load Level, Cinematics: Down to Load Level */
+    case 3: {   /* [Continue Game,] New Game, Load Level, Cinematics (visible items only): Load Level is the one
+                   before Cinematics, the last; the screen it opens is checked in case 5 */
+        static int target = -1;
         if (sub == 0) {
-            if (s_fb_ll_idx < 0) LOG("fast boot: Load Level's place in the Campaign list not seen, trying row 3");
-            else LOG("fast boot: Load Level is Campaign row %d of %d", s_fb_ll_idx + 1, s_fb_camp_n);
+            if (s_fb_retry == 0 || target < 0)
+                target = s_fb_vis_n >= 2 ? s_fb_vis_n - 2 : 1;
+            else target = target + s_fb_retry_dir;
+            s_fb_retry_dir = 0;
+            if (target < 1) {
+                LOG("fast boot: STOPPED, Load Level would be Campaign row %d (Continue Game / nothing): nothing else is "
+                    "pressed", target + 1);
+                s_fb_step = -1; break;
+            }
+            s_fb_target = target;
+            LOG("fast boot: Campaign list: %d visible item(s)%s, selector on row %d, going to row %d (Load Level is "
+                "the one before Cinematics)", s_fb_vis_n, s_fb_vis_n < 0 ? " (not seen)" : "", (s_fb_sel < 0 ? 0 : s_fb_sel) + 1,
+                target + 1);
+            s_fb_cur = s_fb_sel < 0 ? 0 : s_fb_sel;
         }
-        if (sub < (s_fb_ll_idx < 0 ? 2 : s_fb_ll_idx)) { fb_press(DOWN, now); sub++; s_fb_next = now + 600; break; }
+        if (s_fb_cur < target) { fb_press(DOWN, now); s_fb_cur++; sub++; s_fb_next = now + 600; break; }
+        if (s_fb_cur > target) { fb_press(UP, now); s_fb_cur--; sub++; s_fb_next = now + 600; break; }
         go(4, 700); break;
+    }
     case 4:
+        if (s_fb_sel >= 0 && s_fb_sel != s_fb_target) {
+            LOG("fast boot: STOPPED, the selector is on Campaign row %d, not %d: nothing else is pressed", s_fb_sel + 1,
+                s_fb_target + 1);
+            s_fb_step = -1; break;
+        }
         s_fb_screen[0] = 0; s_fb_screen_n = 0;
         fb_press(CROSS, now); go(5, 2500); break;
     case 5:     /* the Load Level screen: levels are Left/Right, the level's checkpoints Up/Down */
         if (sub == 0) {
             if (!s_fb_screen_n || strcmp(s_fb_screen, "CampaignLoad")) {
+                const int dir = !strcmp(s_fb_screen, "Cinematics") ? -1 : !strcmp(s_fb_screen, "CampaignDifficulty") ? 1 : 0;
+                if (s_fb_screen_n && dir && s_fb_retry < 2) {
+                    LOG("fast boot: Campaign row %d opened '%s', not Load Level: Back, then row %d", s_fb_target + 1,
+                        s_fb_screen, s_fb_target + dir + 1);
+                    s_fb_retry++; s_fb_retry_dir = dir;
+                    fb_press(CIRCLE, now); go(3, 2000); break;
+                }
                 LOG("fast boot: STOPPED, Cross on Campaign row %d opened screen '%s', not Load Level (CampaignLoad); "
-                    "nothing else is pressed", (s_fb_ll_idx < 0 ? 2 : s_fb_ll_idx) + 1, s_fb_screen_n ? s_fb_screen : "(none)");
+                    "nothing else is pressed", s_fb_target + 1, s_fb_screen_n ? s_fb_screen : "(none)");
                 s_fb_step = -1; break;
             }
-            LOG("fast boot: Load Level screen at %.1f s", proc_uptime_s());
+            LOG("fast boot: Load Level screen (Campaign row %d) at %.1f s", s_fb_target + 1, proc_uptime_s());
         }
         if (sub < s_fb_row - 1) { fb_press(DOWN, now); sub++; s_fb_next = now + 450; break; }
         go(6, 700); break;

@@ -3,8 +3,9 @@
  *   PORT_FAST_BOOT_CUTSCENES=1  also skip story movies, through the port's own cutscene skip (r2_pcextra.cpp).
  *   PORT_BOOT_LEVEL=<where>     start in that level. The retail game ignores its "-level" option, so the port
  *                               drives the menus with injected pad presses (r2_pcextra.cpp fb_drive_tick):
- *                               auto-save notice, Campaign, Load Level (its place in the Campaign list is read
- *                               from the menu's Localize2 calls and the screen is checked: SetScreen CampaignLoad),
+ *                               auto-save notice, Campaign, Load Level (the row before Cinematics, the last of the
+ *                               visible items, counted from the sublist's genericItem tweens; the screen it opens is
+ *                               checked: CampaignLoad, else Back and the row above / below, at most twice),
  *                               checkpoint row <n> of the first level (Holar), Normal. <where> is a name from the
  *                               table below or a checkpoint row of the first level (1 = first). Other levels are
  *                               reached by content, not by menu position: the game's "LoadCheckpoint level:cp:diff"
