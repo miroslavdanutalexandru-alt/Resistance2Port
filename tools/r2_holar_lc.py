@@ -1,0 +1,177 @@
+"""Resistance 2 port -- compile the Holar Tower elevator watchdogs for project/r2_holar.cpp.
+
+The game may load a level script's compiled form (built/...lc). That is Lua 5.1 bytecode
+in the PS3 layout: big-endian, 4-byte int/size_t/Instruction, 4-byte float numbers,
+debug info stripped. r2_holar.cpp adds the watchdog to such a chunk as a nested function,
+so the watchdog itself has to be in that form. This script compiles kWatchdog7/kWatchdog9
+(the Lua text in r2_holar.cpp) with Lua 5.1 (pip install lupa) and writes
+project/r2_holar_lc.h: the function body in the game's layout and the FNV-1a of its
+source text (r2_holar.cpp checks it, so an out-of-date header is never used).
+Only the port's own watchdog code goes into the header.
+
+    python tools/r2_holar_lc.py            (rewrites project/r2_holar_lc.h)
+    python tools/r2_holar_lc.py --check    (exit 1 if the header is out of date)
+"""
+import os
+import re
+import struct
+import sys
+
+import lupa.lua51 as lua51
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CPP = os.path.join(ROOT, 'project', 'r2_holar.cpp')
+HDR = os.path.join(ROOT, 'project', 'r2_holar_lc.h')
+NAMES = [('kWatchdog7', 'kWd7'), ('kWatchdog9', 'kWd9')]
+
+
+def fnv1a(b):
+    h = 0xcbf29ce484222325
+    for c in b:
+        h ^= c
+        h = (h * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def c_string(cpp, name):
+    m = re.search(r'static const char ' + name + r'\[\] =\s*((?:"(?:[^"\\]|\\.)*"\s*)+);', cpp)
+    if not m:
+        raise SystemExit('%s not found in %s' % (name, CPP))
+    out = ''
+    for lit in re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1)):
+        out += re.sub(r'\\(.)', lambda e: {'n': '\n', 't': '\t', '"': '"', '\\': '\\'}[e.group(1)], lit)
+    return out.encode('ascii')
+
+
+class Reader:
+    def __init__(self, b, endian, szt, numsz):
+        self.b, self.p, self.e, self.szt, self.numsz = b, 0, endian, szt, numsz
+
+    def take(self, fmt):
+        v = struct.unpack_from(self.e + fmt, self.b, self.p)
+        self.p += struct.calcsize(self.e + fmt)
+        return v[0]
+
+    def string(self):
+        n = self.take('I' if self.szt == 4 else 'Q')
+        s = self.b[self.p:self.p + n]
+        self.p += n
+        return s[:-1] if n else None
+
+
+def read_function(r):
+    f = {'source': r.string(), 'line': r.take('i'), 'last': r.take('i')}
+    f['nups'], f['nparams'], f['vararg'], f['maxstack'] = r.b[r.p:r.p + 4]
+    r.p += 4
+    f['code'] = [r.take('I') for _ in range(r.take('i'))]
+    f['k'] = []
+    for _ in range(r.take('i')):
+        t = r.b[r.p]
+        r.p += 1
+        if t == 0:
+            f['k'].append(None)
+        elif t == 1:
+            f['k'].append(bool(r.b[r.p]))
+            r.p += 1
+        elif t == 3:
+            f['k'].append(float(r.take('f' if r.numsz == 4 else 'd')))
+        elif t == 4:
+            f['k'].append(r.string())
+        else:
+            raise SystemExit('constant type %d' % t)
+    f['p'] = [read_function(r) for _ in range(r.take('i'))]
+    for _ in range(r.take('i')):
+        r.take('i')
+    for _ in range(r.take('i')):
+        r.string(); r.take('i'); r.take('i')
+    for _ in range(r.take('i')):
+        r.string()
+    return f
+
+
+def write_function(f, out):
+    """game layout, debug info stripped (as the retail .lc files)"""
+    def i32(v): out.extend(struct.pack('>i', v))
+    def string(s):
+        if s is None:
+            out.extend(struct.pack('>I', 0))
+        else:
+            out.extend(struct.pack('>I', len(s) + 1)); out.extend(s); out.append(0)
+    string(None)
+    i32(0); i32(0)
+    out.extend(bytes([f['nups'], f['nparams'], f['vararg'], f['maxstack']]))
+    i32(len(f['code']))
+    for c in f['code']:
+        out.extend(struct.pack('>I', c))
+    i32(len(f['k']))
+    for k in f['k']:
+        if k is None:
+            out.append(0)
+        elif isinstance(k, bool):
+            out.extend((1, 1 if k else 0))
+        elif isinstance(k, float):
+            out.append(3); out.extend(struct.pack('>f', k))
+        else:
+            out.append(4); string(k)
+    i32(len(f['p']))
+    for p in f['p']:
+        write_function(p, out)
+    i32(0); i32(0); i32(0)
+
+
+def host_reader(dump):
+    h = dump[:12]
+    assert h[:5] == b'\x1bLuaQ' and h[5] == 0, h
+    r = Reader(dump, '<' if h[6] else '>', h[8], h[10])
+    r.p = 12
+    return r
+
+
+def compile_watchdog(src):
+    lua = lua51.LuaRuntime(encoding=None)
+    dump = lua.eval('function(s) return string.dump(assert(loadstring(s, "=holar"))) end')
+    main = read_function(host_reader(bytes(dump(b'return function()\n' + src + b'end\n'))))
+    if len(main['p']) != 1 or main['p'][0]['nups'] != 0:
+        raise SystemExit('watchdog must be one function without upvalues (globals only)')
+    out = bytearray()
+    write_function(main['p'][0], out)
+    return bytes(out)
+
+
+def header():
+    cpp = open(CPP, encoding='ascii').read()
+    lines = ['/* Generated by tools/r2_holar_lc.py from the watchdog text in r2_holar.cpp -- do not edit.',
+             ' * Lua 5.1 function bodies in the PS3 layout (big-endian, float numbers, stripped). */',
+             '#pragma once', '#include <stdint.h>', '']
+    for name, out in NAMES:
+        src = c_string(cpp, name)
+        code = compile_watchdog(src)
+        lines.append('static const uint64_t %sSrcFnv = 0x%016xull;' % (out, fnv1a(src)))
+        lines.append('static const uint8_t %sCode[%d] = {' % (out, len(code)))
+        for i in range(0, len(code), 24):
+            lines.append('    ' + ','.join('0x%02x' % c for c in code[i:i + 24]) + ',')
+        lines.append('};')
+        lines.append('')
+    return '\r\n'.join(lines)
+
+
+def main():
+    text = header()
+    old = open(HDR, newline='').read() if os.path.exists(HDR) else None
+    if '--check' in sys.argv:
+        if old != text:
+            print('project/r2_holar_lc.h is out of date: run python tools/r2_holar_lc.py')
+            return 1
+        print('project/r2_holar_lc.h is up to date')
+        return 0
+    if old != text:
+        with open(HDR, 'w', newline='') as f:
+            f.write(text)
+        print('wrote', HDR)
+    else:
+        print('unchanged', HDR)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
