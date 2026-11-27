@@ -248,6 +248,7 @@ The options are sorted into pages, each with group headings (the same pages as t
 | Upscaling & Frame Gen › Anti-aliasing and upscaling | Anti-aliasing, Upscaling, Sharpening | see the Upscaling & Frame Gen page help | `RSX_FSR`, `RSX_UPSCALE`, `RSX_SHARPEN` |
 | Performance › Processor | CPU profile | Auto, Low, Mid, High | `PORT_CPU_PROFILE` |
 | Performance › Processor | Reduce detail when the CPU is slow | **Original (36.6 ms)**, Earlier (30 ms, weak CPUs), Never | `R2_GOVERNOR_MS` (`30` / `off`) |
+| Performance › Processor | Renderer helper threads | **On**, Off | `RSX_HELPER_THREADS` (`0` = Off; see *Renderer helper threads* below) |
 | Performance › Shader cache | Shader compilation | see the Performance page help | `R2_SHADER_MODE` |
 | Controls › Controller | Controller button prompts | Auto, Xbox, PlayStation, Nintendo, Keyboard keys | `R2_PAD_GLYPHS` (`auto`/`xbox`/`ps`/`nintendo`/`keys`) |
 | Controls › Controller | Confirm button, Vibration | **Cross**, Circle / **100 %** … Off | `PS3_ENTER_BUTTON` (`circle`), `PAD_RUMBLE` |
@@ -282,7 +283,7 @@ The options are sorted into pages, each with group headings (the same pages as t
 | Advanced › Saves | Back up saves before playing | On (keep 10), keep 5, keep 30, Off | `R2_SAVE_BACKUP` (`5`/`30`/`0`; read by the launcher) |
 | Advanced › Mods and textures | Texture pack / Dump textures / HD UI pack | Off, On (Dump: also Menus / HUD only) | `RSX_TEXPACK` / `RSX_TEXDUMP` (`1` / `ui` / `<folder>`) / `RSX_HD_UI` |
 | Trophies | Progress summary (earned / total, %, per grade), every trophy with its icon, grade and unlock date | | read-only: `TROPHY.TRP`, `gamedata\trophies\NPWR00291.json`, `Saved Games\Resistance 2\trophies.json` |
-| Saves & tools | Saved games, Back up now, Restore / Delete a backup, Open folders, Run benchmark, Open results | | `save_backups\`, `logs\bench\` |
+| Saves & tools | Saved games, Back up now, Restore / Delete a backup, Open folders, Run benchmark, Open results, Game files folder (Choose folder / Use default / Open folder) | | `save_backups\`, `logs\bench\`, `PORT_GAMEFILES` |
 
 Other switches (set them in `settings.bat` yourself): `R2_KEY_PROMPTS=0` turns off all prompt replacement (PS3 symbols always), `R2_MENU_PC=0` / `R2_MENU_ROWS=0` (or `=2`: the PC pages only behind R1 / L1 on Audio/Video) / `R2_PC_TEXT=0` (above), `R2_ZOOM_SENS` (above), `PS3_GAMEDATA_ROOT` (above).
 
