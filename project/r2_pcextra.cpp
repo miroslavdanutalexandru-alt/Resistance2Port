@@ -1269,11 +1269,51 @@ static double proc_uptime_s(void)
 static volatile int s_fb_trace = 0;
 /* the menu screens seen (r2_fb_fscommand), for the PORT_BOOT_LEVEL menu driver */
 static volatile int s_fb_seen_notice = 0, s_fb_seen_past_notice = 0, s_fb_seen_main = 0, s_fb_seen_campaign = 0;
+/* the Campaign list (mainmenu.swf: Continue Game only with a save to continue, New Game, Load Level, Cinematics)
+ * is localized in its order when the main menu is built: Load Level's place in it (-1 = not seen), and the last
+ * SetScreen (CampaignLoad = the Load Level screen, Cinematics, CampaignDifficulty = New Game) */
+static volatile int s_fb_ll_idx = -1, s_fb_camp_n = 0, s_fb_camp_run = 0, s_fb_screen_n = 0;
+static char s_fb_screen[48] = "";
+/* the visible Campaign sublist: its items slide in as tweens of _level0.mainMenu.mc.subList.genericItem<N>._x
+ * (N = 0..count-1; hidden options are not built) and the selector moves as a tween of subList.selector._y
+ * (y = 5 + 36 * row). -1 = not seen. */
+static volatile int s_fb_vis_n = -1, s_fb_sel = -1;
 /* every FSCommand the menus send (r2_menu_rows_screen, func_00769378 entry): the screens the driver waits for */
 extern "C" void r2_fb_fscommand(const char* cmd, const char* args)
 {
     if (!s_fb_trace) return;
+    if (!strcmp(cmd, "SetScreen")) {
+        snprintf(s_fb_screen, sizeof s_fb_screen, "%s", args);
+        s_fb_screen_n = s_fb_screen_n + 1;
+        LOG("fast boot: screen '%s'", s_fb_screen);
+    }
+    if (!strcmp(cmd, "CreateTween")) {
+        const char* t = strrchr(args, ':');
+        if (t && (t = strstr(t, "subList.")) != nullptr) {
+            if (!strncmp(t + 8, "genericItem", 11)) {
+                const int k = atoi(t + 19);
+                if (k == 0) s_fb_vis_n = 1;
+                else if (s_fb_vis_n >= 0 && k + 1 > s_fb_vis_n) s_fb_vis_n = k + 1;
+            } else if (!strncmp(t + 8, "selector._y", 11)) {
+                double from = 0, to = 0; int a = 0, b = 0;
+                if (sscanf(args, "%d:%d:%lf:%lf:", &a, &b, &from, &to) == 4) {
+                    const int r = (int)((to - 5.0) / 36.0 + 0.5);
+                    if (r >= 0 && r < 8) s_fb_sel = r;
+                }
+            }
+        }
+    }
     if (!strcmp(cmd, "Localize2")) {
+        static const char* const camp[] = { "LOBBY_OPTION_CONTINUEGAME:", "LOBBY_OPTION_NEWGAME:", "LOBBY_OPTION_LOADLEVEL:",
+                                            "LOBBY_TITLE_CINEMATICS:" };
+        int k = -1;
+        for (int i = 0; i < 4; i++) if (!strncmp(args, camp[i], strlen(camp[i]))) k = i;
+        if (k < 0) s_fb_camp_run = 0;
+        else {
+            if (!s_fb_camp_run) { s_fb_camp_run = 1; s_fb_camp_n = 0; }
+            if (k == 2) s_fb_ll_idx = s_fb_camp_n;
+            s_fb_camp_n = s_fb_camp_n + 1;
+        }
         if (!strncmp(args, "GEN_SYSTEM_HDISK_PWRWARN", 24)) {                                 /* the auto-save notice */
             if (!s_fb_seen_notice) LOG("fast boot: auto-save notice at %.1f s", proc_uptime_s());
             s_fb_seen_notice = 1;
@@ -1297,6 +1337,7 @@ extern "C" void r2_fb_fscommand(const char* cmd, const char* args)
 /* PORT_BOOT_LEVEL: presses the pad through the front end (port_fastboot.h). Each step waits for its screen
  * (FSCommands above); inside the Load Level pages, fixed settle times. Never Continue Game or New Game. */
 static int s_fb_row = 0, s_fb_step = 0;
+static int s_fb_target = 0, s_fb_cur = 0, s_fb_retry = 0, s_fb_retry_dir = 0;   /* Campaign row driver (case 3-5) */
 static ULONGLONG s_fb_next = 0;
 static void fb_press(uint32_t b, ULONGLONG now)
 {
@@ -1305,7 +1346,7 @@ static void fb_press(uint32_t b, ULONGLONG now)
 static void fb_drive_tick(ULONGLONG now)
 {
     if (!s_fb_row || s_fb_step < 0 || now < s_fb_next) return;
-    enum { CROSS = 0x4000, START = 0x8, DOWN = 0x40 };
+    enum { CROSS = 0x4000, CIRCLE = 0x2000, START = 0x8, DOWN = 0x40, UP = 0x10 };
     static int sub = 0;
     auto go = [&](int step, ULONGLONG wait) { s_fb_step = step; sub = 0; s_fb_next = now + wait; };
     switch (s_fb_step) {
@@ -1319,23 +1360,182 @@ static void fb_drive_tick(ULONGLONG now)
     case 2:     /* main menu: Campaign is the first row */
         if (s_fb_seen_campaign) { LOG("fast boot: campaign menu at %.1f s", proc_uptime_s()); go(3, 1200); break; }
         fb_press(CROSS, now); s_fb_next = now + 2500; break;
-    case 3:     /* Continue Game, New Game, Load Level */
-        if (sub < 2) { fb_press(DOWN, now); sub++; s_fb_next = now + 600; break; }
+    case 3: {   /* [Continue Game,] New Game, Load Level, Cinematics (visible items only): Load Level is the one
+                   before Cinematics, the last; the screen it opens is checked in case 5 */
+        static int target = -1;
+        if (sub == 0) {
+            if (s_fb_retry == 0 || target < 0)
+                target = s_fb_vis_n >= 2 ? s_fb_vis_n - 2 : 1;
+            else target = target + s_fb_retry_dir;
+            s_fb_retry_dir = 0;
+            if (target < 1) {
+                LOG("fast boot: STOPPED, Load Level would be Campaign row %d (Continue Game / nothing): nothing else is "
+                    "pressed", target + 1);
+                s_fb_step = -1; break;
+            }
+            s_fb_target = target;
+            LOG("fast boot: Campaign list: %d visible item(s)%s, selector on row %d, going to row %d (Load Level is "
+                "the one before Cinematics)", s_fb_vis_n, s_fb_vis_n < 0 ? " (not seen)" : "", (s_fb_sel < 0 ? 0 : s_fb_sel) + 1,
+                target + 1);
+            s_fb_cur = s_fb_sel < 0 ? 0 : s_fb_sel;
+        }
+        if (s_fb_cur < target) { fb_press(DOWN, now); s_fb_cur++; sub++; s_fb_next = now + 600; break; }
+        if (s_fb_cur > target) { fb_press(UP, now); s_fb_cur--; sub++; s_fb_next = now + 600; break; }
         go(4, 700); break;
+    }
     case 4:
+        if (s_fb_sel >= 0 && s_fb_sel != s_fb_target) {
+            LOG("fast boot: STOPPED, the selector is on Campaign row %d, not %d: nothing else is pressed", s_fb_sel + 1,
+                s_fb_target + 1);
+            s_fb_step = -1; break;
+        }
+        s_fb_screen[0] = 0; s_fb_screen_n = 0;
         fb_press(CROSS, now); go(5, 2500); break;
-    case 5:     /* the level list */
+    case 5:     /* the Load Level screen: levels are Left/Right, the level's checkpoints Up/Down */
+        if (sub == 0) {
+            if (!s_fb_screen_n || strcmp(s_fb_screen, "CampaignLoad")) {
+                const int dir = !strcmp(s_fb_screen, "Cinematics") ? -1 : !strcmp(s_fb_screen, "CampaignDifficulty") ? 1 : 0;
+                if (s_fb_screen_n && dir && s_fb_retry < 2) {
+                    LOG("fast boot: Campaign row %d opened '%s', not Load Level: Back, then row %d", s_fb_target + 1,
+                        s_fb_screen, s_fb_target + dir + 1);
+                    s_fb_retry++; s_fb_retry_dir = dir;
+                    fb_press(CIRCLE, now); go(3, 2000); break;
+                }
+                LOG("fast boot: STOPPED, Cross on Campaign row %d opened screen '%s', not Load Level (CampaignLoad); "
+                    "nothing else is pressed", s_fb_target + 1, s_fb_screen_n ? s_fb_screen : "(none)");
+                s_fb_step = -1; break;
+            }
+            LOG("fast boot: Load Level screen (Campaign row %d) at %.1f s", s_fb_target + 1, proc_uptime_s());
+        }
         if (sub < s_fb_row - 1) { fb_press(DOWN, now); sub++; s_fb_next = now + 450; break; }
         go(6, 700); break;
     case 6:
         fb_press(CROSS, now); go(7, 2000); break;
     case 7:     /* difficulty: Normal is preselected */
         fb_press(CROSS, now);
-        LOG("fast boot: level picked at %.1f s (Load Level row %d)", proc_uptime_s(), s_fb_row);
+        LOG("fast boot: level picked at %.1f s (Load Level: first level, checkpoint row %d)", proc_uptime_s(), s_fb_row);
         s_fb_step = -1; break;
     }
 }
-/* R2_PHOTO_HIDE_HUD: 1 = enabled, 2 = enabled and photo mode on (VKR2FrameGen.cpp r2fg_photo_source) */
+/* PORT_BOOT_CHECKPOINT=<name|index> / PORT_BOOT_LEVEL=<name with an anchor checkpoint>: the start is redirected
+ * once, at the game's "set the start checkpoint" (func_0012EC44(level, checkpoint), hook in tools/hooks/r2.json),
+ * after the menu driver has picked Load Level's first entry (or on the first call without PORT_BOOT_LEVEL).
+ * Load Level's "LoadCheckpoint level:cp:difficulty" (func_00272D04) calls it with the ids of the game's level /
+ * checkpoint table (func_002C497C: [[TOC-0x7884]-0x8000] = { entries, count }, 0x2508-byte entries { level id,
+ * checkpoint count, 0x94-byte checkpoint records, the define_checkpoint name first }): a checkpoint name
+ * (e.g. cp_boss_catwalks1) is found there, which also gives its level. Without that table the loaded level's
+ * own (func_0012FD60: count at [[TOC-0x7DCC]-0x8000], records at [[TOC-0x7DCC]-0x7FFC]) is searched. The
+ * start-up scripts then spawn the hero there (global.lua checkpoint warps). Every call is logged while fast
+ * boot is on. */
+static uint32_t fb_be32(uint32_t a)
+{
+    if (!vm_base || a < 0x10000u || a >= 0xE0000000u) return 0;
+    return _byteswap_ulong(*(const uint32_t*)(vm_base + a));
+}
+static void fb_rec_name(uint32_t rec, char* out, size_t n)
+{
+    out[0] = 0;
+    if (!vm_base || rec < 0x10000u || rec >= 0xE0000000u) return;
+    const char* s = (const char*)vm_base + rec;
+    size_t i = 0;
+    for (; i + 1 < n && i < 0x40 && s[i]; i++) out[i] = (s[i] >= 32 && s[i] < 127) ? s[i] : '?';
+    out[i] = 0;
+}
+static int fb_cp_name(uint32_t toc, int idx, char* out, size_t n)
+{
+    out[0] = 0;
+    const uint32_t x = fb_be32(toc - 0x7DCC);
+    if (!x) return -1;
+    const uint32_t cnt_at = fb_be32(x - 0x8000), recs = fb_be32(x - 0x7FFC);
+    if (!cnt_at || !recs) return -1;
+    const int cnt = (int)fb_be32(cnt_at);
+    if (cnt <= 0 || cnt > 256) return -1;
+    if (idx < 0 || idx >= cnt) return cnt;
+    fb_rec_name(recs + (uint32_t)idx * 0x94u, out, n);
+    return cnt;
+}
+/* the game's level / checkpoint table: number of levels (-1 = none), entry i's id, checkpoint count, records */
+static int fb_lv_count(uint32_t toc, uint32_t* entries)
+{
+    const uint32_t p = fb_be32(fb_be32(toc - 0x7884) - 0x8000);
+    if (!p) return -1;
+    *entries = fb_be32(p);
+    const int n = (int)fb_be32(p + 4);
+    return (*entries && n > 0 && n <= 64) ? n : -1;
+}
+static int fb_lv_entry(uint32_t entries, int i, uint32_t* id, uint32_t* recs)
+{
+    const uint32_t e = entries + (uint32_t)i * 0x2508u;
+    *id = fb_be32(e); *recs = e + 8;
+    const int n = (int)fb_be32(e + 4);
+    return (n >= 0 && n <= 64) ? n : 0;
+}
+/* level id + checkpoint index -> name from the table ("" = not there) */
+static void fb_lv_cp_name(uint32_t toc, uint32_t level, int cp, char* out, size_t n)
+{
+    out[0] = 0;
+    uint32_t ents; const int nl = fb_lv_count(toc, &ents);
+    for (int i = 0; i < nl; i++) {
+        uint32_t id, recs; const int nc = fb_lv_entry(ents, i, &id, &recs);
+        if (id == level && cp >= 0 && cp < nc) { fb_rec_name(recs + (uint32_t)cp * 0x94u, out, n); return; }
+    }
+}
+extern "C" uint32_t r2x_boot_checkpoint(uint32_t* level, uint32_t cp, uint32_t toc)
+{
+    static int done = 0, dumped = 0;
+    const char* e = getenv("PORT_BOOT_CHECKPOINT");
+    const int want = e && *e && *e != '0';
+    const char* anchor = port_fastboot_anchor();
+    if (!want && !anchor && !s_fb) return cp;
+    char nm[72]; const int cnt = fb_cp_name(toc, (int)cp, nm, sizeof nm);
+    char gn[72]; fb_lv_cp_name(toc, *level, (int)cp, gn, sizeof gn);
+    fprintf(stderr, "[fastboot] start checkpoint: level %u, checkpoint %d (table: %s; loaded level: %s, %d checkpoints defined)\n",
+            *level, (int)cp, gn[0] ? gn : "?", nm[0] ? nm : "?", cnt);
+    uint32_t ents; const int nl = fb_lv_count(toc, &ents);
+    if (!dumped) {
+        dumped = 1;
+        fprintf(stderr, "[fastboot] level/checkpoint table: %d levels\n", nl);
+        for (int i = 0; i < nl; i++) {
+            uint32_t id, recs; const int nc = fb_lv_entry(ents, i, &id, &recs);
+            char a0[72], a1[72]; fb_rec_name(recs, a0, sizeof a0); fb_rec_name(recs + (uint32_t)(nc > 0 ? nc - 1 : 0) * 0x94u, a1, sizeof a1);
+            fprintf(stderr, "[fastboot]   level %u: %d checkpoints, %s .. %s\n", id, nc, a0[0] ? a0 : "?", a1[0] ? a1 : "?");
+        }
+    }
+    if ((!want && !anchor) || done || (s_fb_row && s_fb_step >= 0)) { fflush(stderr); return cp; }
+    const int numeric = want && strspn(e, "0123456789") == strlen(e);
+    const char* find = (want && !numeric) ? e : anchor;          /* the name that picks the level (and checkpoint) */
+    uint32_t to_level = *level; int to = -1, found = 0;
+    if (find) {
+        for (int i = 0; i < nl && !found; i++) {
+            uint32_t id, recs; const int nc = fb_lv_entry(ents, i, &id, &recs);
+            for (int k = 0; k < nc; k++) {
+                char n2[72]; fb_rec_name(recs + (uint32_t)k * 0x94u, n2, sizeof n2);
+                if (!_stricmp(n2, find)) { to_level = id; to = (find == e) ? k : 0; found = 1; break; }
+            }
+        }
+        if (!found && find == e) {                                /* not in the table: the loaded level's own */
+            for (int i = 0; i < cnt && i < 256; i++) {
+                char n2[72]; fb_cp_name(toc, i, n2, sizeof n2);
+                if (!_stricmp(n2, e)) { to = i; found = 1; break; }
+            }
+        }
+        if (!found) {
+            fprintf(stderr, "[fastboot] %s=%s: no level has that checkpoint (%d levels in the table), start unchanged\n",
+                    find == e ? "PORT_BOOT_CHECKPOINT" : "PORT_BOOT_LEVEL anchor", find, nl);
+            fflush(stderr); return cp;
+        }
+    }
+    if (numeric) to = atoi(e);
+    if (to < 0) to = (int)cp;
+    done = 1;
+    fb_lv_cp_name(toc, to_level, to, gn, sizeof gn);
+    if (!gn[0] && to_level == *level) fb_cp_name(toc, to, gn, sizeof gn);
+    fprintf(stderr, "[fastboot] start redirected: level %u checkpoint %d (%s) instead of level %u checkpoint %d\n",
+            to_level, to, gn[0] ? gn : "?", *level, (int)cp);
+    fflush(stderr);
+    *level = to_level;
+    return (uint32_t)to;
+}/* R2_PHOTO_HIDE_HUD: 1 = enabled, 2 = enabled and photo mode on (VKR2FrameGen.cpp r2fg_photo_source) */
 extern "C" { volatile int g_port_photo_hud = 0; }
 static void init_once(void)
 {

@@ -708,6 +708,11 @@ uint32_t g_nw_frame = 0, g_nw_try_frame = 0;
 int g_nw_tail = 0, g_nw_tail_settle = 0;   /* after giving up: in-flight reports not drained yet (main thread only) */
 uint64_t g_nw_tail_seq = 0;
 uint32_t g_nw_tail_frame = 0, g_nw_tail_settle_frame = 0;
+int g_nw_mode = 0;              /* the configured R2_OCC_NOWAIT, restored by a re-arm */
+long long g_nw_slow_us = 25000; /* R2_OCC_NOWAIT_SLOW_MS (0 = off) */
+int g_nw_slow_need = 8, g_nw_slow_n = 0;
+int g_nw_rest = 0, g_nw_rest_bad = 0, g_nw_offs = 0;   /* off, waiting for good frames to re-arm (main thread only) */
+uint32_t g_nw_rest_frame = 0, g_nw_good = 0, g_nw_rearm = 600, g_nw_rearm_cur = 600;   /* R2_OCC_NOWAIT_REARM frames */
 std::atomic<long long> g_nw_skips{0}, g_nw_budget_ok{0}, g_nw_periods{0}, g_nw_drains{0}, g_nw_drain_ns{0}, g_nw_drain_max_ns{0},
     g_nw_drain_to{0}, g_nw_forced{0};
 struct OccAlloc { uint32_t obj, stamp; uint64_t key; int8_t b; uint8_t glare; };
@@ -808,6 +813,9 @@ void occ_report()
                 sk - lsk, pe - lpe, g_nw_us, bo - lbo, dr - ldr, dr - ldr ? (double)(dn - ldn) / 1e6 / (double)(dr - ldr) : 0.0,
                 (double)mx / 1e6, to - lto, fo - lfo, g_nw_on);
         lsk = sk; lbo = bo; lpe = pe; ldr = dr; ldn = dn; lto = to; lfo = fo;
+        if (g_nw_rest)
+            fprintf(stderr, "[occ] nowait resting (off %d time(s)): %u of %u frames without a late set\n", g_nw_offs,
+                    g_nw_good, g_nw_rearm_cur);
         static long long lgp, lg0, lcp, lvi, lrc;
         const long long gp = g_nw_ans_gprev.load(), g0 = g_nw_ans_g0.load(), cp = g_nw_ans_cprev.load(), vi = g_nw_ans_vis.load(),
                         rc = g_nw_rec.load();
@@ -977,7 +985,11 @@ void sp_update_mark(uint32_t frame)
    does not finish in R2_OCC_NOWAIT_DRAIN_MS (default 100) answers that frame visible and retries next frame; after 3
       failed drains in a row R2_OCC_NOWAIT turns itself off: no more drains, every set waits the game's way and is drawn
       visible until the RSX was idle on its own once (non-blocking fence) and two more frames began, then the plain lifted
-      wait. =0: the old blocking wait, exactly. */
+      wait. Also off after R2_OCC_NOWAIT_SLOW_MS: 8 drains in a row that pass but take >= 25 ms (default) mean the RSX
+      is a whole frame behind; the drain then costs what the game's wait would, plus every culled object drawn (CHX2
+      Chicxulub domes: 13-15k draws instead of 5-9k). Either way it comes back on after R2_OCC_NOWAIT_REARM (600)
+      guest frames in a row whose per-object sets were in within R2_OCC_NOWAIT_US; the count doubles per off (<= 16x),
+      0 = stays off for the session (the old behaviour). =0: the old blocking wait, exactly. */
 int occ_nw_drain(long long* ns_out)   /* 0 passed, 1 timed out, -1 no RPCS3 renderer */
 {
     LARGE_INTEGER f, q0, q; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&q0);
@@ -1157,6 +1169,17 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
             long long dm = env_int("R2_OCC_NOWAIT_DRAIN_MS", 100);
             if (dm < 1) dm = 1;
             g_nw_drain_us = dm * 1000;
+            g_nw_mode = g_nw_on;
+            const long long sm = env_int("R2_OCC_NOWAIT_SLOW_MS", 25);
+            g_nw_slow_us = sm > 0 ? sm * 1000 : 0;
+            const long long ra = env_int("R2_OCC_NOWAIT_REARM", 600);
+            g_nw_rearm = g_nw_rearm_cur = ra > 0 ? (uint32_t)(ra < 60 ? 60 : ra) : 0;
+            if (g_nw_on)
+                fprintf(stderr, "[occ] R2_OCC_NOWAIT: off for a while after %d drains in a row over %lld ms "
+                                "(R2_OCC_NOWAIT_SLOW_MS, 0 = never: the RSX is that far behind, so the game's own wait costs "
+                                "the same without drawing every culled object) or 3 drain timeouts; back on after %u frames "
+                                "without a late set (R2_OCC_NOWAIT_REARM, doubles each time, 0 = stays off)\n",
+                        g_nw_slow_need, g_nw_slow_us / 1000, g_nw_rearm);
             if (const char* l = getenv("R2_OCC_NOWAIT_LATE"); l && *l)
                 g_nw_late = !_stricmp(l, "visible") || !strcmp(l, "0") ? 0 : !_stricmp(l, "prev") || !strcmp(l, "2") ? 2 : 1;
             if (g_nw_on)
@@ -1190,7 +1213,7 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
             fprintf(stderr, "[occ] R2_OCC_SYNC_SITES: sets read from caller 0x%08X are never skipped\n", g_occ_sync_lr[i]);
         g_occ_next.store(GetTickCount64() + 10000);
     }
-    if (g_occ_us < 0 && !g_occ_skip && !g_occ_gw && !g_sp_on && !g_nw_on && !g_nw_pend && !g_nw_tail) return 0;
+    if (g_occ_us < 0 && !g_occ_skip && !g_occ_gw && !g_sp_on && !g_nw_on && !g_nw_pend && !g_nw_tail && !g_nw_rest) return 0;
     const bool lifted_only = g_occ_us < 0 && !g_occ_skip;   /* R2_OCC_BLOCKING=1: count + RSX_ZCULL_GUEST_WAIT, then the lifted body */
 
     /* same address arithmetic as the lifted entry; anything unexpected runs the lifted body */
@@ -1274,6 +1297,28 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
             h->real = 1;
             return 0;
         }
+        if (g_nw_rest && !g_nw_on && !g_nw_pend && !g_nw_tail && (uint32_t)ctx->lr == 0x001723C8u) {
+            /* R2_OCC_NOWAIT off for a while: count guest frames whose per-object sets were all in within
+               R2_OCC_NOWAIT_US; after g_nw_rearm_cur such frames in a row it comes back on */
+            const uint32_t frame = ld_be32(gs + 0x6C);
+            if (frame != g_nw_rest_frame) {
+                g_nw_good = g_nw_rest_bad ? 0 : g_nw_good + 1;
+                g_nw_rest_bad = 0; g_nw_rest_frame = frame;
+                if (g_nw_good >= g_nw_rearm_cur) {
+                    g_nw_rest = 0; g_nw_on = g_nw_mode; g_nw_fail = 0; g_nw_slow_n = 0;
+                    fprintf(stderr, "[occ] R2_OCC_NOWAIT: back on after %u frames without a late set (next time %u)\n",
+                            g_nw_good, g_nw_rearm_cur * 2 > g_nw_rearm * 16 ? g_nw_rearm * 16 : g_nw_rearm_cur * 2);
+                    g_nw_rearm_cur = g_nw_rearm_cur * 2 > g_nw_rearm * 16 ? g_nw_rearm * 16 : g_nw_rearm_cur * 2;
+                    g_nw_good = 0;
+                }
+            }
+            if (g_nw_rest && !*ts) {
+                g_occ_waited.fetch_add(1, std::memory_order_relaxed);
+                r2rsx_occ_guest_wait(rep);
+                if (g_nw_us <= 0 || occ_native_wait(ts, g_nw_us)) g_nw_rest_bad = 1;
+                return 0;   /* the lifted body waits for the rest */
+            }
+        }
         if (g_nw_on || g_nw_pend || g_nw_tail) {   /* R2_OCC_NOWAIT (see occ_nw_drain) */
             const uint32_t frame = ld_be32(gs + 0x6C);
             if (g_nw_pend && frame != g_nw_frame) {
@@ -1283,7 +1328,22 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
                     const int r = occ_nw_drain(&dns);
                     g_nw_drain_ns.fetch_add(dns, std::memory_order_relaxed);
                     if (dns > g_nw_drain_max_ns.load(std::memory_order_relaxed)) g_nw_drain_max_ns.store(dns, std::memory_order_relaxed);
-                    if (r == 0) { g_nw_pend = 0; g_nw_fail = 0; g_nw_drains.fetch_add(1, std::memory_order_relaxed); }
+                    if (r == 0) {
+                        g_nw_pend = 0; g_nw_fail = 0; g_nw_drains.fetch_add(1, std::memory_order_relaxed);
+                        g_nw_slow_n = (g_nw_slow_us && dns / 1000 >= g_nw_slow_us) ? g_nw_slow_n + 1 : 0;
+                        if (g_nw_slow_n >= g_nw_slow_need) {
+                            /* every frame is late and each drain waits as long as the game's own wait would, while
+                               the culling queries answered visible draw every hidden object (CHX2 run: 13-15k draws a
+                               frame vs 5-9k, rsx-iv ~70 ms). Drained: nothing in flight, the plain wait at once. */
+                            g_nw_on = 0; g_nw_slow_n = 0;
+                            g_nw_offs++;
+                            g_nw_rest = g_nw_rearm ? 1 : 0; g_nw_good = 0; g_nw_rest_bad = 0; g_nw_rest_frame = frame;
+                            fprintf(stderr, "[occ] R2_OCC_NOWAIT: %d drains in a row over %lld ms (last %.1f ms): off, the "
+                                            "game's own wait%s %u frames without a late set\n",
+                                    g_nw_slow_need, g_nw_slow_us / 1000, (double)dns / 1e6,
+                                    g_nw_rest ? "; back on after" : " (R2_OCC_NOWAIT_REARM=0: for good)", g_nw_rearm_cur);
+                        }
+                    }
                     else if (r < 0) {
                         g_nw_pend = 0; g_nw_on = 0;
                         fprintf(stderr, "[occ] R2_OCC_NOWAIT: no RPCS3 renderer fence, off\n");
@@ -1293,7 +1353,8 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
                             /* give up: no more drains. The skipped reports are still in flight, so until the RSX has
                                been idle on its own (non-blocking fence) and two more frames began, every set waits
                                the game's way (consumed) and is drawn visible; then the plain lifted wait. */
-                            g_nw_on = 0; g_nw_pend = 0;
+                            g_nw_on = 0; g_nw_pend = 0; g_nw_slow_n = 0;
+                            g_nw_offs++;
                             g_nw_tail = 1; g_nw_tail_settle = 0;
                             g_nw_tail_seq = r2rsx_occ_nw_arm();
                             if (g_nw_tail_seq == UINT64_MAX) g_nw_tail = 0;
@@ -1319,7 +1380,10 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
                         if (p) { g_nw_tail_settle = 1; g_nw_tail_settle_frame = frame; r2rsx_occ_nw_disarm(); }
                     } else if (frame - g_nw_tail_settle_frame >= 2) {
                         g_nw_tail = 0;
-                        fprintf(stderr, "[occ] R2_OCC_NOWAIT: in-flight reports settled, the game's own wait from now on\n");
+                        g_nw_rest = g_nw_rearm ? 1 : 0; g_nw_good = 0; g_nw_rest_bad = 0; g_nw_rest_frame = frame;
+                        fprintf(stderr, "[occ] R2_OCC_NOWAIT: in-flight reports settled, the game's own wait%s %u frames "
+                                        "without a late set\n",
+                                g_nw_rest ? "; back on after" : " from now on (R2_OCC_NOWAIT_REARM=0)", g_nw_rearm_cur);
                     }
                 }
                 if (g_nw_tail) {

@@ -1,5 +1,19 @@
 {
  "funcs": {
+  "func_0012EC44": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_0012EC44(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" uint32_t r2x_boot_checkpoint(uint32_t* level, uint32_t cp, uint32_t toc);   /* R2: PORT_BOOT_CHECKPOINT developer fast boot (r2_pcextra.cpp) */",
+     "void func_0012EC44(ppu_context* ctx) {",
+     "        { uint32_t lv_ = (uint32_t)ctx->gpr[3]; ctx->gpr[4] = (uint64_t)(int64_t)(int32_t)r2x_boot_checkpoint(&lv_, (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[2]); ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)lv_; }"
+    ]
+   }
+  ],
   "func_002CAD1C": [
    {
     "at": 0,
