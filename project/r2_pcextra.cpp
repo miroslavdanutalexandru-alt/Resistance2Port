@@ -1483,6 +1483,8 @@ static void fb_lv_cp_name(uint32_t toc, uint32_t level, int cp, char* out, size_
 extern "C" uint32_t r2x_boot_checkpoint(uint32_t* level, uint32_t cp, uint32_t toc)
 {
     static int done = 0, dumped = 0;
+    static const int fb_on = port_fastboot_env_on("PORT_FAST_BOOT");
+    if (!fb_on) return cp;   /* release default: one load and branch */
     const char* e = getenv("PORT_BOOT_CHECKPOINT");
     const int want = e && *e && *e != '0';
     const char* anchor = port_fastboot_anchor();
@@ -1556,7 +1558,7 @@ static void init_once(void)
     }
     { const char* fb = getenv("PORT_FAST_BOOT"); const char* lv = getenv("PORT_BOOT_LEVEL");
       const char* fc = getenv("PORT_FAST_BOOT_CUTSCENES");
-      s_fb = (fb && *fb && *fb != '0') || (lv && *lv);
+      s_fb = fb && *fb && *fb != '0'; (void)lv;   /* PORT_BOOT_LEVEL etc. only with PORT_FAST_BOOT=1 */
       s_fb_cut = fc && *fc && *fc != '0';
       const char* tr = getenv("PORT_FAST_BOOT_TRACE");
       if ((s_fb_row = port_fastboot_row()) != 0) s_fb_trace = 1;

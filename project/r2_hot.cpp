@@ -1174,7 +1174,7 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
             g_nw_slow_us = sm > 0 ? sm * 1000 : 0;
             const long long ra = env_int("R2_OCC_NOWAIT_REARM", 600);
             g_nw_rearm = g_nw_rearm_cur = ra > 0 ? (uint32_t)(ra < 60 ? 60 : ra) : 0;
-            if (g_nw_on)
+            if (g_nw_on && g_occ_log)
                 fprintf(stderr, "[occ] R2_OCC_NOWAIT: off for a while after %d drains in a row over %lld ms "
                                 "(R2_OCC_NOWAIT_SLOW_MS, 0 = never: the RSX is that far behind, so the game's own wait costs "
                                 "the same without drawing every culled object) or 3 drain timeouts; back on after %u frames "
@@ -1306,7 +1306,7 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
                 g_nw_rest_bad = 0; g_nw_rest_frame = frame;
                 if (g_nw_good >= g_nw_rearm_cur) {
                     g_nw_rest = 0; g_nw_on = g_nw_mode; g_nw_fail = 0; g_nw_slow_n = 0;
-                    fprintf(stderr, "[occ] R2_OCC_NOWAIT: back on after %u frames without a late set (next time %u)\n",
+                    if (g_occ_log) fprintf(stderr, "[occ] R2_OCC_NOWAIT: back on after %u frames without a late set (next time %u)\n",
                             g_nw_good, g_nw_rearm_cur * 2 > g_nw_rearm * 16 ? g_nw_rearm * 16 : g_nw_rearm_cur * 2);
                     g_nw_rearm_cur = g_nw_rearm_cur * 2 > g_nw_rearm * 16 ? g_nw_rearm * 16 : g_nw_rearm_cur * 2;
                     g_nw_good = 0;
@@ -1338,7 +1338,7 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
                             g_nw_on = 0; g_nw_slow_n = 0;
                             g_nw_offs++;
                             g_nw_rest = g_nw_rearm ? 1 : 0; g_nw_good = 0; g_nw_rest_bad = 0; g_nw_rest_frame = frame;
-                            fprintf(stderr, "[occ] R2_OCC_NOWAIT: %d drains in a row over %lld ms (last %.1f ms): off, the "
+                            if (g_occ_log) fprintf(stderr, "[occ] R2_OCC_NOWAIT: %d drains in a row over %lld ms (last %.1f ms): off, the "
                                             "game's own wait%s %u frames without a late set\n",
                                     g_nw_slow_need, g_nw_slow_us / 1000, (double)dns / 1e6,
                                     g_nw_rest ? "; back on after" : " (R2_OCC_NOWAIT_REARM=0: for good)", g_nw_rearm_cur);
@@ -1381,7 +1381,7 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
                     } else if (frame - g_nw_tail_settle_frame >= 2) {
                         g_nw_tail = 0;
                         g_nw_rest = g_nw_rearm ? 1 : 0; g_nw_good = 0; g_nw_rest_bad = 0; g_nw_rest_frame = frame;
-                        fprintf(stderr, "[occ] R2_OCC_NOWAIT: in-flight reports settled, the game's own wait%s %u frames "
+                        if (g_occ_log) fprintf(stderr, "[occ] R2_OCC_NOWAIT: in-flight reports settled, the game's own wait%s %u frames "
                                         "without a late set\n",
                                 g_nw_rest ? "; back on after" : " from now on (R2_OCC_NOWAIT_REARM=0)", g_nw_rearm_cur);
                     }

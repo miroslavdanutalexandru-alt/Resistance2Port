@@ -38,6 +38,7 @@ static inline int port_fastboot_env_on(const char* name)
 
 static inline std::string port_fastboot_level_name(void)
 {
+    if (!port_fastboot_env_on("PORT_FAST_BOOT")) return std::string();   /* dev tooling: PORT_FAST_BOOT=1 only */
     const char* e = getenv("PORT_BOOT_LEVEL");
     std::string v(e ? e : "");
     const size_t s = v.find_last_of("/\\");                 /* "levels/iceland" works too */
@@ -55,6 +56,7 @@ static inline const char* port_fastboot_anchor(void)
 /* PORT_BOOT_LEVEL -> Load Level row 1.. (0 = none) */
 static inline int port_fastboot_row(void)
 {
+    if (!port_fastboot_env_on("PORT_FAST_BOOT")) return 0;
     const char* e = getenv("PORT_BOOT_LEVEL");
     if (!e || !*e) return 0;
     const std::string v = port_fastboot_level_name();
@@ -88,5 +90,5 @@ static inline void port_fastboot_init(void)
                      getenv("PORT_BOOT_LEVEL"), row, an ? ", then the start is redirected to the level of " : "", an ? an : "",
                      an ? " (found by name)" : "");
     const char* cp = getenv("PORT_BOOT_CHECKPOINT");
-    if (cp && *cp && *cp != '0') fprintf(stderr, "[fastboot] PORT_BOOT_CHECKPOINT=%s: the level starts at that checkpoint\n", cp);
+    if (port_fastboot_env_on("PORT_FAST_BOOT") && cp && *cp && *cp != '0') fprintf(stderr, "[fastboot] PORT_BOOT_CHECKPOINT=%s: the level starts at that checkpoint\n", cp);
 }
