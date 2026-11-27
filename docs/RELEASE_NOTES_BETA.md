@@ -18,6 +18,7 @@ This is a **beta**. The campaign has been played through the opening Iceland lev
 
 ### Fixes
 - **Quarter-frame water / surface flicker (#27):** the picture is shown at the display surface's own resolution scale (`R2_PRESENT_SURFACE_SCALE`, default `1`).
+- **Water areas run faster (#27 slowdown), test round:** the graphics thread now hands its Vulkan command recording and per-draw constant work to helper threads (launcher > Performance > Processor > *Renderer helper threads*, default On; `RSX_HELPER_THREADS=0` = Off). The same code gave +6 fps in Resistance 3. *If you see flicker, missing objects or a crash, turn it Off and report it.*
 - **Frame Generation ghosting on foliage, grass and moving objects:** the FB21 test settings are now the defaults (`RSX_DLSS_OBJMV_GUARD_FAR=16`, `RSX_DLSS_OBJMV_DEFORM_WARM=1`, `RSX_DLSS_OBJMV_SLOTS=3072`, `RSX_DLSS_MV_DILATE=1`; each `0` / old value restores the old behaviour), Frame Generation uses the real camera (`R2_DLSS_FG_REAL_CAMERA`, default on) and holds a scene through short gaps.
 - **Screen blur under Frame Generation:** *Graphics > Screen blur* has a new default, **Auto**: the scripted full-screen blur (hits, explosions) is off while Frame Generation runs, since generated frames smear it, and on otherwise. *On* keeps it always (`R2_FX_SCREEN_BLUR=1`), *Off* never (`0`).
 - **Jungle intro brightness flash:** late occlusion answers count as glare (`R2_OCC_NOWAIT_LATE=glare`, the default).

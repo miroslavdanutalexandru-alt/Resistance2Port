@@ -28322,7 +28322,7 @@ index 0000000..db54a19
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..d4b23b2
+index 0000000..dbc23b0
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 @@ -0,0 +1,12559 @@
@@ -33421,7 +33421,7 @@ index 0000000..d4b23b2
 +	om_lane_t g_lane;
 +	thread_local bool t_lane_owner = false; // the thread that kicks jobs (the render thread)
 +
-+	// RSX_PIPE_SPLIT (round 10: two-stage rsx::thread; 0 = off (default), 1 = on, 2 = on + validate). Stage 2 is the
++	// RSX_PIPE_SPLIT (round 10: two-stage rsx::thread; 0 = off, 1 = on (default since 0.3.1.1), 2 = on + validate). Stage 2 is the
 +	// RSX_RECORD_DEFER lane (turned on with the same mode unless RSX_RECORD_DEFER is set) plus the record thread
 +	// (RSX_RECORD_THREAD). On top of the classification, a depth-writing objmv scene draw's loose key + ordinal and its
 +	// transform-constant capture move to the lane job: stage 1 snapshots the key words and the capture inputs (the
@@ -33433,7 +33433,7 @@ index 0000000..d4b23b2
 +		static const int m = []
 +		{
 +			const char* v = std::getenv("RSX_PIPE_SPLIT");
-+			const int r = v && *v ? std::atoi(v) : 0;
++			const int r = v && *v ? std::atoi(v) : (std::getenv("RSX_HELPER_THREADS") && *std::getenv("RSX_HELPER_THREADS") == '0' ? 0 : 1); // 0.3.1.1: default 1 (RSX_HELPER_THREADS=0: off)
 +			return r == 1 || r == 2 ? r : 0;
 +		}();
 +		return m;
@@ -42661,10 +42661,10 @@ index 0000000..6e892d7
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKRecordThread.cpp b/rpcs3/Emu/RSX/VK/VKRecordThread.cpp
 new file mode 100644
-index 0000000..b07db32
+index 0000000..a7b23f9
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKRecordThread.cpp
-@@ -0,0 +1,960 @@
+@@ -0,0 +1,962 @@
 +// R3PORT: RSX_RECORD_THREAD (see VKRecordThread.h)
 +#define R2REC_NO_REDIRECT
 +#include "stdafx.h"
@@ -43198,7 +43198,9 @@ index 0000000..b07db32
 +			t_defer = true;
 +			return;
 +		}
-+		const int mode = env_int("RSX_RECORD_THREAD", 0);
++		// R2PORT 0.3.1.1 (WAT3): on by default with RSX_PIPE_SPLIT / RSX_SPLIT2; RSX_HELPER_THREADS=0 (launcher: Performance >
++		// Renderer helper threads) turns all three off, RSX_RECORD_THREAD=0/1/2 still wins
++		const int mode = env_int("RSX_RECORD_THREAD", (std::getenv("RSX_HELPER_THREADS") && *std::getenv("RSX_HELPER_THREADS") == '0' ? 0 : 1));
 +		if (mode != 1 && mode != 2)
 +		{
 +			return;
@@ -43235,7 +43237,7 @@ index 0000000..b07db32
 +		g.tail.store(0);
 +		g.quit.store(false);
 +		g.spin_us = env_int("RSX_RECORD_SPIN_US", 250);
-+		g.stats = env_int("RSX_RECORD_STATS", 1) != 0;
++		g.stats = env_int("RSX_RECORD_STATS", 0) != 0; // R2PORT: [rec] line every 5 s only on request
 +		g.win_t0 = now_ns();
 +		g.running = true;
 +		g_mode = mode;
@@ -44204,10 +44206,10 @@ index 19f3ce9..4054c1b 100644
  
 diff --git a/rpcs3/Emu/RSX/VK/VKSplit2.h b/rpcs3/Emu/RSX/VK/VKSplit2.h
 new file mode 100644
-index 0000000..109bf25
+index 0000000..4f0f4be
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKSplit2.h
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,308 @@
 +#pragma once
 +
 +// RSX_SPLIT2 (r11 staged rsx::thread split, stage 2): the transform-constant UBO fill of VKGSRender::load_program_env
@@ -44252,7 +44254,7 @@ index 0000000..109bf25
 +		static const int m = []
 +		{
 +			const char* v = std::getenv("RSX_SPLIT2");
-+			const int x = (v && *v) ? std::atoi(v) : 0;
++			const int x = (v && *v) ? std::atoi(v) : (std::getenv("RSX_HELPER_THREADS") && *std::getenv("RSX_HELPER_THREADS") == '0' ? 0 : 1); // 0.3.1.1: default 1 (RSX_HELPER_THREADS=0: off)
 +			if (x > 0) std::fprintf(stderr, "[split2] RSX_SPLIT2=%d: transform constant fill on the stage-2 worker%s\n", x > 2 ? 2 : x,
 +				x >= 2 ? " (validate)" : "");
 +			return x < 0 ? 0 : (x > 2 ? 2 : x);
@@ -44485,6 +44487,9 @@ index 0000000..109bf25
 +	{
 +		auto& S = g_s2;
 +		if (!S.started) return;
++		// R2PORT: the [split2] line only with RSX_SPLIT2_STATS=1 or validation (RSX_SPLIT2=2)
++		static const bool stats = [] { const char* e = std::getenv("RSX_SPLIT2_STATS"); return (e && *e && *e != '0') || mode() == 2; }();
++		if (!stats) return;
 +		S.frames++;
 +		const auto now = std::chrono::steady_clock::now();
 +		const double sec = std::chrono::duration<double>(now - S.t0).count();

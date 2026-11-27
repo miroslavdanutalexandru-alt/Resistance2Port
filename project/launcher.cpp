@@ -305,6 +305,14 @@ static void register_options()
                "for the frames until its shader is compiled. Pros of On: nothing pops in. Cons: slower frames while it is "
                "active and possible DLSS ghosting on those objects. Rarely needed with Compile shaders before playing on.",
                "R2_SHADER_INTERP", { {"Off", ""}, {"On", "1"} }, 0, {}, "rpcs3");
+    // VKRecordThread.cpp / VKSplit2.h / VKR2Upscaler.cpp pipe_split_mode: RSX_RECORD_THREAD, RSX_SPLIT2, RSX_PIPE_SPLIT
+    // default to RSX_HELPER_THREADS (unset = on); each of them still wins when set in settings.bat by hand
+    add_option(SEC_SHADERS, "helperthreads", "Renderer helper threads",
+               "On: the graphics thread hands its Vulkan command recording and per-draw constant work to helper threads, "
+               "so busy scenes (water areas with reflections, 3000+ draws a frame) run faster on CPUs with 6 or more "
+               "cores. Off: everything runs on the graphics thread as in earlier versions. Turn it off if you see "
+               "flicker, missing objects or crashes, and report it. Takes effect at the next start.",
+               "RSX_HELPER_THREADS", { {"On", ""}, {"Off", "0"} }, 0, {}, "rpcs3");
 }
 
 // PC-port behaviour (Display / Audio / Interface / Advanced pages, see launcher_cats.inc). Kept apart from register_options() (graphics).

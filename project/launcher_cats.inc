@@ -17,7 +17,7 @@ static const CatGroup g_cat[] = {
     { P_GRAPHICS, "RENDERER",                      "renderer" },
     { P_UPSCALE,  "ANTI-ALIASING AND UPSCALING",   "fsr upscale dlsspreset sharpen objmv" },
     { P_UPSCALE,  "FRAME GENERATION AND LATENCY",  "dlss_fg fg_backend reflex latency" },
-    { P_PERF,     "PROCESSOR",                     "cpu governor" },
+    { P_PERF,     "PROCESSOR",                     "cpu governor helperthreads" },
     { P_PERF,     "SHADER CACHE",                  "shaders precompile shaderthreads shaderinterp" },
     { P_CONTROLS, "AIMING AND STICKS",             "msensy adssens aimtoggle aimassist deadzone curve outerdz antidz trigdz turnboost crouchmode sprintmode crosshair xhair_color xhair_size" },
     { P_CONTROLS, "CONTROLLER",                    "padbackend padglyphs nswap enterbtn rumble p1pad lightbar pad_disconnect_pause pad_southpaw" },
