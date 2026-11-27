@@ -21,7 +21,6 @@ This is a **beta**. The campaign has been played through the opening Iceland lev
 - **Frame Generation ghosting on foliage, grass and moving objects:** the FB21 test settings are now the defaults (`RSX_DLSS_OBJMV_GUARD_FAR=16`, `RSX_DLSS_OBJMV_DEFORM_WARM=1`, `RSX_DLSS_OBJMV_SLOTS=3072`, `RSX_DLSS_MV_DILATE=1`; each `0` / old value restores the old behaviour), Frame Generation uses the real camera (`R2_DLSS_FG_REAL_CAMERA`, default on) and holds a scene through short gaps.
 - **Screen blur under Frame Generation:** *Graphics > Screen blur* has a new default, **Auto**: the scripted full-screen blur (hits, explosions) is off while Frame Generation runs, since generated frames smear it, and on otherwise. *On* keeps it always (`R2_FX_SCREEN_BLUR=1`), *Off* never (`0`).
 - **Jungle intro brightness flash:** late occlusion answers count as glare (`R2_OCC_NOWAIT_LATE=glare`, the default).
-- **HDR:** the picture is no longer cropped and invalid (NaN) pixels are cleared before output.
 - **Elevators that never arrive (Holar tower and the node shafts):** a watchdog moves a stuck elevator on (`R2_HOLAR_ASSIST`, default on; `0` = off).
 - **Frame pacing on fixed-refresh screens (#38):** steps down to a frame rate the screen can hold when frames are missed (`PORT_PACING_ADAPT`, default on).
 - **CACAO ambient occlusion** tuned (strength and radius closer to the game's look).
