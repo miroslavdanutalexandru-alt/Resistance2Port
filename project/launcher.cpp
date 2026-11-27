@@ -93,7 +93,8 @@ static std::vector<Setting> g_set = {
       "real time each frame, so it does not play faster. Needs about twice the CPU and GPU time. "
       "40 / 45 suit 120 Hz / 90 Hz screens and handhelds. 72 to 240 / Match display / Uncapped go further (uncapped: as fast as the PC allows; "
       "best with VSync Auto or Off and a G-Sync / FreeSync monitor). Above 60 fps the game's physics still "
-      "steps at 60 Hz; 60 is recommended.",
+      "steps at 60 Hz; 60 is recommended."
+      " On a fixed-refresh screen (Display sync) the limit becomes an even share of the refresh rate (60 -> 72 at 144 Hz) and steps down one share (48) while the PC can't hold it, back up when it can.",
       { {"30 fps  (PS3 original)", "30"}, {"40 fps  (Steam Deck / 120 Hz screens)", "40"}, {"45 fps  (90 Hz screens)", "45"},
         {"60 fps", "60"}, {"72 fps  (144 Hz screens)", "72"}, {"90 fps  (experimental)", "90"},
         {"120 fps  (experimental)", "120"}, {"144 fps  (experimental)", "144"}, {"165 fps  (experimental)", "165"},
