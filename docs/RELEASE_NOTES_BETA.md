@@ -8,6 +8,11 @@ A native PC port of *Resistance 2* (PS3) built by static recompilation: the game
 
 This is a **beta**. The campaign has been played through the opening Iceland levels on one PC (Ryzen 5 5600X, GeForce RTX 5070, Windows 11). Later levels are untested. Please report what you find (see *Reporting problems*).
 
+## Unreleased
+
+### New
+- **Ambient occlusion: CACAO, and the choice of AO (issue #45). Not yet tested in game.** *Graphics › Quality › Ambient occlusion* (and F9) is now Game / Port SSAO (extra) / CACAO / Off (`R2_AO_MODE`), with *Ambient occlusion quality* Low / Medium / High (`R2_AO_QUALITY`). Resistance 2 has no AO of its own; CACAO (AMD FidelityFX CACAO) is a higher-quality alternative to the port SSAO, applied at the same point. Game is the default and unchanged; a saved "On" is Port SSAO.
+
 ## 0.3.1-beta
 
 Fixes from your reports (the Swarm slowdown, explosion stutters, controller and keyboard issues, cutscene dialogue, the speaker layout) and more diagnostics for the problems I can't reproduce yet. Every option below is in the launcher or `settings.bat`; the names in brackets are the variables (useful for bug reports). This version's code generator translates more of the game's SPU code, so **Setup generates the game code again after you update** (run Setup over your install, or *Update now* in the launcher); your settings, saves and game copy are kept.

@@ -230,10 +230,16 @@ static void register_options()
                "(not CPU), heavy with lots of smoke at a high render resolution.",
                "RSX_FX_FULLRES", { {"Original", ""}, {"Full", "1"}, {"Full (all)", "2"} }, 0, {}, "rpcs3");
     add_option(SEC_RENDER_QUALITY, "ssao", "Ambient occlusion",
-               "Adds soft contact shadows in corners and creases (SSAO). Works with every Anti-aliasing setting; "
-               "with DLSS, FSR or XeSS it is computed at the internal resolution, before upscaling. "
-               "Costs GPU time (not CPU). Experimental.",
-               "RSX_SSAO", { {"Off", ""}, {"On  (experimental)", "1"} }, 0, {}, "rpcs3");
+               "Game: as the game (Resistance 2 has no ambient occlusion of its own; the default). "
+               "Port SSAO adds the port's own screen-space AO on top. CACAO (AMD FidelityFX CACAO) "
+               "draws soft contact shadows in corners and creases from the scene depth. "
+               "Off draws no AO at all. Works with every Anti-aliasing setting; with DLSS, FSR or XeSS it is computed "
+               "at the internal resolution, before upscaling. Costs GPU time (not CPU). Experimental.",
+               "R2_AO_MODE", { {"Game  (none of its own)", ""}, {"Port SSAO  (extra, experimental)", "1"},
+                                 {"CACAO  (experimental)", "cacao"}, {"Off  (no AO)", "off"} }, 0, {}, "rpcs3");
+    add_option(SEC_RENDER_QUALITY, "aoquality", "Ambient occlusion quality",
+               "Quality of the CACAO ambient occlusion: Low (3 samples), Medium (5 samples, sharper edges and detail) or High (12 samples, normal-aware edges). Costs GPU time; only used with Ambient occlusion: CACAO.",
+               "R2_AO_QUALITY", { {"Medium", ""}, {"Low", "low"}, {"High", "high"} }, 0, {}, "rpcs3");
     add_option(SEC_RENDER_QUALITY, "hudfix", "Ultrawide HUD",
                "With an ultrawide aspect ratio, keeps the HUD and menus in a centred 16:9 area instead of stretching "
                "them. Experimental.",
