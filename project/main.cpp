@@ -133,6 +133,7 @@ extern "C" int ps3_host_core_scarce(void);   /* sys_ppu_thread.c, PORT_CORE_SCAR
 extern "C" uint32_t r2nj_effective_mask(void);   /* r2_native_jobs.c */
 extern "C" int r2nj_kernel_active(int k);
 #include "r2_autoconfig.h"
+#include "port_fastboot.h"   /* PORT_FAST_BOOT / PORT_BOOT_LEVEL */
 
 /* ---------------------------------------------------------------------------
  * RSX present backend
@@ -1023,6 +1024,8 @@ int main(int argc, char** argv)
         };
         port_native_summary(k_native, (int)(sizeof k_native / sizeof k_native[0]));
     }
+
+    port_fastboot_init();   /* PORT_FAST_BOOT / PORT_BOOT_LEVEL (developer test runs) */
 
     if (!alloc_guest_vm()) {
         fprintf(stderr, "ERROR: could not allocate the guest address space\n");
