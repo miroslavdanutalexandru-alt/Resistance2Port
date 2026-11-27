@@ -10,10 +10,11 @@
 #           repo if it has game\EBOOT.elf, else the main git worktree). The game runs in this folder.
 # -Seconds  wait up to N s for gameplay (the "[fastboot] gameplay" log line) and print the boot time; 0 = don't wait.
 # -Cutscenes  also skip story movies (PORT_FAST_BOOT_CUTSCENES=1).
+# -Env      @{NAME='value'} set after settings.bat and the fast boot switches ('' = unset).
 # Saves: the savedata folder is copied first and put back by a watcher when the game exits (-KeepSaves: not).
 # Prints the game's PID. The game keeps running; close only that PID. Env: PORT_FAST_BOOT=1, PORT_BOOT_LEVEL=<level>.
 param([string]$Level = '', [string]$Exe = '', [int]$Seconds = 0, [string]$GameDir = '', [string]$Log = '',
-      [switch]$Cutscenes, [switch]$KeepSaves, [switch]$List, [string]$Checkpoint = '')
+      [switch]$Cutscenes, [switch]$KeepSaves, [switch]$List, [string]$Checkpoint = '', [hashtable]$Env = @{})
 
 $ErrorActionPreference = 'Stop'
 $ExeName = 'Resistance2.exe'
@@ -51,7 +52,7 @@ if ($levels) { Write-Host ('Level folders (the log shows the one loaded): ' + ($
 if ($List -or -not $Level) { if (-not $Level -and -not $List) { Write-Host 'Give -Level <name|row>.' }; exit 0 }
 
 $name = ($Level -split '[/\\]')[-1].ToLower()
-if (-not $Named.Contains($name) -and $name -notmatch '^[1-9]\d*$') { throw "unknown level '$Level': a name above or a Load Level row number" }
+if (-not $Named.Contains($name) -and $name -notmatch '^([1-9]\d*|last-\d+)$') { throw "unknown level '$Level': a name above or a Load Level row number" }
 if (-not (Test-Path $Exe)) { throw "no game executable at $Exe (build first, or give -Exe)" }
 $Exe = (Resolve-Path $Exe).Path
 
@@ -68,6 +69,7 @@ $envs['PORT_FAST_BOOT'] = '1'
 $envs['PORT_BOOT_LEVEL'] = $name
 $envs['PORT_FAST_BOOT_CUTSCENES'] = if ($Cutscenes) { '1' } else { '' }
 $envs['PORT_BOOT_CHECKPOINT'] = $Checkpoint
+foreach ($k in $Env.Keys) { $envs[$k] = [string]$Env[$k] }   # -Env: last word (diagnostics; '' unsets)
 foreach ($k in $envs.Keys) { [Environment]::SetEnvironmentVariable($k, $(if ($envs[$k] -eq '') { $null } else { $envs[$k] }), 'Process') }
 
 New-Item -ItemType Directory -Force (Join-Path $GameDir 'logs') | Out-Null

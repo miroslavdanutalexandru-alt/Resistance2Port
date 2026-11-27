@@ -1305,7 +1305,7 @@ static void fb_press(uint32_t b, ULONGLONG now)
 static void fb_drive_tick(ULONGLONG now)
 {
     if (!s_fb_row || s_fb_step < 0 || now < s_fb_next) return;
-    enum { CROSS = 0x4000, START = 0x8, DOWN = 0x40 };
+    enum { CROSS = 0x4000, START = 0x8, DOWN = 0x40, UP = 0x10 };
     static int sub = 0;
     auto go = [&](int step, ULONGLONG wait) { s_fb_step = step; sub = 0; s_fb_next = now + wait; };
     switch (s_fb_step) {
@@ -1325,8 +1325,9 @@ static void fb_drive_tick(ULONGLONG now)
     case 4:
         fb_press(CROSS, now); go(5, 2500); break;
     case 5:     /* the level list */
-        if (s_fb_row == PORT_FASTBOOT_LAST_ROW) {
+        if (s_fb_row >= PORT_FASTBOOT_LAST_ROW) {
             if (sub < 60) { fb_press(DOWN, now); sub++; s_fb_next = now + 300; break; }
+            if (sub < 60 + s_fb_row - PORT_FASTBOOT_LAST_ROW) { fb_press(UP, now); sub++; s_fb_next = now + 450; break; }
         } else if (sub < s_fb_row - 1) { fb_press(DOWN, now); sub++; s_fb_next = now + 450; break; }
         go(6, 700); break;
     case 6:
