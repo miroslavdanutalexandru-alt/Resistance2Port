@@ -173,6 +173,10 @@ What it does with `PORT_ONLINE=1`:
 - Turns on real sockets for the game (`PS3_NET_ONLINE=1`).
 - With `rpcn_user` and `rpcn_password` set, the game is told it is signed in, as that RPCN name. When the game asks for a sign-in ticket, the port connects to `rpcn_host` (TLS, port 31313), logs in and gets the ticket from RPCN, as RPCS3 does.
 - Sends the game's server lookups (`gethostbyname`) to `host.<name> = <ip>` entries first, then to the `dns =` server (for community revival servers that are reached through a custom DNS), then to Windows' DNS.
+- Answers the game's own DNS queries (UDP to port 53) the same way when the name is redirected, so a lookup that bypasses `gethostbyname` still reaches the revival server. The network status the game reads reports the `dns =` server as its DNS and the PC's real LAN address.
+- Gives honest answers for NP functions the port does not implement (Clans: "service unavailable"; friend/message system dialogs: not supported; no custom invitations) instead of a silent success.
+
+For **PS Rewired** (the community Resistance 2 servers, alpha), uncomment the `host.resistance2.ps3.online.scea.com = 67.222.156.250` line (or `dns = 67.222.156.250`) in `online.ini`, as in its RPCS3 guide.
 
 | Variable / `online.ini` key | Meaning |
 |---|---|
@@ -184,7 +188,7 @@ What it does with `PORT_ONLINE=1`:
 | `host.<name>` | Fixed IPv4 address for one host name |
 
 `logs\run.log` lines start with `[online]` (config read, sign-in state, ticket requests) and `[sys_net] gethostbyname` (each server name the game looks up and where it went).
-**Limits:** Resistance 2's online modes need the community (revival) servers, which RPCS3 reaches with RPCN plus the revival's DNS. The port does the same steps, but nobody has played online with it yet: whether those servers accept the port's tickets, and whether the rest of the game's online code (matchmaking, voice, NAT) works, is untested. Some online functions are still stubs. Online co-op and competitive play are therefore not expected to work yet.
+**Limits:** Resistance 2's online modes need the community (revival) servers, which RPCS3 reaches with RPCN plus the revival's DNS. The port does the same steps, but nobody has played online with it yet: whether those servers accept the port's tickets, and whether the rest of the game's online code (matchmaking, voice, NAT) works, is untested. Some online functions are still stubs (Clans, friends, messages). The port is the disc version (1.00) while PS3 and RPCS3 players are on the last update (1.60), so the server may refuse it or it may not match their games. Online co-op and competitive play are therefore not expected to work yet. Use your own RPCN account and follow the revival's rules.
 
 ## PC features
 

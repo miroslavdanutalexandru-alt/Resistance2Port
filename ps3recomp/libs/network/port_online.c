@@ -51,6 +51,7 @@ extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_
 extern int (*g_net_resolve_hook)(const char* name, uint32_t* ip_out);   /* sysNet.c */
 extern int (*g_np_signed_in_hook)(void);                                 /* sceNp.c */
 extern const char* (*g_np_online_id_hook)(void);                         /* np_psnr.c */
+extern uint32_t g_netctl_dns_override;                                    /* cellNetCtl.c */
 void np_manager_get_callback(uint32_t* cb, uint32_t* arg);               /* sceNp.c */
 int  np_is_initialized(void);                                            /* sceNp.c */
 
@@ -1008,6 +1009,76 @@ static void h_get_network_time(ppu_context* ctx)
  * Accepted without a second account, as RPCS3 does. */
 static void h_ok(ppu_context* ctx) { RET(np_is_initialized() ? CELL_OK : SCE_NP_ERROR_NOT_INITIALIZED); }
 
+/* NP Basic / Clans / avatar exports a title imports but the HLE did not
+ * implement. Unimplemented imports fake CELL_OK without writing outputs; once
+ * online, titles act on those outputs (R2 polls the custom invitation count
+ * and opens Clans), so they get real "nothing there" / "unavailable" answers
+ * instead. Codes are the SDK's (RPCS3 sceNp.h / sceNpClans.h). */
+#define PO_NP_BASIC_ERROR_NOT_SUPPORTED       0x8002a663u
+#define PO_NP_BASIC_ERROR_INVALID_ARGUMENT    0x8002a665u
+#define PO_NP_BASIC_ERROR_NOT_INITIALIZED     0x8002a662u
+#define PO_NP_CLANS_ERROR_SERVICE_UNAVAILABLE 0x80022711u
+#define PO_NP_DEFAULT_AVATAR "http://static-resource.np.community.playstation.net/avatar_s/default/DefaultAvatar_s.png"
+
+/* sceNpBasicGetCustomInvitationEntryCount(u32* count) */
+static void h_basic_custom_invitation_count(ppu_context* ctx)
+{
+    if (!np_is_initialized()) { RET(PO_NP_BASIC_ERROR_NOT_INITIALIZED); return; }
+    if (!R32(3)) { RET(PO_NP_BASIC_ERROR_INVALID_ARGUMENT); return; }
+    vm_write32(R32(3), 0);
+    RET(CELL_OK);
+}
+
+/* Friend presence by index: there are no friends (GetFriendListEntryCount is
+ * 0), so every index is out of range. */
+static void h_basic_no_data(ppu_context* ctx) { RET(PO_NP_BASIC_ERROR_INVALID_ARGUMENT); }
+/* System GUIs (send message, add friend, received messages): not available. */
+static void h_basic_not_supported(ppu_context* ctx) { RET(PO_NP_BASIC_ERROR_NOT_SUPPORTED); }
+static void h_basic_abort_gui(ppu_context* ctx) { RET(CELL_OK); }
+
+/* sceNpManagerGetAvatarUrl(SceNpAvatarUrl* url): char[128]. */
+static void h_get_avatar_url(ppu_context* ctx)
+{
+    if (!np_is_initialized()) { RET(SCE_NP_ERROR_NOT_INITIALIZED); return; }
+    if (!R32(3)) { RET(SCE_NP_ERROR_INVALID_ARGUMENT); return; }
+    if (!port_online_signed_in()) { RET(SCE_NP_ERROR_OFFLINE); return; }
+    char* out = (char*)vm_ptr8(R32(3));
+    memset(out, 0, 128);
+    memcpy(out, PO_NP_DEFAULT_AVATAR, sizeof(PO_NP_DEFAULT_AVATAR));
+    RET(CELL_OK);
+}
+
+/* Clans has its own server (clans_client in RPCS3); not implemented here. */
+static void h_clans_unavailable(ppu_context* ctx) { RET(PO_NP_CLANS_ERROR_SERVICE_UNAVAILABLE); }
+static void h_clans_destroy_request(ppu_context* ctx) { RET(CELL_OK); }
+
+static void register_np_gaps(void)
+{
+    static const char* const clans[] = {
+        "sceNpClansCreateRequest", "sceNpClansGetClanList", "sceNpClansSearchByProfile",
+        "sceNpClansUpdateClanInfo", "sceNpClansDisbandClan", "sceNpClansKickMember",
+        "sceNpClansChangeMemberRole", "sceNpClansUpdateAutoAcceptStatus",
+        "sceNpClansSendInvitation", "sceNpClansCancelInvitation",
+        "sceNpClansSendInvitationResponse", "sceNpClansSendMembershipRequest",
+        "sceNpClansCancelMembershipRequest", "sceNpClansSendMembershipResponse",
+    };
+    static const struct { const char* name; void (*fn)(ppu_context*); } tab[] = {
+        { "sceNpBasicGetCustomInvitationEntryCount", h_basic_custom_invitation_count },
+        { "sceNpBasicGetFriendPresenceByIndex",      h_basic_no_data },
+        { "sceNpBasicSendMessageGui",                h_basic_not_supported },
+        { "sceNpBasicAddFriend",                     h_basic_not_supported },
+        { "sceNpBasicRecvMessageAttachmentLoad",     h_basic_not_supported },
+        { "sceNpBasicRecvMessageCustom",             h_basic_not_supported },
+        { "sceNpBasicAbortGui",                      h_basic_abort_gui },
+        { "sceNpManagerGetAvatarUrl",                h_get_avatar_url },
+        { "sceNpClansDestroyRequest",                h_clans_destroy_request },
+    };
+    for (size_t i = 0; i < sizeof(tab) / sizeof(tab[0]); i++)
+        ps3_hle_register_ctx(ps3_compute_nid(tab[i].name), tab[i].name, tab[i].fn);
+    for (size_t i = 0; i < sizeof(clans) / sizeof(clans[0]); i++)
+        ps3_hle_register_ctx(ps3_compute_nid(clans[i]), clans[i], h_clans_unavailable);
+}
+
 void port_online_register(void)
 {
     if (!port_online_enabled()) return;
@@ -1018,6 +1089,7 @@ void port_online_register(void)
     if (!getenv("PS3_NET_ONLINE")) setenv("PS3_NET_ONLINE", "1", 0);
 #endif
     g_net_resolve_hook = port_online_resolve;
+    g_netctl_dns_override = s_cfg.dns_server;
     g_np_signed_in_hook = port_online_signed_in;
     g_np_online_id_hook = po_online_id;
 
@@ -1033,6 +1105,7 @@ void port_online_register(void)
     };
     for (size_t i = 0; i < sizeof(tab) / sizeof(tab[0]); i++)
         ps3_hle_register_ctx(ps3_compute_nid(tab[i].name), tab[i].name, tab[i].fn);
+    register_np_gaps();
     printf("[online] PORT_ONLINE: %s, %u sceNp exports\n",
            port_online_signed_in() ? "signed in (RPCN credentials present)" : "online, not signed in (no rpcn_user/password)",
            (unsigned)(sizeof(tab) / sizeof(tab[0])));

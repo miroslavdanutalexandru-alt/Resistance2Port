@@ -220,7 +220,51 @@ int main(void)
     strcpy((char*)vm_base + STR, "redirect.test");
     h = (uint32_t)call("gethostbyname", STR, 0, 0, 0, 0, 0);
     assert(h && vm_read32(vm_read32(vm_read32(h + 16))) == 0xC0000207u);   /* 192.0.2.7 */
+
+    /* ...and a title's own resolver: a UDP A query to port 53 for a redirected
+     * name is answered locally (never sent); recvfrom returns the answer. */
+    static const uint8_t query[] = { 0xAB, 0xCD, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,
+        8, 'r','e','d','i','r','e','c','t', 4, 't','e','s','t', 0, 0, 1, 0, 1 };
+    int32_t d = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_DGRAM, 0);
+    put_sockaddr(ADDR_A, LOOP, 53);
+    memcpy(vm_base + BUF, query, sizeof(query));
+    assert(call("sendto", d, BUF, sizeof(query), 0, ADDR_A, 16) == (int64_t)sizeof(query));
+    assert(dns_pending(d));
+    vm_write32(POLLFD, (uint32_t)d);
+    vm_write16(POLLFD + 4, SYS_NET_POLLIN);
+    assert(C3("socketpoll", POLLFD, 1, 0) == 1 && (vm_read16(POLLFD + 6) & SYS_NET_POLLIN));
+    memset(vm_base + BUF, 0, 128);
+    vm_write32(LEN, 16);
+    int32_t an = (int32_t)call("recvfrom", d, BUF, 128, SYS_NET_MSG_PEEK, ADDR_B, LEN);
+    assert(an == (int32_t)sizeof(query) + 16 && dns_pending(d));     /* PEEK keeps it */
+    an = (int32_t)call("recvfrom", d, BUF, 128, 0, ADDR_B, LEN);
+    assert(an == (int32_t)sizeof(query) + 16 && !dns_pending(d));
+    const uint8_t* r = vm_base + BUF;
+    assert(r[0] == 0xAB && r[1] == 0xCD && (r[2] & 0x80) && (r[3] & 0x0F) == 0);   /* id, QR, NOERROR */
+    assert(r[7] == 1 && !memcmp(r + 12, query + 12, sizeof(query) - 12));        /* 1 answer, question echoed */
+    assert(!memcmp(r + an - 4, "\xC0\x00\x02\x07", 4));                         /* 192.0.2.7 */
+    assert(vm_read32(ADDR_B + 4) == LOOP && vm_read16(ADDR_B + 2) == 53);         /* from the server asked */
+    /* Not a single A/IN question (AAAA here): left to the real server. */
+    uint8_t aaaa[sizeof(query)];
+    memcpy(aaaa, query, sizeof(query));
+    aaaa[sizeof(query) - 3] = 28;
+    assert(dns_parse_question(aaaa, sizeof(aaaa), (char*)vm_base + STR, 256) == 0);
+    assert(dns_parse_question(query, sizeof(query), (char*)vm_base + STR, 256) == sizeof(query));
+    assert(!strcmp((const char*)vm_base + STR, "redirect.test"));
+    assert(C1("socketclose", d) == 0);
     g_net_resolve_hook = NULL;
+    /* Without PORT_ONLINE's hook nothing is intercepted. */
+    d = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_DGRAM, 0);
+    memcpy(vm_base + BUF, query, sizeof(query));
+    assert(!dns_maybe_answer(d, (const void*)(uintptr_t)BUF, sizeof(query), NULL));
+    assert(C1("socketclose", d) == 0);
+
+    /* inet_ntop: network-order bytes to text in the caller's buffer. */
+    memcpy(vm_base + ADDR_B, "\x0A\x00\x00\xFE", 4);
+    assert((uint32_t)call("inet_ntop", SYS_NET_AF_INET, ADDR_B, STR, 16, 0, 0) == STR);
+    assert(!strcmp((const char*)vm_base + STR, "10.0.0.254"));
+    assert(call("inet_ntop", SYS_NET_AF_INET, ADDR_B, STR, 10, 0, 0) == 0 && errno_cell() == SYS_NET_ENOSPC);
+    assert(call("inet_ntop", 99, ADDR_B, STR, 16, 0, 0) == 0 && errno_cell() == SYS_NET_EAFNOSUPPORT);
 
     /* P2P: the title binds its own IP and port 3658 with vport 1000; the host
      * socket lands on this instance's P2P port on every interface, so a peer
