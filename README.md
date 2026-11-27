@@ -166,7 +166,7 @@ Only the offline, split-screen part of co-op works: everything that needs PSN (o
 
 Off by default; nothing here touches the network unless you turn it on. This is groundwork, not working online play: see the limits below.
 
-**Turning it on:** launcher, Controls page → **Online (experimental)** → On (or `set PORT_ONLINE=1`). Copy `online.ini.example` to `online.ini` next to `run.bat` and put in **your own** RPCN account (make one with RPCS3 first; the port never creates accounts). `online.ini` is ignored by git; never share it.
+**Turning it on:** launcher, Controls page → **Online (experimental)** → On (or `set PORT_ONLINE=1`). Copy `online.ini.example` to `online.ini` next to `run.bat` and put in **your own** RPCN account (made with RPCS3, or made for you; RPCS3 is not needed to play, and the port never creates accounts). `rpcn_password` may be the plain password or the 64-character hash RPCS3 stores; the port sends RPCN the same derived hash as RPCS3 (PBKDF2-SHA3-256), never the plain text. `online.ini` is ignored by git; never share it.
 
 What it does with `PORT_ONLINE=1`:
 
@@ -183,7 +183,7 @@ For **PS Rewired** (the community Resistance 2 servers, alpha), uncomment the `h
 | `PORT_ONLINE=1` | Turn it on (default off) |
 | `PORT_ONLINE_CONFIG=<path>` | Read another file instead of `online.ini` |
 | `PORT_ONLINE_PROBE=1` | At start-up, only check that `rpcn_host` answers (TLS + server version; no login). The result is in `logs\run.log` (`[online] probe`) |
-| `rpcn_host`, `rpcn_user`, `rpcn_password`, `rpcn_token` | RPCN server (default port 31313) and your account. The password and token are never written to the log |
+| `rpcn_host`, `rpcn_user`, `rpcn_password`, `rpcn_token` | RPCN server (default port 31313) and your account. `rpcn_password` is the plain password or RPCS3's stored 64-hex hash. The password and token are never written to the log |
 | `dns` | IPv4 address of a DNS server for the game's lookups |
 | `host.<name>` | Fixed IPv4 address for one host name |
 

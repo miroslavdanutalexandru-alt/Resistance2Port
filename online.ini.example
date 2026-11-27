@@ -1,11 +1,14 @@
 # Online (experimental) - read when PORT_ONLINE=1 (launcher: Controls -> "Online (experimental)").
 # Copy this file to online.ini (same folder) and fill in YOUR OWN account.
 # online.ini holds your password: it is ignored by git; never share it.
-# The port never creates accounts: make one with RPCS3 (Configuration -> RPCN) first.
+# The port never creates accounts: use an existing RPCN account (made with RPCS3,
+# Configuration -> RPCN, or made for you). RPCS3 itself is not needed to play.
 
 # RPCN server (host or host:port, default port 31313)
 rpcn_host = np.rpcs3.net
 rpcn_user =
+# Your plain RPCN password, or the 64-character hash RPCS3 stores (config.yml / rpcn.yml
+# Password). Either works: the port sends RPCN the same hash RPCS3 does, never the plain text.
 rpcn_password =
 # Only if the server asked for an email token when the account was made
 rpcn_token =

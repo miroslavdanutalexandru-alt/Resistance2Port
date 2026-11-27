@@ -251,6 +251,27 @@ int main(void)
     uint8_t type; uint16_t cmd; uint32_t total; uint64_t pid;
     assert(rpcn_parse_header(pkt, (size_t)n, &type, &cmd, &total, &pid) == RPCN_HEADER_SIZE);
     assert(type == RPCN_PKT_REQUEST && cmd == RPCN_CMD_LOGIN && total == 28 && pid == 0x0102030405060708ull);
+
+    /* RPCN password = RPCS3 derive_password(); vectors from Python
+     * hashlib.pbkdf2_hmac('sha3_256', pw, salt, iterations, 32). */
+    {
+        uint8_t d[32];
+        char hex[65];
+        static const char salt[] = "No matter where you go, everybody's connected.";
+        port_sha3_256("", 0, d);
+        assert(d[0] == 0xa7 && d[1] == 0xff && d[31] == 0x4a);
+        char big[201]; memset(big, 'x', 200); big[200] = 0;
+        port_pbkdf2_sha3_256(big, 200, salt, sizeof(salt) - 1, 1, d, 32); /* key > block: hashed */
+        for (int i = 0; i < 32; i++) sprintf(hex + 2 * i, "%02X", d[i]);
+        assert(!strcmp(hex, "CC7A18098CA523ECF800C0BB41E320FE82CE780D8B43453600CDBC3E764707BD"));
+        rpcn_wire_password("pw", hex);
+        assert(!strcmp(hex, "11E34BA86A98ED6A7DEBCA858864FAE02BC9C16AA4D99AAAB116311BDC6BFB01"));
+        rpcn_wire_password("correct horse battery staple", hex);
+        assert(!strcmp(hex, "56D05353F751EFA39EFD7E9778336A2EF807A2795615D4714945F4450008591D"));
+        /* RPCS3's stored hash passes through (case normalised). */
+        rpcn_wire_password("11e34ba86a98ed6a7debca858864fae02bc9c16aa4d99aaab116311bdc6bfb01", hex);
+        assert(!strcmp(hex, "11E34BA86A98ED6A7DEBCA858864FAE02BC9C16AA4D99AAAB116311BDC6BFB01"));
+    }
     assert(rpcn_build_login(pkt, 20, 1, "Tester_1", "pw", "") < 0);
 
     const uint8_t cookie[3] = { 0xAA, 0xBB, 0xCC };
