@@ -1,8 +1,10 @@
 # Developer fast boot (automated tests): starts the game straight into a level, intro movies skipped.
 #   tools\fastboot.ps1 -Level <name|row> [-Exe <path>] [-Seconds N] [-GameDir <dir>] [-Log <file>] [-Cutscenes]
-#                      [-KeepSaves] [-List]
+#                      [-KeepSaves] [-List] [-Checkpoint <name|index>]
 # -Level    a name from the list printed below (iceland), or the row number in the game's Campaign > Load Level
-#           list (1 = first). The port presses through the menus for you.
+#           list (1 = first), or last (the bottom row). The port presses through the menus for you.
+# -Checkpoint  start the picked level at that checkpoint (PORT_BOOT_CHECKPOINT): a define_checkpoint name from the
+#           level's levelconfig.lua, e.g. cp_boss_catwalks1, or its 0-based index.
 # -Exe      the Resistance2.exe to run (default: build\Resistance2.exe next to this tools folder).
 # -GameDir  the installed game folder: game\EBOOT.elf, gamefiles, gamedata (saves), settings.bat (default: this
 #           repo if it has game\EBOOT.elf, else the main git worktree). The game runs in this folder.
@@ -11,7 +13,7 @@
 # Saves: the savedata folder is copied first and put back by a watcher when the game exits (-KeepSaves: not).
 # Prints the game's PID. The game keeps running; close only that PID. Env: PORT_FAST_BOOT=1, PORT_BOOT_LEVEL=<level>.
 param([string]$Level = '', [string]$Exe = '', [int]$Seconds = 0, [string]$GameDir = '', [string]$Log = '',
-      [switch]$Cutscenes, [switch]$KeepSaves, [switch]$List)
+      [switch]$Cutscenes, [switch]$KeepSaves, [switch]$List, [string]$Checkpoint = '')
 
 $ErrorActionPreference = 'Stop'
 $ExeName = 'Resistance2.exe'
@@ -19,7 +21,7 @@ $ExeName = 'Resistance2.exe'
 $RunEnv = [ordered]@{ SPURS_PM_YIELD = '0'; SPURS_IDLE_POLL = '0'; FREEZE_RELAUNCH = '900' }
 $CfgUser = Join-Path $env:USERPROFILE 'Saved Games\Resistance 2\config'   # run.bat's CFG_USER
 # same table as project\port_fastboot.h: name -> Campaign > Load Level row
-$Named = [ordered]@{ 'iceland' = '1  (Holar, Iceland: the opening)' }
+$Named = [ordered]@{ 'iceland' = '1  (Holar, Iceland: the opening)'; 'chicxulub' = 'last  (Chicxulub: the final level, not checked on screen)'; 'last' = 'last  (the bottom row)' }
 $repo = Split-Path -Parent $PSScriptRoot
 if (-not $GameDir) {
     $GameDir = $repo
@@ -65,6 +67,7 @@ $envs['PS3_VFS_ROOT'] = $vfs
 $envs['PORT_FAST_BOOT'] = '1'
 $envs['PORT_BOOT_LEVEL'] = $name
 $envs['PORT_FAST_BOOT_CUTSCENES'] = if ($Cutscenes) { '1' } else { '' }
+$envs['PORT_BOOT_CHECKPOINT'] = $Checkpoint
 foreach ($k in $envs.Keys) { [Environment]::SetEnvironmentVariable($k, $(if ($envs[$k] -eq '') { $null } else { $envs[$k] }), 'Process') }
 
 New-Item -ItemType Directory -Force (Join-Path $GameDir 'logs') | Out-Null

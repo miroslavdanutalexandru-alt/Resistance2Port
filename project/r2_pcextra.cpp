@@ -1325,7 +1325,9 @@ static void fb_drive_tick(ULONGLONG now)
     case 4:
         fb_press(CROSS, now); go(5, 2500); break;
     case 5:     /* the level list */
-        if (sub < s_fb_row - 1) { fb_press(DOWN, now); sub++; s_fb_next = now + 450; break; }
+        if (s_fb_row == PORT_FASTBOOT_LAST_ROW) {
+            if (sub < 60) { fb_press(DOWN, now); sub++; s_fb_next = now + 300; break; }
+        } else if (sub < s_fb_row - 1) { fb_press(DOWN, now); sub++; s_fb_next = now + 450; break; }
         go(6, 700); break;
     case 6:
         fb_press(CROSS, now); go(7, 2000); break;
@@ -1334,6 +1336,60 @@ static void fb_drive_tick(ULONGLONG now)
         LOG("fast boot: level picked at %.1f s (Load Level row %d)", proc_uptime_s(), s_fb_row);
         s_fb_step = -1; break;
     }
+}
+/* PORT_BOOT_CHECKPOINT=<name|index>: the level's start checkpoint is replaced once, at the game's "set the
+ * start checkpoint" (func_0012EC44(level, checkpoint), hook in tools/hooks/r2.json), after the menu driver has
+ * picked the level (or on the first call without PORT_BOOT_LEVEL). A name (levelconfig.lua define_checkpoint,
+ * e.g. cp_boss_catwalks1) is looked up in the level's checkpoint table (func_0012FD60: count at
+ * [[TOC-0x7DCC]-0x8000], 0x94-byte records at [[TOC-0x7DCC]-0x7FFC], the name first); the start-up scripts
+ * then spawn the hero there (global.lua checkpoint warps). Every call is logged while fast boot is on. */
+static uint32_t fb_be32(uint32_t a)
+{
+    if (!vm_base || a < 0x10000u || a >= 0xE0000000u) return 0;
+    return _byteswap_ulong(*(const uint32_t*)(vm_base + a));
+}
+static int fb_cp_name(uint32_t toc, int idx, char* out, size_t n)
+{
+    out[0] = 0;
+    const uint32_t x = fb_be32(toc - 0x7DCC);
+    if (!x) return -1;
+    const uint32_t cnt_at = fb_be32(x - 0x8000), recs = fb_be32(x - 0x7FFC);
+    if (!cnt_at || !recs) return -1;
+    const int cnt = (int)fb_be32(cnt_at);
+    if (cnt <= 0 || cnt > 256) return -1;
+    if (idx < 0 || idx >= cnt) return cnt;
+    const char* s = (const char*)vm_base + recs + (uint32_t)idx * 0x94u;
+    size_t i = 0;
+    for (; i + 1 < n && i < 0x40 && s[i]; i++) out[i] = (s[i] >= 32 && s[i] < 127) ? s[i] : '?';
+    out[i] = 0;
+    return cnt;
+}
+extern "C" uint32_t r2x_boot_checkpoint(uint32_t level, uint32_t cp, uint32_t toc)
+{
+    static int done = 0;
+    const char* e = getenv("PORT_BOOT_CHECKPOINT");
+    const int want = e && *e && *e != '0';
+    if (!want && !s_fb) return cp;
+    char nm[72]; const int cnt = fb_cp_name(toc, (int)cp, nm, sizeof nm);
+    fprintf(stderr, "[fastboot] start checkpoint: level %u, checkpoint %d (%s), %d checkpoints defined\n",
+            level, (int)cp, nm[0] ? nm : "?", cnt);
+    if (!want || done || (s_fb_row && s_fb_step >= 0)) { fflush(stderr); return cp; }
+    int to = -1;
+    if (strspn(e, "0123456789") == strlen(e)) to = atoi(e);
+    else for (int i = 0; i < cnt && i < 256; i++) {
+        char n2[72]; fb_cp_name(toc, i, n2, sizeof n2);
+        if (!_stricmp(n2, e)) { to = i; break; }
+    }
+    if (to < 0) {
+        fprintf(stderr, "[fastboot] PORT_BOOT_CHECKPOINT=%s: not a checkpoint of this level (%d defined), start unchanged\n", e, cnt);
+        fflush(stderr); return cp;
+    }
+    done = 1;
+    fb_cp_name(toc, to, nm, sizeof nm);
+    fprintf(stderr, "[fastboot] PORT_BOOT_CHECKPOINT: level %u starts at checkpoint %d (%s) instead of %d\n",
+            level, to, nm[0] ? nm : "?", (int)cp);
+    fflush(stderr);
+    return (uint32_t)to;
 }
 /* R2_PHOTO_HIDE_HUD: 1 = enabled, 2 = enabled and photo mode on (VKR2FrameGen.cpp r2fg_photo_source) */
 extern "C" { volatile int g_port_photo_hud = 0; }
