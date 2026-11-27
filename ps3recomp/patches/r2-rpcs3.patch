@@ -27400,10 +27400,10 @@ index 0000000..db54a19
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..0d5da40
+index 0000000..108385e
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12503 @@
+@@ -0,0 +1,12513 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -27810,6 +27810,11 @@ index 0000000..0d5da40
 +		// instance, stale constants) gave a static floor/rug polygon a foreign velocity: hard-edged dark smears in DLSS
 +		// while the camera moved (R3 11-19). Genuinely moving surfaces fail the camera check and keep their velocity.
 +		bool om_guard = true;
++		// RSX_DLSS_OBJMV_GUARD_FAR=N (render px, default 0 = off; needs the depth guard): an object velocity more than N px
++		// from the camera motion is dropped wherever the camera motion is confirmed by the previous depth, even when its own
++		// previous position is confirmed too. Mispaired skinned grass patches (another clump's bone palette, 30-1000 px off)
++		// land on grass at a similar depth and passed the guard (FB19 dumps: 1-20% of grass pixels per moving frame).
++		float om_guard_far = 0.f;
 +		// RSX_DLSS_OBJMV_EXACT_REF=0: the reference camera is the frame's most common draw motion only. Default: a draw whose
 +		// program carries the game's verified view-projection rows (RSX_AA_CAMERA_EXACT) is checked against its own
 +		// VP_prev * VP_cur^-1, the game's camera, not the provisional vote (R3: 5-15% of the matched draws agree with it)
@@ -28251,6 +28256,7 @@ index 0000000..0d5da40
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_NEAREST")) r.om_nearest = std::atoi(e) != 0;
 +		r.om_behind = pdq_env_int("RSX_DLSS_OBJMV_BEHIND", 0) != 0;
 +		r.om_guard = pdq_env_int("RSX_DLSS_OBJMV_DEPTH_GUARD", 1) != 0;
++		r.om_guard_far = std::clamp(pdq_env_float("RSX_DLSS_OBJMV_GUARD_FAR", 0.f), 0.f, 4096.f);
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_EXACT_REF")) r.om_exact_ref = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_STATIC_PX")) r.om_static_px = std::clamp(static_cast<float>(std::atof(e)), 0.f, 16.f);
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_HSUBMIT")) r.om_hsubmit = std::atoi(e) != 0;
@@ -29179,6 +29185,10 @@ index 0000000..0d5da40
 +	if (!r2cfg().om_guard) return {};
 +	char b[160];
 +	std::snprintf(b, sizeof(b), "\tif (eo < 0.0) return length(omv - cmv) > %.9e;\n", static_cast<double>(r2cfg().om_max_motion));
++	// RSX_DLSS_OBJMV_GUARD_FAR: the camera motion is confirmed here; a velocity this far from it is a mispair
++	char gfar[96] = "";
++	if (r2cfg().om_guard_far > 0.f)
++		std::snprintf(gfar, sizeof(gfar), "\tif (dot(dpx, dpx) > %.9e) return true;\n", static_cast<double>(r2cfg().om_guard_far * r2cfg().om_guard_far));
 +	return std::string(
 +		// best relative match of the previous depth (3x3) with want or want2 (-1: off screen)
 +		"float r2_prev_err(vec2 pndc, float want, float want2)\n"
@@ -29202,10 +29212,10 @@ index 0000000..0d5da40
 +		"	if (dot(dpx, dpx) <= 1.0) return false;\n"
 +		"	float lc = lin(((q.z / q.w) - opts.y) / opts.x);\n"
 +		"	float ec = r2_prev_err(q.xy / q.w, lc, lc);\n"
-+		"	if (ec < 0.0 || ec > 0.03) return false;\n"
++		"	if (ec < 0.0 || ec > 0.03) return false;\n") + gfar +
 +		// the object's previous depth is unknown: accept its current depth or the camera-corrected one (approaching a
 +		// moving enemy changes both), with a band wider than the camera's own depth motion and the object's depth drift
-+		"	float eo = r2_prev_err(ndc + 2.0 * omv, l0, lc);\n") + b +
++		"	float eo = r2_prev_err(ndc + 2.0 * omv, l0, lc);\n" + b +
 +		"	return eo > max(0.04 + abs(lc - l0) / max(l0, 1e-6), 3.0 * ec);\n"
 +		"}\n";
 +}
