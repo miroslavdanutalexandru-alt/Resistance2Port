@@ -23,6 +23,7 @@ void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; 
 int (*g_net_resolve_hook)(const char*, uint32_t*);
 int (*g_np_signed_in_hook)(void);
 const char* (*g_np_online_id_hook)(void);
+uint32_t g_netctl_dns_override;
 static int s_np_init = 1;
 int  np_is_initialized(void) { return s_np_init; }
 void np_manager_get_callback(uint32_t* cb, uint32_t* arg) { *cb = 0x10000; *arg = 0x20000; }
@@ -33,7 +34,7 @@ s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8])
     return 0;
 }
 
-static struct { uint32_t nid; void (*fn)(ppu_context*); } s_reg[32];
+static struct { uint32_t nid; void (*fn)(ppu_context*); } s_reg[64];
 static int s_nreg;
 void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*))
 {
@@ -219,6 +220,20 @@ int main(void)
     assert(getenv("PS3_NET_ONLINE"));
     assert(g_net_resolve_hook == port_online_resolve && g_np_signed_in_hook() == 1);
     assert(!strcmp(g_np_online_id_hook(), "Tester_1"));
+    assert(g_netctl_dns_override == ip4(127, 0, 0, 1));   /* reported as cellNetCtl's primary DNS */
+
+    /* NP exports the title imports but the HLE lacks: real answers, not a faked OK. */
+    vm_write32(0x1000, 0xDEADBEEF);
+    assert(call("sceNpBasicGetCustomInvitationEntryCount", 0x1000, 0, 0, 0, 0) == 0 && vm_read32(0x1000) == 0);
+    assert((uint32_t)call("sceNpBasicGetCustomInvitationEntryCount", 0, 0, 0, 0, 0) == PO_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    assert((uint32_t)call("sceNpClansCreateRequest", 0x1000, 0, 0, 0, 0) == PO_NP_CLANS_ERROR_SERVICE_UNAVAILABLE);
+    assert((uint32_t)call("sceNpClansGetClanList", 0, 0x1000, 0, 0, 0) == PO_NP_CLANS_ERROR_SERVICE_UNAVAILABLE);
+    assert((uint32_t)call("sceNpBasicGetFriendPresenceByIndex", 0, 0x1000, 0x1100, 0, 0) == PO_NP_BASIC_ERROR_INVALID_ARGUMENT);
+    assert(call("sceNpManagerGetAvatarUrl", 0x2000, 0, 0, 0, 0) == 0);
+    assert(!strncmp((const char*)vm_ptr8(0x2000), "http://", 7) && strlen((const char*)vm_ptr8(0x2000)) < 128);
+    s_np_init = 0;
+    assert((uint32_t)call("sceNpManagerGetAvatarUrl", 0x2000, 0, 0, 0, 0) == SCE_NP_ERROR_NOT_INITIALIZED);
+    s_np_init = 1;
 
     assert(port_online_resolve("SVO.example", &ip) && ip == ip4(10, 9, 8, 7));   /* case-insensitive */
     start_mock();
@@ -236,6 +251,27 @@ int main(void)
     uint8_t type; uint16_t cmd; uint32_t total; uint64_t pid;
     assert(rpcn_parse_header(pkt, (size_t)n, &type, &cmd, &total, &pid) == RPCN_HEADER_SIZE);
     assert(type == RPCN_PKT_REQUEST && cmd == RPCN_CMD_LOGIN && total == 28 && pid == 0x0102030405060708ull);
+
+    /* RPCN password = RPCS3 derive_password(); vectors from Python
+     * hashlib.pbkdf2_hmac('sha3_256', pw, salt, iterations, 32). */
+    {
+        uint8_t d[32];
+        char hex[65];
+        static const char salt[] = "No matter where you go, everybody's connected.";
+        port_sha3_256("", 0, d);
+        assert(d[0] == 0xa7 && d[1] == 0xff && d[31] == 0x4a);
+        char big[201]; memset(big, 'x', 200); big[200] = 0;
+        port_pbkdf2_sha3_256(big, 200, salt, sizeof(salt) - 1, 1, d, 32); /* key > block: hashed */
+        for (int i = 0; i < 32; i++) sprintf(hex + 2 * i, "%02X", d[i]);
+        assert(!strcmp(hex, "CC7A18098CA523ECF800C0BB41E320FE82CE780D8B43453600CDBC3E764707BD"));
+        rpcn_wire_password("pw", hex);
+        assert(!strcmp(hex, "11E34BA86A98ED6A7DEBCA858864FAE02BC9C16AA4D99AAAB116311BDC6BFB01"));
+        rpcn_wire_password("correct horse battery staple", hex);
+        assert(!strcmp(hex, "56D05353F751EFA39EFD7E9778336A2EF807A2795615D4714945F4450008591D"));
+        /* RPCS3's stored hash passes through (case normalised). */
+        rpcn_wire_password("11e34ba86a98ed6a7debca858864fae02bc9c16aa4d99aaab116311bdc6bfb01", hex);
+        assert(!strcmp(hex, "11E34BA86A98ED6A7DEBCA858864FAE02BC9C16AA4D99AAAB116311BDC6BFB01"));
+    }
     assert(rpcn_build_login(pkt, 20, 1, "Tester_1", "pw", "") < 0);
 
     const uint8_t cookie[3] = { 0xAA, 0xBB, 0xCC };

@@ -51,6 +51,7 @@ extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_
 extern int (*g_net_resolve_hook)(const char* name, uint32_t* ip_out);   /* sysNet.c */
 extern int (*g_np_signed_in_hook)(void);                                 /* sceNp.c */
 extern const char* (*g_np_online_id_hook)(void);                         /* np_psnr.c */
+extern uint32_t g_netctl_dns_override;                                    /* cellNetCtl.c */
 void np_manager_get_callback(uint32_t* cb, uint32_t* arg);               /* sceNp.c */
 int  np_is_initialized(void);                                            /* sceNp.c */
 
@@ -358,6 +359,133 @@ int port_online_resolve(const char* name, uint32_t* ip_out)
         printf("[online] %s: configured dns gave no A record, using system resolver\n", name);
     }
     return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * RPCN password: SHA3-256, HMAC, PBKDF2 (matches RPCS3's derive_password)
+ * -----------------------------------------------------------------------*/
+
+#define PO_SHA3_RATE 136
+
+typedef struct { uint64_t s[25]; uint8_t buf[PO_SHA3_RATE]; size_t n; } po_sha3;
+
+static uint64_t po_rol64(uint64_t x, unsigned r) { return r ? (x << r) | (x >> (64 - r)) : x; }
+
+static void po_keccakf(uint64_t s[25])
+{
+    static const uint64_t rc[24] = {
+        0x0000000000000001ull, 0x0000000000008082ull, 0x800000000000808Aull, 0x8000000080008000ull,
+        0x000000000000808Bull, 0x0000000080000001ull, 0x8000000080008081ull, 0x8000000000008009ull,
+        0x000000000000008Aull, 0x0000000000000088ull, 0x0000000080008009ull, 0x000000008000000Aull,
+        0x000000008000808Bull, 0x800000000000008Bull, 0x8000000000008089ull, 0x8000000000008003ull,
+        0x8000000000008002ull, 0x8000000000000080ull, 0x000000000000800Aull, 0x800000008000000Aull,
+        0x8000000080008081ull, 0x8000000000008080ull, 0x0000000080000001ull, 0x8000000080008008ull };
+    static const unsigned rot[25] = { 0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43,
+                                      25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14 };
+    for (int r = 0; r < 24; r++) {
+        uint64_t c[5], b[25];
+        for (int x = 0; x < 5; x++) c[x] = s[x] ^ s[x + 5] ^ s[x + 10] ^ s[x + 15] ^ s[x + 20];
+        for (int x = 0; x < 5; x++) {
+            uint64_t d = c[(x + 4) % 5] ^ po_rol64(c[(x + 1) % 5], 1);
+            for (int y = 0; y < 25; y += 5) s[y + x] ^= d;
+        }
+        for (int x = 0; x < 5; x++)
+            for (int y = 0; y < 5; y++)
+                b[y + 5 * ((2 * x + 3 * y) % 5)] = po_rol64(s[x + 5 * y], rot[x + 5 * y]);
+        for (int y = 0; y < 25; y += 5)
+            for (int x = 0; x < 5; x++) s[y + x] = b[y + x] ^ (~b[y + (x + 1) % 5] & b[y + (x + 2) % 5]);
+        s[0] ^= rc[r];
+    }
+}
+
+static void po_sha3_absorb_block(po_sha3* h, const uint8_t* p)
+{
+    for (int i = 0; i < PO_SHA3_RATE / 8; i++) {
+        uint64_t v = 0;
+        for (int j = 0; j < 8; j++) v |= (uint64_t)p[i * 8 + j] << (8 * j);
+        h->s[i] ^= v;
+    }
+    po_keccakf(h->s);
+}
+
+static void po_sha3_init(po_sha3* h) { memset(h, 0, sizeof(*h)); }
+
+static void po_sha3_update(po_sha3* h, const uint8_t* p, size_t len)
+{
+    while (len) {
+        size_t k = PO_SHA3_RATE - h->n;
+        if (k > len) k = len;
+        memcpy(h->buf + h->n, p, k);
+        h->n += k; p += k; len -= k;
+        if (h->n == PO_SHA3_RATE) { po_sha3_absorb_block(h, h->buf); h->n = 0; }
+    }
+}
+
+static void po_sha3_final(po_sha3* h, uint8_t out[32])
+{
+    memset(h->buf + h->n, 0, PO_SHA3_RATE - h->n);
+    h->buf[h->n] ^= 0x06;
+    h->buf[PO_SHA3_RATE - 1] ^= 0x80;
+    po_sha3_absorb_block(h, h->buf);
+    for (int i = 0; i < 32; i++) out[i] = (uint8_t)(h->s[i / 8] >> (8 * (i % 8)));
+}
+
+void port_sha3_256(const void* data, size_t len, uint8_t out[32])
+{
+    po_sha3 h;
+    po_sha3_init(&h);
+    po_sha3_update(&h, (const uint8_t*)data, len);
+    po_sha3_final(&h, out);
+}
+
+void port_pbkdf2_sha3_256(const void* pw, size_t pw_len, const void* salt, size_t salt_len,
+                          uint32_t iterations, uint8_t* out, size_t out_len)
+{
+    uint8_t key[PO_SHA3_RATE] = { 0 }, pad[PO_SHA3_RATE];
+    if (pw_len > PO_SHA3_RATE) port_sha3_256(pw, pw_len, key);
+    else memcpy(key, pw, pw_len);
+    /* HMAC states after the key block, reused for every iteration. */
+    po_sha3 inner, outer;
+    for (int i = 0; i < PO_SHA3_RATE; i++) pad[i] = key[i] ^ 0x36;
+    po_sha3_init(&inner); po_sha3_update(&inner, pad, sizeof(pad));
+    for (int i = 0; i < PO_SHA3_RATE; i++) pad[i] = key[i] ^ 0x5c;
+    po_sha3_init(&outer); po_sha3_update(&outer, pad, sizeof(pad));
+
+    for (uint32_t blk = 1; out_len; blk++) {
+        uint8_t u[32], t[32], be[4] = { (uint8_t)(blk >> 24), (uint8_t)(blk >> 16), (uint8_t)(blk >> 8), (uint8_t)blk };
+        po_sha3 h = inner;
+        po_sha3_update(&h, (const uint8_t*)salt, salt_len);
+        po_sha3_update(&h, be, 4);
+        po_sha3_final(&h, u);
+        h = outer; po_sha3_update(&h, u, 32); po_sha3_final(&h, u);
+        memcpy(t, u, 32);
+        for (uint32_t it = 1; it < iterations; it++) {
+            h = inner; po_sha3_update(&h, u, 32); po_sha3_final(&h, u);
+            h = outer; po_sha3_update(&h, u, 32); po_sha3_final(&h, u);
+            for (int i = 0; i < 32; i++) t[i] ^= u[i];
+        }
+        size_t k = out_len < 32 ? out_len : 32;
+        memcpy(out, t, k);
+        out += k; out_len -= k;
+    }
+}
+
+void rpcn_wire_password(const char* password, char out[65])
+{
+    static const char hex[] = "0123456789ABCDEF";
+    const char* pw = password ? password : "";
+    size_t n = strlen(pw), i;
+    for (i = 0; i < n && isxdigit((unsigned char)pw[i]); i++) {}
+    if (n == 64 && i == 64) {
+        /* Already RPCS3's stored hash (config.yml Password). */
+        for (i = 0; i < 64; i++) out[i] = (char)toupper((unsigned char)pw[i]);
+    } else {
+        static const char salt[] = "No matter where you go, everybody's connected.";
+        uint8_t d[32];
+        port_pbkdf2_sha3_256(pw, n, salt, sizeof(salt) - 1, 200000, d, sizeof(d));
+        for (i = 0; i < 32; i++) { out[2 * i] = hex[d[i] >> 4]; out[2 * i + 1] = hex[d[i] & 15]; }
+    }
+    out[64] = 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -804,7 +932,9 @@ static int po_rpcn_session(const char* service_id, const uint8_t* cookie, uint32
     if (!service_id) { rc = 0; goto done; }
 
     uint8_t buf[RPCN_HEADER_SIZE + 4 + 64 + SCE_NP_COOKIE_MAX_SIZE + 256];
-    int n = rpcn_build_login(buf, sizeof(buf), 1, s_cfg.rpcn_user, s_cfg.rpcn_password, s_cfg.rpcn_token);
+    static char wire_pw[65];
+    if (!wire_pw[0]) rpcn_wire_password(s_cfg.rpcn_password, wire_pw);
+    int n = rpcn_build_login(buf, sizeof(buf), 1, s_cfg.rpcn_user, wire_pw, s_cfg.rpcn_token);
     if (n < 0 || po_tls_send(&t, buf, (size_t)n) < 0 || po_rpcn_reply(&t, RPCN_CMD_LOGIN, 1, &p, &pl) < 0) {
         printf("[online] rpcn: login exchange failed\n");
         goto done;
@@ -1008,6 +1138,76 @@ static void h_get_network_time(ppu_context* ctx)
  * Accepted without a second account, as RPCS3 does. */
 static void h_ok(ppu_context* ctx) { RET(np_is_initialized() ? CELL_OK : SCE_NP_ERROR_NOT_INITIALIZED); }
 
+/* NP Basic / Clans / avatar exports a title imports but the HLE did not
+ * implement. Unimplemented imports fake CELL_OK without writing outputs; once
+ * online, titles act on those outputs (R2 polls the custom invitation count
+ * and opens Clans), so they get real "nothing there" / "unavailable" answers
+ * instead. Codes are the SDK's (RPCS3 sceNp.h / sceNpClans.h). */
+#define PO_NP_BASIC_ERROR_NOT_SUPPORTED       0x8002a663u
+#define PO_NP_BASIC_ERROR_INVALID_ARGUMENT    0x8002a665u
+#define PO_NP_BASIC_ERROR_NOT_INITIALIZED     0x8002a662u
+#define PO_NP_CLANS_ERROR_SERVICE_UNAVAILABLE 0x80022711u
+#define PO_NP_DEFAULT_AVATAR "http://static-resource.np.community.playstation.net/avatar_s/default/DefaultAvatar_s.png"
+
+/* sceNpBasicGetCustomInvitationEntryCount(u32* count) */
+static void h_basic_custom_invitation_count(ppu_context* ctx)
+{
+    if (!np_is_initialized()) { RET(PO_NP_BASIC_ERROR_NOT_INITIALIZED); return; }
+    if (!R32(3)) { RET(PO_NP_BASIC_ERROR_INVALID_ARGUMENT); return; }
+    vm_write32(R32(3), 0);
+    RET(CELL_OK);
+}
+
+/* Friend presence by index: there are no friends (GetFriendListEntryCount is
+ * 0), so every index is out of range. */
+static void h_basic_no_data(ppu_context* ctx) { RET(PO_NP_BASIC_ERROR_INVALID_ARGUMENT); }
+/* System GUIs (send message, add friend, received messages): not available. */
+static void h_basic_not_supported(ppu_context* ctx) { RET(PO_NP_BASIC_ERROR_NOT_SUPPORTED); }
+static void h_basic_abort_gui(ppu_context* ctx) { RET(CELL_OK); }
+
+/* sceNpManagerGetAvatarUrl(SceNpAvatarUrl* url): char[128]. */
+static void h_get_avatar_url(ppu_context* ctx)
+{
+    if (!np_is_initialized()) { RET(SCE_NP_ERROR_NOT_INITIALIZED); return; }
+    if (!R32(3)) { RET(SCE_NP_ERROR_INVALID_ARGUMENT); return; }
+    if (!port_online_signed_in()) { RET(SCE_NP_ERROR_OFFLINE); return; }
+    char* out = (char*)vm_ptr8(R32(3));
+    memset(out, 0, 128);
+    memcpy(out, PO_NP_DEFAULT_AVATAR, sizeof(PO_NP_DEFAULT_AVATAR));
+    RET(CELL_OK);
+}
+
+/* Clans has its own server (clans_client in RPCS3); not implemented here. */
+static void h_clans_unavailable(ppu_context* ctx) { RET(PO_NP_CLANS_ERROR_SERVICE_UNAVAILABLE); }
+static void h_clans_destroy_request(ppu_context* ctx) { RET(CELL_OK); }
+
+static void register_np_gaps(void)
+{
+    static const char* const clans[] = {
+        "sceNpClansCreateRequest", "sceNpClansGetClanList", "sceNpClansSearchByProfile",
+        "sceNpClansUpdateClanInfo", "sceNpClansDisbandClan", "sceNpClansKickMember",
+        "sceNpClansChangeMemberRole", "sceNpClansUpdateAutoAcceptStatus",
+        "sceNpClansSendInvitation", "sceNpClansCancelInvitation",
+        "sceNpClansSendInvitationResponse", "sceNpClansSendMembershipRequest",
+        "sceNpClansCancelMembershipRequest", "sceNpClansSendMembershipResponse",
+    };
+    static const struct { const char* name; void (*fn)(ppu_context*); } tab[] = {
+        { "sceNpBasicGetCustomInvitationEntryCount", h_basic_custom_invitation_count },
+        { "sceNpBasicGetFriendPresenceByIndex",      h_basic_no_data },
+        { "sceNpBasicSendMessageGui",                h_basic_not_supported },
+        { "sceNpBasicAddFriend",                     h_basic_not_supported },
+        { "sceNpBasicRecvMessageAttachmentLoad",     h_basic_not_supported },
+        { "sceNpBasicRecvMessageCustom",             h_basic_not_supported },
+        { "sceNpBasicAbortGui",                      h_basic_abort_gui },
+        { "sceNpManagerGetAvatarUrl",                h_get_avatar_url },
+        { "sceNpClansDestroyRequest",                h_clans_destroy_request },
+    };
+    for (size_t i = 0; i < sizeof(tab) / sizeof(tab[0]); i++)
+        ps3_hle_register_ctx(ps3_compute_nid(tab[i].name), tab[i].name, tab[i].fn);
+    for (size_t i = 0; i < sizeof(clans) / sizeof(clans[0]); i++)
+        ps3_hle_register_ctx(ps3_compute_nid(clans[i]), clans[i], h_clans_unavailable);
+}
+
 void port_online_register(void)
 {
     if (!port_online_enabled()) return;
@@ -1018,6 +1218,7 @@ void port_online_register(void)
     if (!getenv("PS3_NET_ONLINE")) setenv("PS3_NET_ONLINE", "1", 0);
 #endif
     g_net_resolve_hook = port_online_resolve;
+    g_netctl_dns_override = s_cfg.dns_server;
     g_np_signed_in_hook = port_online_signed_in;
     g_np_online_id_hook = po_online_id;
 
@@ -1033,6 +1234,7 @@ void port_online_register(void)
     };
     for (size_t i = 0; i < sizeof(tab) / sizeof(tab[0]); i++)
         ps3_hle_register_ctx(ps3_compute_nid(tab[i].name), tab[i].name, tab[i].fn);
+    register_np_gaps();
     printf("[online] PORT_ONLINE: %s, %u sceNp exports\n",
            port_online_signed_in() ? "signed in (RPCN credentials present)" : "online, not signed in (no rpcn_user/password)",
            (unsigned)(sizeof(tab) / sizeof(tab[0])));

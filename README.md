@@ -167,25 +167,29 @@ Only the offline, split-screen part of co-op works: everything that needs PSN (o
 
 Off by default; nothing here touches the network unless you turn it on. This is groundwork, not working online play: see the limits below.
 
-**Turning it on:** launcher, Controls page → **Online (experimental)** → On (or `set PORT_ONLINE=1`). Copy `online.ini.example` to `online.ini` next to `run.bat` and put in **your own** RPCN account (make one with RPCS3 first; the port never creates accounts). `online.ini` is ignored by git; never share it.
+**Turning it on:** launcher, Controls page → **Online (experimental)** → On (or `set PORT_ONLINE=1`). Copy `online.ini.example` to `online.ini` next to `run.bat` and put in **your own** RPCN account (made with RPCS3, or made for you; RPCS3 is not needed to play, and the port never creates accounts). `rpcn_password` may be the plain password or the 64-character hash RPCS3 stores; the port sends RPCN the same derived hash as RPCS3 (PBKDF2-SHA3-256), never the plain text. `online.ini` is ignored by git; never share it.
 
 What it does with `PORT_ONLINE=1`:
 
 - Turns on real sockets for the game (`PS3_NET_ONLINE=1`).
 - With `rpcn_user` and `rpcn_password` set, the game is told it is signed in, as that RPCN name. When the game asks for a sign-in ticket, the port connects to `rpcn_host` (TLS, port 31313), logs in and gets the ticket from RPCN, as RPCS3 does.
 - Sends the game's server lookups (`gethostbyname`) to `host.<name> = <ip>` entries first, then to the `dns =` server (for community revival servers that are reached through a custom DNS), then to Windows' DNS.
+- Answers the game's own DNS queries (UDP to port 53) the same way when the name is redirected, so a lookup that bypasses `gethostbyname` still reaches the revival server. The network status the game reads reports the `dns =` server as its DNS and the PC's real LAN address.
+- Gives honest answers for NP functions the port does not implement (Clans: "service unavailable"; friend/message system dialogs: not supported; no custom invitations) instead of a silent success.
+
+For **PS Rewired** (the community Resistance 2 servers, alpha), uncomment the `host.resistance2.ps3.online.scea.com = 67.222.156.250` line (or `dns = 67.222.156.250`) in `online.ini`, as in its RPCS3 guide.
 
 | Variable / `online.ini` key | Meaning |
 |---|---|
 | `PORT_ONLINE=1` | Turn it on (default off) |
 | `PORT_ONLINE_CONFIG=<path>` | Read another file instead of `online.ini` |
 | `PORT_ONLINE_PROBE=1` | At start-up, only check that `rpcn_host` answers (TLS + server version; no login). The result is in `logs\run.log` (`[online] probe`) |
-| `rpcn_host`, `rpcn_user`, `rpcn_password`, `rpcn_token` | RPCN server (default port 31313) and your account. The password and token are never written to the log |
+| `rpcn_host`, `rpcn_user`, `rpcn_password`, `rpcn_token` | RPCN server (default port 31313) and your account. `rpcn_password` is the plain password or RPCS3's stored 64-hex hash. The password and token are never written to the log |
 | `dns` | IPv4 address of a DNS server for the game's lookups |
 | `host.<name>` | Fixed IPv4 address for one host name |
 
 `logs\run.log` lines start with `[online]` (config read, sign-in state, ticket requests) and `[sys_net] gethostbyname` (each server name the game looks up and where it went).
-**Limits:** Resistance 2's online modes need the community (revival) servers, which RPCS3 reaches with RPCN plus the revival's DNS. The port does the same steps, but nobody has played online with it yet: whether those servers accept the port's tickets, and whether the rest of the game's online code (matchmaking, voice, NAT) works, is untested. Some online functions are still stubs. Online co-op and competitive play are therefore not expected to work yet.
+**Limits:** Resistance 2's online modes need the community (revival) servers, which RPCS3 reaches with RPCN plus the revival's DNS. The port does the same steps, but nobody has played online with it yet: whether those servers accept the port's tickets, and whether the rest of the game's online code (matchmaking, voice, NAT) works, is untested. Some online functions are still stubs (Clans, friends, messages). The port is the disc version (1.00) while PS3 and RPCS3 players are on the last update (1.60), so the server may refuse it or it may not match their games. Online co-op and competitive play are therefore not expected to work yet. Use your own RPCN account and follow the revival's rules.
 
 ## PC features
 

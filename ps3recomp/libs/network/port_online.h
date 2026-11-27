@@ -64,8 +64,16 @@ int  port_dns_parse_a(const uint8_t* msg, size_t len, uint16_t id, uint32_t* ip_
 int  rpcn_write_header(uint8_t* out, uint8_t type, uint16_t cmd, uint32_t total, uint64_t packet_id);
 int  rpcn_parse_header(const uint8_t* in, size_t len, uint8_t* type, uint16_t* cmd,
                        uint32_t* total, uint64_t* packet_id);
+/* password is the wire form from rpcn_wire_password(). */
 int  rpcn_build_login(uint8_t* out, size_t cap, uint64_t packet_id,
                       const char* user, const char* password, const char* token);
+/* RPCN never sees the plain password: 64 hex chars (RPCS3's stored hash) are
+ * sent as is (upper-cased); anything else becomes PBKDF2-HMAC-SHA3-256(pw,
+ * RPCS3 salt, 200000, 32) as uppercase hex, like RPCS3's derive_password(). */
+void rpcn_wire_password(const char* password, char out[65]);
+void port_sha3_256(const void* data, size_t len, uint8_t out[32]);
+void port_pbkdf2_sha3_256(const void* pw, size_t pw_len, const void* salt, size_t salt_len,
+                          uint32_t iterations, uint8_t* out, size_t out_len);
 int  rpcn_build_ticket_request(uint8_t* out, size_t cap, uint64_t packet_id,
                                const char* service_id, const uint8_t* cookie, uint32_t cookie_size);
 /* ServerInfo payload -> protocol version (u32 LE). -1 when malformed. */

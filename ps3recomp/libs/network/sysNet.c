@@ -83,6 +83,11 @@ typedef struct {
     int           stream;   /* SOCK_STREAM or SOCK_STREAM_P2P */
     uint16_t      vport;    /* the P2P vport it was bound to */
     int           listening;
+    /* A DNS answer made up locally for a query that was never sent (see
+     * "Built-in DNS"); the next recvfrom hands it out. */
+    uint8_t       dns[512];
+    uint32_t      dns_len;
+    struct sockaddr_in dns_from;
 } net_socket_slot;
 
 static net_socket_slot s_sockets[SYS_NET_MAX_SOCKETS];
@@ -179,6 +184,7 @@ static int alloc_slot(host_socket_t fd)
             s_sockets[i].stream = 0;
             s_sockets[i].vport = 0;
             s_sockets[i].listening = 0;
+            s_sockets[i].dns_len = 0;
             return i;
         }
     return -1;
@@ -380,6 +386,7 @@ int32_t sys_net_bnet_close(int32_t s)
     }
     host_closesocket(s_sockets[s].host_fd);
     s_sockets[s].in_use = 0;
+    s_sockets[s].dns_len = 0;
     return 0;
 }
 
@@ -611,6 +618,97 @@ int32_t sys_net_bnet_send(int32_t s, const void* buf, uint32_t len, int32_t flag
     return n == HOST_SOCKET_ERROR ? host_fail() : n;
 }
 
+/* ---------------------------------------------------------------------------
+ * Built-in DNS for PORT_ONLINE's host.* / dns= redirection.
+ *
+ * Besides gethostbyname, a title's own resolver may send a UDP query straight
+ * to the DNS server cellNetCtl reported. gethostbyname's redirection never
+ * sees those, and for a retired service the real answer is NXDOMAIN. So a
+ * single-question A/IN query to port 53 for a name the resolve hook redirects
+ * is answered here and handed out by the next recvfrom on that socket; it is
+ * never sent. Every other query goes to the real server untouched. Without
+ * the hook (PORT_ONLINE off) nothing is intercepted.
+ *
+ * One pending answer per socket: a second query before the first answer is
+ * read replaces it, which is what a resolver retrying the same name expects.
+ * -----------------------------------------------------------------------*/
+
+extern int (*g_net_resolve_hook)(const char* name, uint32_t* ip_out);   /* defined with gethostbyname */
+
+static int dns_pending(int32_t s)
+{
+    return s > 0 && s < SYS_NET_MAX_SOCKETS && s_sockets[s].in_use && s_sockets[s].dns_len > 0;
+}
+
+/* Read the QNAME at buf+12 into dot notation. Returns the offset just past the
+ * question section, or 0 when the packet is not a single-question A/IN query. */
+static uint32_t dns_parse_question(const uint8_t* buf, uint32_t len, char* name, size_t namecap)
+{
+    if (len < 12 + 5) return 0;
+    if ((buf[2] & 0x80) || (buf[2] & 0x78)) return 0;   /* a response, or not a standard query */
+    if ((buf[4] << 8 | buf[5]) != 1) return 0;           /* QDCOUNT */
+    uint32_t p = 12; size_t n = 0;
+    if (namecap) name[0] = 0;
+    while (p < len && buf[p]) {
+        uint32_t l = buf[p];
+        if (l & 0xC0) return 0;                          /* compression in a question */
+        if (p + 1 + l >= len) return 0;
+        if (n + l + 2 >= namecap) return 0;
+        if (n) name[n++] = '.';
+        memcpy(name + n, buf + p + 1, l);
+        n += l; name[n] = 0;
+        p += 1 + l;
+    }
+    if (!n || p + 5 > len) return 0;
+    p += 1;                                              /* root label */
+    uint16_t qtype = (uint16_t)(buf[p] << 8 | buf[p + 1]);
+    uint16_t qclass = (uint16_t)(buf[p + 2] << 8 | buf[p + 3]);
+    if (qtype != 1 || qclass != 1) return 0;             /* A / IN only */
+    return p + 4;
+}
+
+/* Intercept a query to port 53. 1 = answered here (nothing was sent). */
+static int dns_maybe_answer(int32_t s, const void* guest_buf, uint32_t len,
+                            const struct sockaddr_in* to)
+{
+    if (!g_net_resolve_hook || s_sockets[s].stream) return 0;
+    if (!to || ntohs(to->sin_port) != 53 || len < 12 || len > 400) return 0;
+
+    const uint8_t* q = (const uint8_t*)GUEST_PTR(EA(guest_buf), const uint8_t*);
+    char name[256];
+    uint32_t qend = q ? dns_parse_question(q, len, name, sizeof(name)) : 0;
+    if (!qend) return 0;
+
+    struct in_addr answer;
+    if (!g_net_resolve_hook(name, (uint32_t*)&answer.s_addr)) {
+        if (net_trace()) printf("[sys_net] DNS query '%s' -> real server (not redirected)\n", name);
+        return 0;
+    }
+
+    net_socket_slot* sl = &s_sockets[s];
+    memset(sl->dns, 0, sizeof sl->dns);
+    memcpy(sl->dns, q, qend);                            /* id, then the question */
+    sl->dns[2] = (uint8_t)(0x80 | (q[2] & 0x01));        /* QR=1, opcode 0, RD as asked */
+    sl->dns[3] = 0x80;                                   /* RA=1, rcode=0 */
+    sl->dns[4] = 0; sl->dns[5] = 1;                      /* QDCOUNT */
+    sl->dns[6] = 0; sl->dns[7] = 1;                      /* ANCOUNT */
+    sl->dns[8] = 0; sl->dns[9] = 0;                      /* NSCOUNT */
+    sl->dns[10] = 0; sl->dns[11] = 0;                    /* ARCOUNT */
+    uint8_t* a = sl->dns + qend;
+    a[0] = 0xC0; a[1] = 0x0C;                            /* pointer to the question name */
+    a[2] = 0; a[3] = 1;                                  /* TYPE A */
+    a[4] = 0; a[5] = 1;                                  /* CLASS IN */
+    a[6] = a[7] = a[8] = 0; a[9] = 60;                   /* TTL 60 s */
+    a[10] = 0; a[11] = 4;                                /* RDLENGTH */
+    memcpy(a + 12, &answer.s_addr, 4);
+    sl->dns_len = qend + 16;
+    sl->dns_from = *to;
+
+    char ip[16];
+    printf("[sys_net] DNS '%s' -> %s (answered locally)\n", name, ip_str(&answer, ip));
+    return 1;
+}
+
 int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t flags,
                             const sys_net_sockaddr* to, uint32_t tolen)
 {
@@ -622,6 +720,7 @@ int32_t sys_net_bnet_sendto(int32_t s, const void* buf, uint32_t len, int32_t fl
     if (s_sockets[s].p2p && np_psnr_p2p_route(GUEST_PTR(EA(buf), const char*), len,
                                              (const uint8_t*)&a.sin_addr, ntohs(a.sin_port)))
         return (int32_t)len;   /* went through psnr's relay */
+    if (dns_maybe_answer(s, buf, len, &a)) return (int32_t)len;
     if (would_block(s, flags, POLLOUT)) return fail(SYS_NET_EWOULDBLOCK);
     int n = sendto(s_sockets[s].host_fd, GUEST_PTR(EA(buf), const char*), (int)len, PS3_NET_HOST_SEND_FLAGS,
                    (struct sockaddr*)&a, sizeof(a));
@@ -645,6 +744,15 @@ int32_t sys_net_bnet_recvfrom(int32_t s, void* buf, uint32_t len, int32_t flags,
     socklen_t alen;
     int n;
     if (!valid_socket(s)) return fail(SYS_NET_EBADF);
+
+    if (dns_pending(s)) {
+        net_socket_slot* sl = &s_sockets[s];
+        n = (int)(sl->dns_len < len ? sl->dns_len : len);
+        memcpy(GUEST_PTR(EA(buf), char*), sl->dns, (size_t)n);
+        if (!(flags & SYS_NET_MSG_PEEK)) sl->dns_len = 0;
+        write_sockaddr(EA(from), EA(fromlen), &sl->dns_from);
+        return n;
+    }
 
     /* psnr's own packets (probe replies, peers' punches) are consumed here;
      * the title only ever sees its own traffic. */
@@ -836,7 +944,8 @@ static int run_poll(const int32_t* gfd, const short* gev, short* grev, int n, in
     }
     int relayed = 0;
     for (int i = 0; i < n; i++)
-        if ((gev[i] & SYS_NET_POLLIN) && valid_socket(gfd[i]) && relayed_pending(gfd[i])) relayed++;
+        if ((gev[i] & SYS_NET_POLLIN) && valid_socket(gfd[i]) &&
+            (relayed_pending(gfd[i]) || dns_pending(gfd[i]))) relayed++;
     if (nval || relayed) timeout_ms = 0;
     if (nh == 0) { sleep_ms(timeout_ms); return nval; }
 
@@ -851,7 +960,8 @@ static int run_poll(const int32_t* gfd, const short* gev, short* grev, int n, in
         if (h & POLLERR)  rv |= SYS_NET_POLLERR;
         if (h & POLLHUP)  rv |= SYS_NET_POLLHUP;
         if (h & POLLNVAL) rv |= SYS_NET_POLLNVAL;
-        if ((gev[map[k]] & SYS_NET_POLLIN) && relayed_pending(gfd[map[k]])) rv |= SYS_NET_POLLIN;
+        if ((gev[map[k]] & SYS_NET_POLLIN) &&
+            (relayed_pending(gfd[map[k]]) || dns_pending(gfd[map[k]]))) rv |= SYS_NET_POLLIN;
         grev[map[k]] = rv;
         if (rv) ready++;
     }
@@ -983,6 +1093,21 @@ uint32_t sys_net_bnet_inet_ntoa(uint32_t addr)
     return ea;
 }
 
+/* const char* inet_ntop(int af, const void* src, char* dst, socklen_t size):
+ * dst on success, NULL (errno set) otherwise. */
+uint32_t sys_net_bnet_inet_ntop(int32_t family, const void* src, char* dst, uint32_t size)
+{
+    if (family != SYS_NET_AF_INET) { (void)fail(SYS_NET_EAFNOSUPPORT); return 0; }
+    const uint8_t* b = GUEST_PTR(EA(src), const uint8_t*);
+    char* out = GUEST_PTR(EA(dst), char*);
+    if (!b || !out) { (void)fail(SYS_NET_EFAULT); return 0; }
+    char tmp[16];
+    int n = snprintf(tmp, sizeof tmp, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+    if (n < 0 || (uint32_t)n + 1 > size) { (void)fail(SYS_NET_ENOSPC); return 0; }
+    memcpy(out, tmp, (size_t)n + 1);
+    return EA(dst);
+}
+
 /* PORT_ONLINE (port_online.c): online.ini host.* / dns= redirection. */
 int (*g_net_resolve_hook)(const char* name, uint32_t* ip_out) = NULL;
 
@@ -1062,6 +1187,7 @@ static void h_inet_pton(ppu_context* ctx)   { RET_S(sys_net_bnet_inet_pton(S32(3
 static void h_inet_aton(ppu_context* ctx)   { RET_S(sys_net_bnet_inet_aton(PTR(3), PTR(4))); }
 static void h_inet_addr(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_addr(PTR(3))); }
 static void h_inet_ntoa(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_ntoa(R32(3))); }
+static void h_inet_ntop(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_ntop(S32(3), PTR(4), PTR(5), R32(6))); }
 static void h_gethostbyname(ppu_context* ctx) { RET_U(sys_net_bnet_gethostbyname(PTR(3))); }
 static void h_errno_loc(ppu_context* ctx)   { RET_U(sys_net_errno_loc()); }
 static void h_h_errno_loc(ppu_context* ctx) { RET_U(scratch(&s_h_errno_ea, 4)); }
@@ -1082,7 +1208,7 @@ void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int size, unsign
         { "getpeername", h_getpeername }, { "socketpoll", h_poll },
         { "socketselect", h_select },     { "inet_aton", h_inet_aton },
         { "inet_addr", h_inet_addr },     { "inet_ntoa", h_inet_ntoa },
-        { "inet_pton", h_inet_pton },
+        { "inet_pton", h_inet_pton },     { "inet_ntop", h_inet_ntop },
         { "gethostbyname", h_gethostbyname },
         { "_sys_net_errno_loc", h_errno_loc },
         { "_sys_net_h_errno_loc", h_h_errno_loc },
