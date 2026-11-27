@@ -881,6 +881,20 @@
     ]
    }
   ],
+  "func_00648548": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_00648548(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" void r2_occ_alloc_note(ppu_context* ctx);   /* R2: occlusion query note (project/r2_hot.cpp, R2_OCC_NOWAIT_LATE) */",
+     "void func_00648548(ppu_context* ctx) {",
+     "        r2_occ_alloc_note(ctx);"
+    ]
+   }
+  ],
   "func_00A56E30": [
    {
     "at": 0,
