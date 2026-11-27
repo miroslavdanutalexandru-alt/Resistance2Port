@@ -710,6 +710,15 @@ uint64_t g_nw_tail_seq = 0;
 uint32_t g_nw_tail_frame = 0, g_nw_tail_settle_frame = 0;
 std::atomic<long long> g_nw_skips{0}, g_nw_budget_ok{0}, g_nw_periods{0}, g_nw_drains{0}, g_nw_drain_ns{0}, g_nw_drain_max_ns{0},
     g_nw_drain_to{0}, g_nw_forced{0};
+struct OccAlloc { uint32_t obj, stamp; uint64_t key; int8_t b; uint8_t glare; };
+constexpr uint32_t kOccAllocN = 0x4000;
+OccAlloc g_oa[2][kOccAllocN];   /* [obj+8 stamp parity][query index]; written by the game's allocating thread */
+struct OccPrev { uint64_t key; uint32_t frame; uint8_t flag; };
+constexpr uint32_t kOccPrevN = 1u << 14;
+OccPrev g_op[kOccPrevN];        /* open addressing; key 0 = empty. Main thread only */
+uint32_t g_op_used = 0;
+int g_nw_late = 1;              /* R2_OCC_NOWAIT_LATE: 0 visible, 1 glare, 2 prev */
+std::atomic<long long> g_nw_ans_gprev{0}, g_nw_ans_g0{0}, g_nw_ans_cprev{0}, g_nw_ans_vis{0}, g_nw_rec{0};
 
 inline uint32_t ld_be32(uint32_t ea) { uint32_t v; memcpy(&v, vm_base + ea, 4); return _byteswap_ulong(v); }
 inline uint16_t ld_be16(uint32_t ea) { uint16_t v; memcpy(&v, vm_base + ea, 2); return _byteswap_ushort(v); }
@@ -794,11 +803,19 @@ void occ_report()
         const long long sk = g_nw_skips.load(), bo = g_nw_budget_ok.load(), pe = g_nw_periods.load(), dr = g_nw_drains.load(),
                         dn = g_nw_drain_ns.load(), to = g_nw_drain_to.load(), fo = g_nw_forced.load();
         const long long mx = g_nw_drain_max_ns.exchange(0);
-        fprintf(stderr, "[occ] nowait 10 s: late sets drawn visible %lld in %lld frames, in within %lld us %lld; drains %lld "
-                        "(%.2f ms avg, max %.2f ms, timeouts %lld), sets visible while undrained %lld (R2_OCC_NOWAIT=%d)\n",
+        fprintf(stderr, "[occ] nowait 10 s: late sets answered at once %lld in %lld frames, in within %lld us %lld; drains %lld "
+                        "(%.2f ms avg, max %.2f ms, timeouts %lld), sets answered while undrained %lld (R2_OCC_NOWAIT=%d)\n",
                 sk - lsk, pe - lpe, g_nw_us, bo - lbo, dr - ldr, dr - ldr ? (double)(dn - ldn) / 1e6 / (double)(dr - ldr) : 0.0,
                 (double)mx / 1e6, to - lto, fo - lfo, g_nw_on);
         lsk = sk; lbo = bo; lpe = pe; ldr = dr; ldn = dn; lto = to; lfo = fo;
+        static long long lgp, lg0, lcp, lvi, lrc;
+        const long long gp = g_nw_ans_gprev.load(), g0 = g_nw_ans_g0.load(), cp = g_nw_ans_cprev.load(), vi = g_nw_ans_vis.load(),
+                        rc = g_nw_rec.load();
+        fprintf(stderr, "[occ] nowait late answers 10 s: flare points last flag %lld, flare points 0 (no result yet) %lld, "
+                        "culling last flag %lld, visible %lld; exact flags recorded %lld (R2_OCC_NOWAIT_LATE=%s)\n",
+                gp - lgp, g0 - lg0, cp - lcp, vi - lvi, rc - lrc,
+                g_nw_late == 0 ? "visible" : g_nw_late == 2 ? "prev" : "glare");
+        lgp = gp; lg0 = g0; lcp = cp; lvi = vi; lrc = rc;
     }
     occ_gw_report();
 }
@@ -949,8 +966,9 @@ void sp_update_mark(uint32_t frame)
 
 /* ---- R2_OCC_NOWAIT (default 1; R2_OCC_BLOCKING=1 and RSX_OCC_SPEC_VISIBLE=0 only) --------------------------------
    Frame S: a per-object set (caller 0x001723C8; =2 also the global set 0x0026C1E0) whose last report is still not
-   written after R2_OCC_NOWAIT_US (default 2000) is answered at once with r2_occ_write_visible (every flag 1 -- the
-   object is drawn and the depth test hides it if it really is occluded; never hidden). Sets that are ready in S keep
+   written after R2_OCC_NOWAIT_US (default 2000) is answered at once by occ_nw_answer (R2_OCC_NOWAIT_LATE below: culling
+   flags 1 -- the object is drawn and the depth test hides it if it really is occluded; never hidden -- and flare points
+   their last exact flag). Sets that are ready in S keep
    their exact results (nothing stale can exist yet). The skipped reports can still land after the game zeroed and
    reused their slots (scratch\cpu_occ.md "Popping root cause"), so at the FIRST set read of frame S+1 the main thread
    drains the RSX once (occ_nw_drain): it waits until rsx::thread has executed every command put so far and every
@@ -985,7 +1003,118 @@ int occ_nw_drain(long long* ns_out)   /* 0 passed, 1 timed out, -1 no RPCS3 rend
     *ns_out = (q.QuadPart - q0.QuadPart) * 1000000000 / f.QuadPart;
     return r;
 }
+
+/* ---- R2_OCC_NOWAIT_LATE: what a late set answers (default glare) --------------------------------------------------
+   The per-object sets read at 0x001723C8 hold two kinds of queries, all allocated by func_00648548 into the same
+   object (0x012CF880): drawable culling spheres (callers 0x0064E524 / 0x0064E7B8, func_0064E02C) and the light-flare
+   points whose visible flag drives the glare/corona brightness (0x0069953C func_006994B8, 0x006CFA74 func_006CF9D4).
+   Answering a late set all-visible un-hides every flare point behind a wall or in the dark for that frame -- the
+   jungle-intro "bright flash" (user test FL1: R2_OCC_NOWAIT=0 removes it; same bug class as R3's flares through walls).
+   r2_occ_alloc_note (hook at the entry of func_00648548) remembers, per query index and frame parity, the caller, set
+   and a key (the hashed point/sphere the query tests: the point arrays are refilled every frame, the position is what
+   stays). Every exact evaluation (a ready set, or in within R2_OCC_NOWAIT_US) stores each flare point's flag
+   (report count >= obj+0x14, as the lifted body) under its key. A late set is then answered:
+     glare  DEFAULT: flare points take their last exact flag (at most 8 guest frames old), else 0 (not visible: no
+            flare on a frame with no result -- the brightness never jumps up); culling queries visible as before
+            (an object never pops out).
+     prev   also culling queries take their last exact flag (<= 2 frames old), else visible.
+     visible  the old all-visible answer. */
+
+/* the allocation record of query idx in set b of obj, from the allocations the set being read holds: the game's reset
+   (func_006489AC) stamps obj+8 and restarts the indices, so (stamp, idx) names one query; the next stamp's allocations
+   go to the other table and cannot overwrite it before this set is read */
+const OccAlloc* occ_alloc_rec(uint32_t obj, int32_t b, uint32_t idx)
+{
+    if (idx >= kOccAllocN) return nullptr;
+    const uint32_t stamp = ld_be32(obj + 8);
+    const OccAlloc& a = g_oa[stamp & 1][idx];
+    if (a.key && a.obj == obj && a.b == b && a.stamp == stamp) return &a;
+    /* allocated just before the reset that stamped this set (func_0026B73C allocates flare points at 0x0026C288,
+       before its reset at 0x0026C374): still the previous stamp */
+    const OccAlloc& o = g_oa[(stamp - 1) & 1][idx];
+    return o.key && o.obj == obj && o.b == b && o.stamp == stamp - 1 ? &o : nullptr;
+}
+
+OccPrev* occ_prev_slot(uint64_t key, bool insert)
+{
+    if (insert && g_op_used >= kOccPrevN / 2) { memset(g_op, 0, sizeof g_op); g_op_used = 0; }
+    for (uint32_t i = (uint32_t)(key ^ (key >> 29)) & (kOccPrevN - 1), n = 0; n < kOccPrevN; i = (i + 1) & (kOccPrevN - 1), n++) {
+        if (g_op[i].key == key) return &g_op[i];
+        if (!g_op[i].key) {
+            if (!insert) return nullptr;
+            g_op_used++; g_op[i].key = key; return &g_op[i];
+        }
+    }
+    return nullptr;
+}
+
+/* An exact evaluation (the last report of the set is written, so every report of it is): remember the flags the lifted
+   body is about to write, for the queries a late answer would look up. */
+void occ_nw_record(uint32_t obj, int32_t b, uint32_t count, uint32_t list, uint32_t rbase, uint32_t frame)
+{
+    if (!g_nw_late || !span_ok(obj, 0x18) || !span_ok(list, 2 * (uint64_t)count)) return;
+    const uint32_t thr = ld_be32(obj + 0x14);
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t idx = ld_be16(list + 2 * i);
+        const OccAlloc* a = occ_alloc_rec(obj, b, idx);
+        if (!a || (!a->glare && g_nw_late < 2)) continue;
+        const uint32_t rc = rbase + (idx << 4) + 8;
+        if (!span_ok(rc, 4)) continue;
+        if (OccPrev* p = occ_prev_slot(a->key, true)) {
+            p->frame = frame; p->flag = ld_be32(rc) >= thr ? 1 : 0;
+            g_nw_rec.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+/* the answer for a set whose reports are not (provably) in: R2_OCC_NOWAIT_LATE, then the set is marked read, as
+   r2_occ_write_visible. 0 = layout unexpected, nothing written. */
+int occ_nw_answer(uint32_t obj, int32_t b, uint32_t count, uint32_t list, uint32_t frame, long long* pend_out)
+{
+    if (!g_nw_late) return r2_occ_write_visible(obj, b, count, list, pend_out);
+    if (b < 0 || b > 31 || !span_ok(obj, 0x18) || !span_ok(list, 2 * (uint64_t)count)) return 0;
+    const uint32_t flags = ld_be32(obj + 0);
+    for (uint32_t i = 0; i < count; i++)
+        if (!span_ok(flags + ld_be16(list + 2 * i), 1)) return 0;
+    long long gp = 0, g0 = 0, cp = 0, vis = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t idx = ld_be16(list + 2 * i);
+        const OccAlloc* a = occ_alloc_rec(obj, b, idx);
+        uint8_t v = 1;
+        if (a && (a->glare || g_nw_late >= 2)) {
+            const OccPrev* p = occ_prev_slot(a->key, false);
+            const bool fresh = p && frame - p->frame <= (a->glare ? 8u : 2u);
+            if (a->glare) { v = fresh ? p->flag : 0; ++(fresh ? gp : g0); }
+            else if (fresh) { v = p->flag; cp++; }
+            else vis++;
+        } else vis++;
+        vm_write8(flags + idx, v);
+    }
+    vm_write16(obj + 6, (uint16_t)(ld_be16(obj + 6) | (1u << b)));
+    g_nw_ans_gprev.fetch_add(gp, std::memory_order_relaxed); g_nw_ans_g0.fetch_add(g0, std::memory_order_relaxed);
+    g_nw_ans_cprev.fetch_add(cp, std::memory_order_relaxed); g_nw_ans_vis.fetch_add(vis, std::memory_order_relaxed);
+    if (pend_out) *pend_out = vis;
+    return 1;
+}
 }  // namespace
+
+/* Hook at the entry of func_00648548 (allocate an occlusion query: r3 obj, r4 the vec4 point/sphere it tests, r5 set
+   b; leaf, so ctx->lr is the caller's return address). Only notes the query; the lifted body runs unchanged. */
+extern "C" void r2_occ_alloc_note(ppu_context* ctx)
+{
+    if (!g_nw_on || !g_nw_late) return;
+    const uint32_t obj = (uint32_t)ctx->gpr[3], v = (uint32_t)ctx->gpr[4], lr = (uint32_t)ctx->lr;
+    const int32_t b = (int32_t)ctx->gpr[5];
+    if (b < 0 || b > 31 || !span_ok(obj, 0x20) || !span_ok(v, 16)) return;
+    const uint32_t idx = ld_be32(obj + 0x18);
+    if (idx >= ld_be32(obj + 0x1C) || idx >= kOccAllocN) return;   /* the game refuses it (returns 0xFFFF) */
+    const uint32_t stamp = ld_be32(obj + 8);
+    uint64_t k = 0xCBF29CE484222325ull ^ ((uint64_t)lr << 8) ^ (uint64_t)b;
+    for (int i = 0; i < 4; i++) { k ^= ld_be32(v + 4 * i); k *= 0x100000001B3ull; k ^= k >> 31; }
+    OccAlloc& a = g_oa[stamp & 1][idx];
+    a.obj = obj; a.stamp = stamp; a.key = k ? k : 1; a.b = (int8_t)b;
+    a.glare = (lr == 0x0069953Cu || lr == 0x006CFA74u) ? 1 : 0;
+}
 
 extern "C" int r2_occ_wait(ppu_context* ctx)
 {
@@ -1028,6 +1157,16 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
             long long dm = env_int("R2_OCC_NOWAIT_DRAIN_MS", 100);
             if (dm < 1) dm = 1;
             g_nw_drain_us = dm * 1000;
+            if (const char* l = getenv("R2_OCC_NOWAIT_LATE"); l && *l)
+                g_nw_late = !_stricmp(l, "visible") || !strcmp(l, "0") ? 0 : !_stricmp(l, "prev") || !strcmp(l, "2") ? 2 : 1;
+            if (g_nw_on)
+                fprintf(stderr, "[occ] R2_OCC_NOWAIT_LATE=%s: a late set answers %s\n",
+                        g_nw_late == 0 ? "visible" : g_nw_late == 2 ? "prev" : "glare",
+                        g_nw_late == 0 ? "every query visible (old behaviour; flare points behind walls glare)"
+                        : g_nw_late == 2 ? "every query's last exact flag (flare points <= 8, culling <= 2 frames old; flare points without one 0, "
+                                           "culling queries without one visible)"
+                                         : "flare/glare points with their last exact flag (<= 8 frames old, else not "
+                                           "visible); culling queries visible");
             if (g_nw_on)
                 fprintf(stderr, "[occ] R2_OCC_NOWAIT=%d: an occlusion set still late after %lld us (R2_OCC_NOWAIT_US) is drawn "
                                 "visible instead of stalling the frame (%s); the next frame drains the RSX once (<= %lld ms, "
@@ -1165,7 +1304,7 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
                     }
                 }
                 if (g_nw_pend) {   /* not drained yet: a ready report may be a stale late write */
-                    if (r2_occ_write_visible(obj, b, count, list, nullptr)) {
+                    if (occ_nw_answer(obj, b, count, list, frame, nullptr)) {
                         g_nw_forced.fetch_add(1, std::memory_order_relaxed);
                         return 1;
                     }
@@ -1185,7 +1324,7 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
                 }
                 if (g_nw_tail) {
                     if (!*ts) { r2rsx_occ_guest_wait(rep); occ_native_wait(ts, 1000000); }
-                    if (r2_occ_write_visible(obj, b, count, list, nullptr)) {
+                    if (occ_nw_answer(obj, b, count, list, frame, nullptr)) {
                         g_nw_forced.fetch_add(1, std::memory_order_relaxed);
                         return 1;
                     }
@@ -1199,10 +1338,11 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
                 r2rsx_occ_guest_wait(rep);
                 if (g_nw_us > 0 && !occ_native_wait(ts, g_nw_us)) {
                     g_nw_budget_ok.fetch_add(1, std::memory_order_relaxed);
+                    occ_nw_record(obj, b, count, list, rbase, frame);
                     return 0;   /* in within the budget: the lifted body reads the exact results */
                 }
                 long long pend = 0;
-                if (r2_occ_write_visible(obj, b, count, list, &pend)) {
+                if (occ_nw_answer(obj, b, count, list, frame, &pend)) {
                     if (!g_nw_pend) g_nw_periods.fetch_add(1, std::memory_order_relaxed);
                     g_nw_pend = 1; g_nw_frame = frame;
                     g_nw_skips.fetch_add(1, std::memory_order_relaxed);
@@ -1211,6 +1351,7 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
                 }
                 return 0;   /* layout unexpected: the lifted wait */
             }
+            if (*ts && g_nw_on) occ_nw_record(obj, b, count, list, rbase, frame);
         }
         if (*ts) g_occ_ready.fetch_add(1, std::memory_order_relaxed);
         else {
