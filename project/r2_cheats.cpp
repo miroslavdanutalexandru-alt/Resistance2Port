@@ -301,13 +301,15 @@ extern "C" void r2_cheats_frame(ppu_context* ctx)
         const uint32_t player = (uint32_t)gcall(c, func_0011C93C, iter);
         if (player) {
             np++;
-            /* the game's own dead test (Lua is_dead: func_0002D01C -> func_0002CFB0
-             * -> func_00A776BC([moby+0x40]), [moby+0x40] being this player) */
-            const int dead = god && (gcall(c, func_00A776BC, player) & 0xFF);
+            const uint32_t ent = vm_read32(iter);
+            const uint32_t moby = ent ? (uint32_t)gcall(c, func_0071DC64, ent) : 0;
+            /* the game's own dead test (Lua is_dead: func_0002D01C -> func_0002CFB0:
+             * [moby+0x40] != 0, then func_00A776BC(moby) -- the moby, not the player;
+             * given the player it read garbage and always said dead) */
+            const int dead = god && moby && vm_read32(moby + 0x40) == player && (gcall(c, func_00A776BC, moby) & 0xFF);
             if (dead) ndead++;
             if ((god && !(dead && god_deathfix())) || restore) {
-                const uint32_t ent = vm_read32(iter);
-                if (ent) god_moby((uint32_t)gcall(c, func_0071DC64, ent), player, god);
+                if (ent) god_moby(moby, player, god);
             }
             if (ammo) ammo_player(c, player);
             if (gren) grenades_player(player);
