@@ -81,6 +81,7 @@ extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" void     vm_write64(uint64_t a, uint64_t v);
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "ps3emu/log_first.h"
+#include "../ps3_log.h"   /* ps3_diag_enabled (PORT_DIAG) */
 /* Perf pass 9: the PS3_FSLOG* / FS_* diagnostic switches were a getenv() (UCRT environment lock + a
  * linear scan) several times per cellFsRead/Stat/Fstat while the game streams. Each call site now
  * reads its switch once (thread-safe function-local static, a copy so a later putenv cannot dangle);
@@ -419,10 +420,10 @@ static void cellFsOpen(ppu_context* ctx)
            * then a count every 1000 (PS3_FSLOG=1: every open). */
           static std::atomic<unsigned> opens{0};
           const unsigned no = ++opens;
-          if (no <= 200 || FS_DBG_ENV("PS3_FSLOG"))
+          if (FS_DBG_ENV("PS3_FSLOG") || (ps3_diag_enabled() && no <= 200))   /* successful opens: PORT_DIAG=1 only */
               fprintf(stderr, "[fs] open '%s' -> fd %d%s\n", gpath, fd,
                       no == 200 ? "  (further opens: a count every 1000, PS3_FSLOG=1 lists them)" : "");
-          else if (no % 1000 == 0)
+          else if (ps3_diag_enabled() && no % 1000 == 0)
               fprintf(stderr, "[fs] %u files opened so far (latest '%s')\n", no, gpath);
       } }
     { void (*cb)(int, const char*) = g_port_file_open_cb; if (cb) cb(-1, gpath); }
@@ -625,8 +626,8 @@ static void cellFsRead(ppu_context* ctx)
      * opened and never read" unfalsifiable: reads on a later-opened fd fall off
      * the end of the log and look identical to reads that never happen.
      * FS_READ_ALL=1 logs every read; otherwise a per-fd first-read line plus a
-     * periodic summary is enough to tell the two apart. */
-    { static uint64_t tot=0; static int _n=0;
+     * periodic summary is enough to tell the two apart. PORT_DIAG=1 or FS_READ_ALL=1 only. */
+    if (ps3_diag_enabled() || FS_DBG_ENV("FS_READ_ALL")) { static uint64_t tot=0; static int _n=0;
       static uint64_t per_fd[64]; static uint32_t cnt_fd[64];
       tot+=n;
       if (fd>=0 && fd<64) { per_fd[fd]+=n; cnt_fd[fd]++; }

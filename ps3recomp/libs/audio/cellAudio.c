@@ -708,7 +708,7 @@ static inline float ld_be_f32(const float* p)
 /* Resistance port: run.bat pipes stderr through Tee-Object, which does not
  * reach logs\run.log until the game exits, so the 5 s audio diagnostics are
  * also appended to logs\audiodiag.txt where they can be read live.
- * Debug only: nothing is printed or written unless R2_DIAG=1. */
+ * Debug only: nothing is printed or written unless PORT_DIAG=1 (or R2_DIAG=1). */
 void audio_diag_line(const char* line)
 {
     if (!ps3_diag_enabled()) return;
@@ -1739,7 +1739,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     int drift_on, adapt_on, ulog_on; unsigned adapt_max_ms;
     { const char* e = getenv("PORT_AUDIO_DRIFT"); drift_on = !(e && *e == '0');
       e = getenv("PORT_AUDIO_ADAPTIVE"); adapt_on = !(e && *e == '0');
-      e = getenv("PORT_AUDIO_UNDERRUN_LOG"); ulog_on = !(e && *e == '0');
+      e = getenv("PORT_AUDIO_UNDERRUN_LOG"); ulog_on = !(e && *e) ? 1 : *e == '0' ? 0 : 2;   /* 1 = windows with underruns only, 2 = every 10 s */
       e = getenv("PORT_AUDIO_BUFFER_MAX_MS"); adapt_max_ms = (e && *e) ? (unsigned)atoi(e) : 300;
       if (adapt_max_ms > 500) adapt_max_ms = 500;
       if (adapt_max_ms < audio_buffer_ms()) adapt_max_ms = audio_buffer_ms(); }
@@ -1797,7 +1797,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     ULONGLONG aw_t0 = GetTickCount64();
     unsigned sess_underruns = 0, win_dry0 = s_dev_dry_total;
     static float ao_buf[4096 * AUDIO_CHMAP_MAX];
-    int ao_log_ms = 5000;
+    int ao_log_ms = ps3_diag_enabled() ? 5000 : 0;   /* opt-in: PORT_AUDIO_LOG or PORT_DIAG */
     { const char* e = getenv("PORT_AUDIO_LOG"); const char* p = getenv("R2_RSX_PROF");
       if (e && *e) ao_log_ms = atoi(e) == 0 ? 0 : (atoi(e) == 1 ? 1000 : atoi(e) < 100 ? 1000 : atoi(e));
       else if (p && *p && atoi(p)) ao_log_ms = 1000; }
@@ -1830,7 +1830,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
       else if (late_us > 0) late_ms = (late_us + 999) / 1000;
       else late_ms = (stretch_on || ao) ? 22 : 0;
       if (late_ms < 0) late_ms = 0; if (late_ms > 40) late_ms = 40;
-      e = getenv("PORT_AUDIO_LOG"); health_log = !(e && *e && atoi(e) == 0); }
+      e = getenv("PORT_AUDIO_LOG"); health_log = e && *e ? atoi(e) != 0 : ps3_diag_enabled(); }   /* opt-in */
     double tempo = 1.0;
     static float hop[AS_HS * 2];
     long long wait_q0 = 0;                 /* QPC: this tick started waiting for a late block */
@@ -2182,7 +2182,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                   const int was_suspended = wait_suspended;
                   /* the wait is only worth its slip if it catches blocks */
                   wait_suspended = !was_suspended && s_ah.waits >= 100 && s_ah.caught * 10 < s_ah.waits;
-                  if (health_log && !ao && (bad || tn - ah_quiet0 >= 60000)) {
+                  if (!ao && ulog_on && (bad || ulog_on == 2 || (health_log && tn - ah_quiet0 >= 60000))) {
                       fprintf(stderr, "[audio] underruns %u in last 10 s (device dry %u, buffer refilled %u) | "
                               "guest blocks late: %u concealed, %u rescued | waits %u (caught %u, gave up %u, slip %.0f ms)%s | "
                               "stretched %.0f%% of the time (min tempo %.2f) | host buffer avg %.0f ms, min %.0f ms (target %u) | "
@@ -2271,7 +2271,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                     const int parked = audio_host_paused();
                     const unsigned old_ms = adapt.cur_ms;
                     const unsigned nt = parked ? 0u : audio_adapt_window(&adapt, ur, spct);
-                    if (health_log && ulog_on)
+                    if (ulog_on == 2 || (ulog_on == 1 && (ur || health_log)))
                         fprintf(stderr, "[audio] underruns %u in last 10 s (stage %u, device dry %u, silence %.0f ms) | stretched %.0f%% "
                                 "(min tempo %.2f) | buffer min %.0f ms (target %u) | session: %u underruns | clock drift %+.0f ppm%c",
                                 ur, w.underruns, dry_win, w.silence_ms, spct, w.ticks ? w.tempo_min : 1.0,

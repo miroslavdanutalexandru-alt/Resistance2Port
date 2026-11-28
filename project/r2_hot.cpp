@@ -1182,7 +1182,7 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
                         g_nw_slow_need, g_nw_slow_us / 1000, g_nw_rearm);
             if (const char* l = getenv("R2_OCC_NOWAIT_LATE"); l && *l)
                 g_nw_late = !_stricmp(l, "visible") || !strcmp(l, "0") ? 0 : !_stricmp(l, "prev") || !strcmp(l, "2") ? 2 : 1;
-            if (g_nw_on)
+            if (g_nw_on && g_occ_log)
                 fprintf(stderr, "[occ] R2_OCC_NOWAIT_LATE=%s: a late set answers %s\n",
                         g_nw_late == 0 ? "visible" : g_nw_late == 2 ? "prev" : "glare",
                         g_nw_late == 0 ? "every query visible (old behaviour; flare points behind walls glare)"
@@ -1190,7 +1190,7 @@ extern "C" int r2_occ_wait(ppu_context* ctx)
                                            "culling queries without one visible)"
                                          : "flare/glare points with their last exact flag (<= 8 frames old, else not "
                                            "visible); culling queries visible");
-            if (g_nw_on)
+            if (g_nw_on && g_occ_log)
                 fprintf(stderr, "[occ] R2_OCC_NOWAIT=%d: an occlusion set still late after %lld us (R2_OCC_NOWAIT_US) is drawn "
                                 "visible instead of stalling the frame (%s); the next frame drains the RSX once (<= %lld ms, "
                                 "R2_OCC_NOWAIT_DRAIN_MS) so results stay exact. 0 = the game's own wait\n",
